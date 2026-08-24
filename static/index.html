@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PropMap · avisos en el mapa</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=pick2" />
+</head>
+<body>
+  <div class="shell">
+    <aside class="panel">
+      <header class="brand">
+        <p class="eyebrow">Venta · cualquier localidad del país</p>
+        <h1>PropMap</h1>
+        <p class="lede">Escribí un lugar y tocá buscar: los avisos aparecen rápido en el mapa. En segundo plano arranca solo un motor más cuidadoso, que sigue juntando fichas y actualiza cada tanto. Tocá un aviso y la ficha se abre a la derecha.</p>
+      </header>
+
+      <div class="kpis" id="kpis"></div>
+
+      <section class="market-pulse" id="marketPulse">
+        <div class="block-head">
+          <h2>Pulso del mercado</h2>
+          <button type="button" id="togglePulse" class="ghost">ocultar</button>
+        </div>
+        <p class="market-kicker" id="marketHeadline">El seguimiento arranca con la búsqueda de avisos.</p>
+        <div class="market-readout" id="marketReadout"></div>
+        <div class="market-chart" id="marketChart"></div>
+        <div class="market-bars" id="marketBars"></div>
+        <div class="market-mix" id="marketMix"></div>
+        <div class="market-types" id="marketTypes"></div>
+        <div class="market-split">
+          <div>
+            <h3>Oportunidades relevantes</h3>
+            <div class="market-list" id="marketDeals"></div>
+          </div>
+          <div>
+            <h3>Bajaron de precio</h3>
+            <div class="market-list" id="marketDrops"></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="deal-panel">
+        <p class="disclaimer">Esto no es una tasación. Comparamos USD/m² del mismo tipo y tamaño en la zona. Un lote o depto barato puede ser ganga; <strong>dato raro</strong> es solo si el USD/m² es imposible (error de carga), no por estar debajo de la mediana.</p>
+        <label class="deal-slider">Filtro de ganga
+          <input id="dealBar" type="range" min="0" max="70" step="5" value="0" />
+          <span id="dealBarLabel">todos los avisos</span>
+        </label>
+        <div class="deal-track" aria-hidden="true"></div>
+      </div>
+
+      <div class="actions">
+        <div class="search-row">
+          <button id="refreshBtn" class="primary" type="button">Buscar avisos</button>
+          <button id="pauseBtn" type="button" disabled>Pausar</button>
+        </div>
+        <label class="check crawl-check">
+          <input id="slowCrawl" type="checkbox" />
+          Motor de fondo (se prende solo; desmarcá para apagarlo)
+        </label>
+        <p class="status" id="statusLine">Tocá buscar: es rápido. Lo ya bajado no se vuelve a pedir hasta otro día. El motor cuidadoso sigue en segundo plano con lo pendiente.</p>
+      </div>
+
+      <div class="filters">
+        <label class="place-wrap">Lugar
+          <input id="placeQuery" type="search" placeholder="Playa Unión, Bariloche, un barrio…" autocomplete="off" />
+          <div id="placeSuggest" class="place-suggest" hidden></div>
+        </label>
+        <label>Lugares cargados
+          <select id="cityFilter">
+            <option value="puerto-madryn">Puerto Madryn</option>
+            <option value="playa-union">Playa Unión</option>
+            <option value="trelew">Trelew</option>
+            <option value="rawson">Rawson</option>
+            <option value="gaiman">Gaiman</option>
+            <option value="microcentro-caba">Microcentro CABA</option>
+          </select>
+        </label>
+        <label>Tipo
+          <select id="typeFilter">
+            <option value="">Todos</option>
+            <option value="casa">Casas</option>
+            <option value="departamento">Departamentos</option>
+            <option value="ph">PH / dúplex</option>
+            <option value="terreno">Terrenos</option>
+          </select>
+        </label>
+        <label>Barrio
+          <select id="barrioFilter"><option value="">Todos</option></select>
+        </label>
+        <label>Zona
+          <select id="zonaFilter"><option value="">Todas</option></select>
+        </label>
+        <label>Hasta USD
+          <input id="maxPrice" type="number" min="0" step="5000" placeholder="sin tope" />
+        </label>
+        <label>Ordenar
+          <select id="sortBy">
+            <option value="deal">Ganga / score</option>
+            <option value="price-asc">Precio menor</option>
+            <option value="price-desc">Precio mayor</option>
+            <option value="m2">Más m²</option>
+            <option value="m2price">USD/m² menor</option>
+            <option value="type">Tipo</option>
+            <option value="barrio">Barrio</option>
+            <option value="contacted">Contactados primero</option>
+          </select>
+        </label>
+        <label class="check">
+          <input id="favOnly" type="checkbox" />
+          Solo favoritos
+        </label>
+      </div>
+
+    </aside>
+
+    <aside class="list-rail" aria-label="Avisos">
+      <div class="block-head">
+        <h2>Avisos</h2>
+        <span id="listCount"></span>
+      </div>
+      <div class="list" id="list"></div>
+    </aside>
+
+    <main class="map-wrap">
+      <div id="map"></div>
+      <aside class="map-legend" id="mapLegend">
+        <div class="map-legend-head">
+          <h3>Colores del mapa</h3>
+          <button type="button" id="toggleLegend" class="ghost">ocultar</button>
+        </div>
+        <ul>
+          <li><span class="dot deal"></span><span><strong>Verde brillante:</strong> oportunidad. El USD/m² quedó bastante por debajo de la mediana del mismo tipo en ese barrio (después de sacar outliers).</span></li>
+          <li><span class="dot good"></span><span><strong>Verde lima:</strong> bueno. Un poco más barato que la zona, no tan marcado.</span></li>
+          <li><span class="dot market"></span><span><strong>Celeste:</strong> a precio de mercado. En línea con el barrio.</span></li>
+          <li><span class="dot high"></span><span><strong>Coral:</strong> caro. El m² pide más que la mediana de la zona.</span></li>
+          <li><span class="dot warn"></span><span><strong>Amarillo:</strong> revisar. Precio irreal, error de carga o el texto habla de juicio / a demoler / loteo.</span></li>
+          <li><span class="dot loteo"></span><span><strong>Beige:</strong> loteo o catálogo. No entra en la mediana del barrio.</span></li>
+          <li><span class="pin-legend round"></span><span><strong>Punto lleno:</strong> hay calle y altura (o el portal dio un punto preciso).</span></li>
+          <li><span class="pin-legend zone"></span><span><strong>Círculo punteado:</strong> no hay dirección exacta; el pin es solo la zona / barrio.</span></li>
+          <li><span class="pin-legend barrio"></span><span><strong>Mancha teal:</strong> contorno del barrio. El cartel muestra la mediana USD/m².</span></li>
+        </ul>
+      </aside>
+      <p class="map-hint">Arrastrá el mapa · rueda = zoom · el color del pin es el precio vs el barrio, no el tipo de casa</p>
+      <section class="stats-card" id="statsCard">
+        <div class="stats-head">
+          <h2>Promedios por barrio</h2>
+          <button type="button" id="toggleStats" class="ghost">ocultar</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Barrio / zona</th>
+                <th>Avisos</th>
+                <th>Mediana USD</th>
+                <th>USD/m²</th>
+                <th>Oport.</th>
+              </tr>
+            </thead>
+            <tbody id="statsBody"></tbody>
+          </table>
+        </div>
+        <div class="legend">
+          <span class="dot deal"></span> oportunidad (más barato que el barrio)
+          <span class="dot good"></span> bueno
+          <span class="dot market"></span> mercado
+          <span class="dot high"></span> caro
+          <span class="dot warn"></span> revisar
+          <span class="dot loteo"></span> loteo
+          <span class="pin-legend round"></span> con dirección
+          <span class="pin-legend zone"></span> solo zona
+        </div>
+      </section>
+    </main>
+
+    <aside class="detail is-empty" id="detailPane">
+      <p class="muted">Elegí un aviso en la lista o en el mapa para ver la ficha.</p>
+    </aside>
+  </div>
+
+  <button class="fab" id="manualBtn" type="button">+ Facebook / aviso suelto</button>
+
+  <dialog id="manualModal">
+    <form id="manualForm" method="dialog">
+      <h2>Cargar un aviso a mano</h2>
+      <p>Útil para Marketplace o grupos de Facebook, que no se pueden leer sin iniciar sesión.</p>
+      <label>Título <input name="title" required placeholder="Casa 3 dorm. zona sur" /></label>
+      <label>Link <input name="url" placeholder="https://facebook.com/..." /></label>
+      <div class="row">
+        <label>Ciudad
+          <select name="city">
+            <option value="puerto-madryn">Puerto Madryn</option>
+            <option value="playa-union">Playa Unión</option>
+            <option value="trelew">Trelew</option>
+            <option value="rawson">Rawson</option>
+            <option value="gaiman">Gaiman</option>
+            <option value="microcentro-caba">Microcentro CABA</option>
+          </select>
+        </label>
+        <label>Tipo
+          <select name="property_type">
+            <option value="casa">Casa</option>
+            <option value="departamento">Departamento</option>
+            <option value="ph">PH / dúplex</option>
+            <option value="terreno">Terreno</option>
+          </select>
+        </label>
+        <label>Precio <input name="price" type="number" step="100" /></label>
+        <label>Moneda
+          <select name="currency">
+            <option>USD</option>
+            <option>ARS</option>
+          </select>
+        </label>
+      </div>
+      <label>Dirección o barrio <input name="address" placeholder="Roca 2400 / Punta Cuevas" /></label>
+      <div class="row">
+        <label>m² cubiertos <input name="covered_m2" type="number" /></label>
+        <label>m² terreno <input name="total_m2" type="number" /></label>
+        <label>Dormitorios <input name="bedrooms" type="number" /></label>
+        <label>Baños <input name="bathrooms" type="number" step="0.5" /></label>
+      </div>
+      <label>Notas <textarea name="notes" rows="3"></textarea></label>
+      <div class="dialog-actions">
+        <button value="cancel" type="button" id="closeManual">Cancelar</button>
+        <button class="primary" value="save" id="saveManual">Guardar en el mapa</button>
+      </div>
+      <p class="facebook-links" id="fbLinks"></p>
+    </form>
+  </dialog>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="/static/app.js?v=pick2"></script>
+</body>
+</html>
