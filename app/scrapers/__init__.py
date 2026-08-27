@@ -5,9 +5,10 @@ from typing import Callable
 
 from lxml import html as lhtml
 
-from ..geo import locate
+from ..geo import foreign_locality, locate, parse_street, pin_listing_city
 from ..http_client import fetch_text
 from ..models import Listing
+from ..text_quality import looks_like_intersection
 
 Progress = Callable[[str], None]
 
@@ -67,6 +68,12 @@ def detect_type(text: str, fallback: str) -> str:
         return "casa"
     if fallback == "terreno" or "terreno" in t or re.search(r"\blote\b", t) or "hectarea" in t or "hectárea" in t:
         return "terreno"
+    if re.search(r"\bgalp[oó]n\b|nave industrial", t):
+        return "galpon"
+    if re.search(r"\boficina", t):
+        return "oficina"
+    if re.search(r"local comercial|\blocal\b", t):
+        return "local"
     return fallback
 
 
@@ -104,10 +111,89 @@ def tree(url: str):
     return lhtml.fromstring(fetch_text(url))
 
 
+def portal_neighborhood(*nodes) -> str:
+    for node in nodes:
+        if isinstance(node, dict):
+            name = str(node.get("name") or node.get("label") or "").strip()
+            if name:
+                return name
+        elif node:
+            name = str(node).strip()
+            if name:
+                return name
+    return ""
+
+
+def attach_location_facts(item: Listing) -> dict:
+    """Guarda calle+altura, esquina y 'entre' si el aviso las trae; no se pisan entre sí."""
+    extra = dict(item.extra or {})
+    place_blob = " ".join(p for p in (item.title, item.address) if p)
+    full_blob = " ".join(
+        p
+        for p in (
+            item.title,
+            item.address,
+            item.description,
+            extra.get("intersection"),
+            extra.get("between"),
+        )
+        if p
+    )
+    from ..geo_tools import parse_plain_locations
+
+    found_place = parse_plain_locations(place_blob)
+    found_all = parse_plain_locations(full_blob)
+    named, height = parse_street(place_blob)
+    street = named or found_place.get("street") or extra.get("street") or ""
+    number = height or found_place.get("number") or extra.get("street_number")
+    if street and number:
+        extra["street"] = street
+        extra["street_number"] = number
+        cur_s, cur_n = parse_street(item.address or "")
+        if not (cur_s and cur_n):
+            item.address = f"{street} {number}"
+    if found_all.get("corners"):
+        extra.setdefault("intersection", " y ".join(found_all["corners"][0]))
+    if found_all.get("between"):
+        extra.setdefault("between", " y ".join(found_all["between"][0]))
+    if looks_like_intersection(item.address or "") and not (street and number):
+        extra.setdefault("intersection", (item.address or "").strip())
+    item.extra = extra
+    return extra
+
+
 def locate_item(item: Listing) -> Listing:
+    try:
+        return _locate_item(item)
+    except Exception:
+        extra = dict(item.extra or {})
+        extra.setdefault("location_kind", "unknown")
+        item.extra = extra
+        return item
+
+
+def _locate_item(item: Listing) -> Listing:
     if item.price is not None and item.price <= 200:
         item.price = None
-    barrio, zona, lat, lon, exact = locate(
+    hint = portal_neighborhood((item.extra or {}).get("barrio"))
+    if item.barrio and item.barrio != "Sin clasificar":
+        hint = hint or item.barrio
+    from ..geo import default_city
+
+    extra = attach_location_facts(item)
+    search_city = item.city or default_city()
+    extracted: dict = {}
+    if extra.get("street") and extra.get("street_number"):
+        extracted["street"] = extra["street"]
+        extracted["number"] = extra["street_number"]
+    inter = str(extra.get("intersection") or "")
+    if " y " in inter.lower():
+        left, right = re.split(r"\s+y\s+", inter, maxsplit=1, flags=re.I)
+        extracted["corner_a"] = left
+        extracted["corner_b"] = right
+    if extra.get("portal_exact"):
+        extracted["portal_exact"] = True
+    barrio, zona, lat, lon, exact, pin_kind = locate(
         item.id,
         item.lat,
         item.lon,
@@ -115,10 +201,47 @@ def locate_item(item: Listing) -> Listing:
         item.address,
         item.description,
         item.publisher,
-        city=item.city or "puerto-madryn",
+        extra.get("intersection") or "",
+        city=search_city,
+        barrio_hint=hint or None,
+        allow_approx=not foreign_locality(item, search_city),
+        extracted=extracted or None,
     )
+    had_street = bool(extra.get("street") and extra.get("street_number"))
+    if (item.source or "").lower() == "properati":
+        if not had_street and pin_kind != "intersection":
+            exact = False
+            if pin_kind == "address":
+                pin_kind = "saved"
+    if extra.get("portal_approx") and pin_kind not in {"address", "intersection"}:
+        exact = False
+        if pin_kind == "address":
+            pin_kind = "saved"
     item.barrio, item.zona, item.lat, item.lon = barrio, zona, lat, lon
+    extra = attach_location_facts(item)
+    had_street = bool(extra.get("street") and extra.get("street_number"))
+    if pin_kind == "address":
+        exact = True
+        extra["location_kind"] = "exact"
+    elif pin_kind == "intersection":
+        exact = True
+        extra["location_kind"] = "intersection"
+    elif exact:
+        extra["location_kind"] = "exact"
+    elif extra.get("intersection") and not had_street:
+        extra["location_kind"] = "intersection"
+    elif lat is not None:
+        extra["location_kind"] = "approx"
+    else:
+        extra["location_kind"] = "unknown"
+    extra["pin_kind"] = pin_kind
+    item.extra = extra
     item.has_exact_location = exact
+    if item.barrio and item.barrio != "Sin clasificar":
+        from ..geo import remember_barrio
+
+        remember_barrio(item.city, item.barrio, item.lat, item.lon)
+    pin_listing_city(item)
     return item
 
 

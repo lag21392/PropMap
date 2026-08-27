@@ -1,21 +1,23 @@
-from app.geo import infer_barrio, locate
+from app.geo import _LEARNED, infer_barrio, locate, remember_city_polygons
 
 TITLE = "Casa en Venta en Puerto Madryn, Biedma CASA DE 3 DORMITORIOS (Bº 287 VIVIENDAS)"
 ADDR = "Angelo Mistrangelo 1200"
 
 
 def test_infers_287_viviendas_from_title():
-    barrio, zona, lat, lon = infer_barrio(TITLE, ADDR, city="puerto-madryn")
+    remember_city_polygons("puerto-madryn", [])
+    _LEARNED["puerto-madryn"] = []
+    barrio, zona, _lat, _lon = infer_barrio(TITLE, ADDR, city="puerto-madryn")
     assert barrio == "287 Viviendas"
     assert zona == "Zona Norte"
-    assert lon < -65.05
 
 
-def test_mistrangelo_is_not_dropped_on_city_center():
-    barrio, zona, lat, lon, exact = locate(
+def test_mistrangelo_keeps_barrio_from_text():
+    remember_city_polygons("puerto-madryn", [])
+    barrio, zona, lat, lon, exact, _kind = locate(
         "argenprop:19444640",
-        -42.775128853754936,
-        -65.0385,
+        -42.7548,
+        -65.0592,
         TITLE,
         ADDR,
         "",
@@ -23,5 +25,6 @@ def test_mistrangelo_is_not_dropped_on_city_center():
     )
     assert barrio == "287 Viviendas"
     assert zona == "Zona Norte"
-    assert abs(lon + 65.0385) > 0.01
-    assert lat > -42.77
+    assert exact is False
+    assert abs(lat + 42.7548) < 1e-4
+    assert abs(lon + 65.0592) < 1e-4

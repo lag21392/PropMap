@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -10,7 +12,8 @@ from .models import Listing
 from .text_quality import address_quality, title_quality
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "data" / "listings.sqlite"
+DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
+DB_PATH = DATA_DIR / "listings.sqlite"
 _write = Lock()
 EDIT_FIELDS = (
     "title", "price", "currency", "address", "covered_m2", "total_m2",
@@ -22,7 +25,8 @@ def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -64,7 +68,7 @@ def init() -> None:
                 extra_json TEXT,
                 scraped_at TEXT,
                 has_exact_location INTEGER DEFAULT 0,
-                city TEXT DEFAULT 'puerto-madryn',
+                city TEXT DEFAULT 'caba',
                 quality_score REAL,
                 quality_label TEXT,
                 details_scraped INTEGER DEFAULT 0
@@ -94,7 +98,7 @@ def init() -> None:
         if "has_exact_location" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN has_exact_location INTEGER DEFAULT 0")
         if "city" not in cols:
-            conn.execute("ALTER TABLE listings ADD COLUMN city TEXT DEFAULT 'puerto-madryn'")
+            conn.execute("ALTER TABLE listings ADD COLUMN city TEXT DEFAULT 'caba'")
         if "quality_score" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN quality_score REAL")
         if "quality_label" not in cols:
@@ -134,7 +138,55 @@ def init() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rental_comps (
+                id TEXT PRIMARY KEY,
+                source TEXT,
+                source_id TEXT,
+                url TEXT,
+                title TEXT,
+                property_type TEXT,
+                price REAL,
+                currency TEXT,
+                price_usd REAL,
+                period TEXT,
+                address TEXT,
+                barrio TEXT,
+                zona TEXT,
+                lat REAL,
+                lon REAL,
+                covered_m2 REAL,
+                bedrooms INTEGER,
+                city TEXT,
+                extra_json TEXT,
+                scraped_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_city ON rental_comps(city, period, property_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_city ON listings(city)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS visits (
+                id INTEGER PRIMARY KEY,
+                seen_at TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT,
+                referrer TEXT,
+                city TEXT,
+                vid TEXT,
+                ua_kind TEXT,
+                extra_json TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_seen ON visits(seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_name ON visits(name, city)")
         conn.commit()
+    from .accounts import init_tables
+
+    init_tables()
 
 
 def replace_portal_listings(source: str, listings: list[Listing]) -> None:
@@ -152,7 +204,22 @@ def _merge_existing(item: Listing, row: sqlite3.Row) -> None:
     if title_quality(row["title"] or "") > title_quality(item.title or ""):
         item.title = row["title"] or item.title
     old_exact = bool(row["has_exact_location"] if "has_exact_location" in row.keys() else 0)
-    if old_exact and not item.has_exact_location and row["lat"] is not None:
+    approx_portal = (item.source or "").lower() in {"properati"}
+    from .geo import foreign_locality, parse_street
+
+    extra = dict(item.extra or {})
+    street, number = parse_street(
+        " ".join(p for p in (item.title, item.address, item.description, extra.get("intersection")) if p)
+    )
+    keep_old = (
+        old_exact
+        and not item.has_exact_location
+        and row["lat"] is not None
+        and not approx_portal
+        and not (street and number)
+        and not extra.get("intersection")
+    )
+    if keep_old and item.city not in {"fuera", "otros"} and not foreign_locality(item, item.city or ""):
         item.lat = row["lat"]
         item.lon = row["lon"]
         item.has_exact_location = True
@@ -176,6 +243,16 @@ def _merge_existing(item: Listing, row: sqlite3.Row) -> None:
     extra["amenities"] = list(
         dict.fromkeys((old_extra.get("amenities") or []) + ((item.extra or {}).get("amenities") or []))
     )
+    for key in ("intersection", "between", "street", "street_number", "approx_address"):
+        if not extra.get(key) and old_extra.get(key):
+            extra[key] = old_extra[key]
+    photos = list(old_extra.get("photos") or [])
+    photos.extend((item.extra or {}).get("photos") or [])
+    if row["image"]:
+        photos.append(row["image"])
+    if item.image:
+        photos.append(item.image)
+    extra["photos"] = list(dict.fromkeys(url for url in photos if url))[:24]
     if not extra.get("expenses"):
         extra["expenses"] = old_extra.get("expenses")
     if not extra.get("pdf_text"):
@@ -265,6 +342,7 @@ def upsert_listings(listings: list[Listing], delete_source: str | None = None) -
     from .market import sync_listing_prices
 
     sync_listing_prices(listings)
+    _notify_listings(listings)
 
 
 def upsert_one(item: Listing) -> None:
@@ -277,67 +355,116 @@ def save_manual(item: Listing) -> None:
     replace_portal_listings("manual", existing + [item])
 
 
-def all_listings() -> list[Listing]:
+def _pins_map(conn: sqlite3.Connection) -> dict:
     pins = {}
+    try:
+        for pin in conn.execute("SELECT * FROM pins").fetchall():
+            pins[pin["listing_id"]] = pin
+    except sqlite3.OperationalError:
+        pass
+    return pins
+
+
+def _listing_from_row(row: sqlite3.Row, pin) -> Listing:
+    extra = json.loads(row["extra_json"] or "{}")
+    return Listing(
+        source=row["source"],
+        source_id=row["source_id"],
+        url=row["url"],
+        title=row["title"],
+        property_type=row["property_type"],
+        price=row["price"],
+        currency=row["currency"],
+        price_usd=row["price_usd"],
+        address=row["address"] or "",
+        barrio=row["barrio"] or "Sin clasificar",
+        zona=row["zona"] or "Sin clasificar",
+        lat=row["lat"],
+        lon=row["lon"],
+        covered_m2=row["covered_m2"],
+        total_m2=row["total_m2"],
+        rooms=row["rooms"],
+        bedrooms=row["bedrooms"],
+        bathrooms=row["bathrooms"],
+        parking=row["parking"],
+        age_years=row["age_years"],
+        image=row["image"] or "",
+        publisher=row["publisher"] or "",
+        description=row["description"] or "",
+        published_at=row["published_at"] or "",
+        price_m2=row["price_m2"],
+        score=row["score"],
+        deal_label=row["deal_label"] or "",
+        vs_barrio_pct=row["vs_barrio_pct"],
+        fingerprint=row["fingerprint"] or "",
+        extra=extra,
+        has_exact_location=bool(row["has_exact_location"] if "has_exact_location" in row.keys() else 0),
+        city=row["city"] if "city" in row.keys() and row["city"] else "caba",
+        quality_score=row["quality_score"] if "quality_score" in row.keys() else None,
+        quality_label=(row["quality_label"] if "quality_label" in row.keys() else "") or "",
+        details_scraped=bool(row["details_scraped"] if "details_scraped" in row.keys() else 0),
+        favorite=bool(pin["favorite"] if pin else 0),
+        notes=(pin["notes"] if pin else "") or "",
+        contacted=bool(
+            (pin["contacted"] if pin and "contacted" in pin.keys() else 0)
+            or extra.get("contacted")
+        ),
+    )
+
+
+def all_listings() -> list[Listing]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM listings ORDER BY price_usd IS NULL, price_usd ASC").fetchall()
-        try:
-            for pin in conn.execute("SELECT * FROM pins").fetchall():
-                pins[pin["listing_id"]] = pin
-        except sqlite3.OperationalError:
-            pass
-    items: list[Listing] = []
-    for row in rows:
-        extra = json.loads(row["extra_json"] or "{}")
-        pin = pins.get(row["id"])
-        items.append(
-            Listing(
-                source=row["source"],
-                source_id=row["source_id"],
-                url=row["url"],
-                title=row["title"],
-                property_type=row["property_type"],
-                price=row["price"],
-                currency=row["currency"],
-                price_usd=row["price_usd"],
-                address=row["address"] or "",
-                barrio=row["barrio"] or "Sin clasificar",
-                zona=row["zona"] or "Sin clasificar",
-                lat=row["lat"],
-                lon=row["lon"],
-                covered_m2=row["covered_m2"],
-                total_m2=row["total_m2"],
-                rooms=row["rooms"],
-                bedrooms=row["bedrooms"],
-                bathrooms=row["bathrooms"],
-                parking=row["parking"],
-                age_years=row["age_years"],
-                image=row["image"] or "",
-                publisher=row["publisher"] or "",
-                description=row["description"] or "",
-                published_at=row["published_at"] or "",
-                price_m2=row["price_m2"],
-                score=row["score"],
-                deal_label=row["deal_label"] or "",
-                vs_barrio_pct=row["vs_barrio_pct"],
-                fingerprint=row["fingerprint"] or "",
-                extra=extra,
-                has_exact_location=bool(row["has_exact_location"] if "has_exact_location" in row.keys() else 0),
-                city=row["city"] if "city" in row.keys() and row["city"] else "puerto-madryn",
-                quality_score=row["quality_score"] if "quality_score" in row.keys() else None,
-                quality_label=(row["quality_label"] if "quality_label" in row.keys() else "") or "",
-                details_scraped=bool(row["details_scraped"] if "details_scraped" in row.keys() else 0),
-                favorite=bool(pin["favorite"] if pin else 0),
-                notes=(pin["notes"] if pin else "") or "",
-                contacted=bool(
-                    (pin["contacted"] if pin and "contacted" in pin.keys() else 0)
-                    or extra.get("contacted")
-                ),
-            )
-        )
+        pins = _pins_map(conn)
+    items = []
+    for i, row in enumerate(rows):
+        items.append(_listing_from_row(row, pins.get(row["id"])))
+        if os.environ.get("PROPMAP_TEST") != "1" and i % 40 == 0:
+            time.sleep(0.01)
     for item in items:
         apply_user_edits(item)
     return items
+
+
+def get_listing(listing_id: str) -> Listing | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM listings WHERE id = ?", (listing_id,)).fetchone()
+        if not row:
+            return None
+        pins = _pins_map(conn)
+    item = _listing_from_row(row, pins.get(row["id"]))
+    apply_user_edits(item)
+    return item
+
+
+def fetch_by_cities(cities: set[str] | list[str]) -> list[Listing]:
+    wanted = [cid for cid in cities if cid]
+    if not wanted:
+        return []
+    marks = ",".join("?" * len(wanted))
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM listings WHERE city IN ({marks}) ORDER BY price_usd IS NULL, price_usd ASC",
+            tuple(wanted),
+        ).fetchall()
+        pins = _pins_map(conn)
+    items = []
+    for i, row in enumerate(rows):
+        items.append(_listing_from_row(row, pins.get(row["id"])))
+        if os.environ.get("PROPMAP_TEST") != "1" and i % 40 == 0:
+            time.sleep(0.01)
+    for item in items:
+        apply_user_edits(item)
+    return items
+
+
+def _notify_listings(listings: list[Listing] | None) -> None:
+    try:
+        from .listings_cache import ingest
+
+        ingest(listings)
+    except Exception:
+        pass
 
 
 def update_scores(listings: list[Listing]) -> None:
@@ -386,6 +513,7 @@ def update_scores(listings: list[Listing]) -> None:
     from .market import sync_listing_prices
 
     sync_listing_prices(listings)
+    _notify_listings(listings)
 
 
 def set_meta(key: str, value: str) -> None:
@@ -401,6 +529,50 @@ def set_meta(key: str, value: str) -> None:
 def listing_ids() -> set[str]:
     with connect() as conn:
         return {row[0] for row in conn.execute("SELECT id FROM listings")}
+
+
+def sale_m2_by_city() -> dict[str, float]:
+    init()
+    import statistics
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT city, price_m2 FROM listings
+            WHERE price_m2 IS NOT NULL
+              AND property_type IN ('casa', 'departamento', 'ph')
+              AND price_m2 >= 80 AND price_m2 <= 8000
+              AND price_usd IS NOT NULL
+            """
+        ).fetchall()
+    buckets: dict[str, list[float]] = {}
+    for row in rows:
+        buckets.setdefault(row["city"] or "", []).append(float(row["price_m2"]))
+    out: dict[str, float] = {}
+    for city, values in buckets.items():
+        values.sort()
+        if len(values) < 5:
+            continue
+        lo = int(len(values) * 0.15)
+        hi = int(len(values) * 0.85) or len(values)
+        cut = values[lo:hi] or values
+        out[city] = float(statistics.median(cut))
+    return out
+
+
+def update_extras(listings: list[Listing]) -> None:
+    if not listings:
+        return
+    with _write:
+        with connect() as conn:
+            conn.executemany(
+                "UPDATE listings SET extra_json = ? WHERE id = ?",
+                [
+                    (json.dumps(item.extra or {}, ensure_ascii=False), item.id)
+                    for item in listings
+                ],
+            )
+            conn.commit()
 
 
 def get_meta(key: str, default: str = "") -> str:
@@ -431,7 +603,14 @@ def save_pin(
                 (listing_id, fav, text, cont),
             )
             conn.commit()
-    return {"id": listing_id, "favorite": bool(fav), "notes": text, "contacted": bool(cont)}
+    saved = {"id": listing_id, "favorite": bool(fav), "notes": text, "contacted": bool(cont)}
+    try:
+        from .listings_cache import patch_pin
+
+        patch_pin(listing_id, saved["favorite"], saved["notes"], saved["contacted"])
+    except Exception:
+        pass
+    return saved
 
 
 def update_listing(payload: dict) -> Listing:
@@ -462,6 +641,98 @@ def update_listing(payload: dict) -> Listing:
         contacted=payload.get("contacted") if "contacted" in payload else None,
     )
     return next((row for row in all_listings() if row.id == listing_id), item)
+
+
+def fetch_rentals(city: str | None = None) -> list[dict]:
+    init()
+    with connect() as conn:
+        if city:
+            rows = conn.execute("SELECT * FROM rental_comps WHERE city = ?", (city,)).fetchall()
+        else:
+            try:
+                rows = conn.execute("SELECT * FROM rental_comps").fetchall()
+            except sqlite3.OperationalError:
+                return []
+    out = []
+    for row in rows:
+        extra = json.loads(row["extra_json"] or "{}")
+        out.append(
+            {
+                "id": row["id"],
+                "source": row["source"],
+                "source_id": row["source_id"],
+                "url": row["url"],
+                "title": row["title"],
+                "property_type": row["property_type"],
+                "price": row["price"],
+                "currency": row["currency"],
+                "price_usd": row["price_usd"],
+                "period": row["period"],
+                "address": row["address"] or "",
+                "barrio": row["barrio"] or "",
+                "zona": row["zona"] or "",
+                "lat": row["lat"],
+                "lon": row["lon"],
+                "covered_m2": row["covered_m2"],
+                "bedrooms": row["bedrooms"],
+                "city": row["city"] or "",
+                "extra": extra,
+            }
+        )
+    return out
+
+
+def replace_city_rentals(city: str, rows: list[dict]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _write:
+        with connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rental_comps ("
+                "id TEXT PRIMARY KEY, source TEXT, source_id TEXT, url TEXT, title TEXT, "
+                "property_type TEXT, price REAL, currency TEXT, price_usd REAL, period TEXT, "
+                "address TEXT, barrio TEXT, zona TEXT, lat REAL, lon REAL, covered_m2 REAL, "
+                "bedrooms INTEGER, city TEXT, extra_json TEXT, scraped_at TEXT)"
+            )
+            keep = {row["id"] for row in rows if row.get("id")}
+            if keep:
+                conn.execute("DELETE FROM rental_comps WHERE city = ? AND id NOT IN ({})".format(",".join("?" * len(keep))), (city, *keep))
+            elif rows:
+                conn.execute("DELETE FROM rental_comps WHERE city = ?", (city,))
+            for row in rows:
+                if not row.get("id"):
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO rental_comps (
+                        id, source, source_id, url, title, property_type, price, currency,
+                        price_usd, period, address, barrio, zona, lat, lon, covered_m2,
+                        bedrooms, city, extra_json, scraped_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        row.get("source") or "",
+                        row.get("source_id") or "",
+                        row.get("url") or "",
+                        row.get("title") or "",
+                        row.get("property_type") or "",
+                        row.get("price"),
+                        row.get("currency") or "ARS",
+                        row.get("price_usd"),
+                        row.get("period") or "monthly",
+                        row.get("address") or "",
+                        row.get("barrio") or "",
+                        row.get("zona") or "",
+                        row.get("lat"),
+                        row.get("lon"),
+                        row.get("covered_m2"),
+                        row.get("bedrooms"),
+                        row.get("city") or city,
+                        json.dumps(row.get("extra") or {}, ensure_ascii=False),
+                        now,
+                    ),
+                )
+            conn.commit()
 
 
 replace_source = replace_portal_listings

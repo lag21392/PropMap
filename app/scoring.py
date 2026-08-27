@@ -7,12 +7,12 @@ from collections import defaultdict
 
 from html import unescape
 
-from .geo import approx_slot, fingerprint, fold, infer_barrio
+from .geo import approx_slot, default_city, fingerprint, fold, foreign_locality, infer_barrio
 from .models import Listing
 from .features import analyze, fill_areas, scan_red_flags
 
 USD_FALLBACK = 1350.0
-SCORE_VERSION = "10"
+SCORE_VERSION = "12"
 PLACEHOLDER_USD = 200
 PRICE_BOUNDS = {
     "departamento": (8_000, 8_000_000),
@@ -93,8 +93,10 @@ def unrealistic_unit_price(item: Listing) -> bool:
 
 
 def excluded_from_comps(item: Listing) -> bool:
+    extra = item.extra or {}
     return (
-        bool((item.extra or {}).get("exclude_from_comps"))
+        bool(extra.get("exclude_from_comps"))
+        or bool(extra.get("duplicate_of"))
         or is_catalog_ad(item)
         or unrealistic_unit_price(item)
     )
@@ -185,11 +187,15 @@ def sanitize_item(item: Listing, usd_ars: float) -> Listing:
         item.extra = extra
         _note_fix(item, "aviso de loteo / varios lotes: fuera de la mediana")
         barrio, zona, _lat, _lon = infer_barrio(
-            item.title, item.address, item.description, city=item.city or "puerto-madryn"
+            item.title,
+            item.address,
+            item.description,
+            city=item.city or default_city(),
+            barrio_hint=(item.extra or {}).get("barrio") if isinstance((item.extra or {}).get("barrio"), str) else None,
         )
-        if barrio != "Sin clasificar":
+        if barrio != "Sin clasificar" and not foreign_locality(item, item.city or default_city()):
             item.barrio, item.zona = barrio, zona
-            item.lat, item.lon = approx_slot(barrio, zona, item.id, item.city or "puerto-madryn")
+            item.lat, item.lon = approx_slot(barrio, zona, item.id, item.city or default_city())
             item.has_exact_location = False
     return item
 
@@ -361,13 +367,13 @@ def _nearby_m2(item: Listing, pool: list[Listing]) -> list[float]:
         return []
     radius = _local_radius(item)
     bucket = _size_bucket(item)
-    city = item.city or "puerto-madryn"
+    city = item.city or default_city()
     same: list[float] = []
     any_size: list[float] = []
     for other in pool:
         if other.id == item.id:
             continue
-        if (other.city or "puerto-madryn") != city:
+        if (other.city or default_city()) != city:
             continue
         if other.property_type != item.property_type:
             continue
@@ -400,7 +406,7 @@ def enrich(listings: list[Listing], usd_ars: float) -> list[Listing]:
     price_by_barrio_type: dict[tuple[str, str, str], list[float]] = defaultdict(list)
 
     for item in listings:
-        city = item.city or "puerto-madryn"
+        city = item.city or default_city()
         if excluded_from_comps(item):
             continue
         bucket = _size_bucket(item)
@@ -424,29 +430,30 @@ def enrich(listings: list[Listing], usd_ars: float) -> list[Listing]:
     ]
 
     for item in listings:
-        city = item.city or "puerto-madryn"
+        city = item.city or default_city()
         bucket = _size_bucket(item)
         barrio_key = (city, item.barrio, item.property_type, bucket)
         zona_key = (city, item.zona, item.property_type, bucket)
         type_bucket_key = (city, item.property_type, bucket)
         nearby = _nearby_m2(item, geo_pool)
         nearby_ref = _robust_median(nearby) if len(nearby) >= 4 else None
-        fallback_peers = _first_peers(
-            m2_by_barrio.get(barrio_key) or [],
-            m2_by_zona.get(zona_key) or [],
-            m2_by_type_bucket.get(type_bucket_key) or [],
-            m2_by_type.get((city, item.property_type)) or [],
-        )
-        if nearby_ref:
+        barrio_vals = m2_by_barrio.get(barrio_key) or []
+        zona_vals = m2_by_zona.get(zona_key) or []
+        type_bucket_vals = m2_by_type_bucket.get(type_bucket_key) or []
+        type_vals = m2_by_type.get((city, item.property_type)) or []
+        kind = {"departamento": "deptos", "casa": "casas", "ph": "PH", "terreno": "terrenos"}.get(item.property_type) or item.property_type
+        if item.barrio and item.barrio != "Sin clasificar" and len(barrio_vals) >= 4 and med_m2_barrio.get(barrio_key):
+            peers, ref, scope = barrio_vals, med_m2_barrio[barrio_key], f"{kind} en {item.barrio}"
+        elif nearby_ref:
             peers, ref, scope = nearby, nearby_ref, f"{len(nearby)} avisos a {int(_local_radius(item))} m"
         elif med_m2_barrio.get(barrio_key):
-            peers, ref, scope = fallback_peers, med_m2_barrio[barrio_key], f"barrio {item.barrio}"
+            peers, ref, scope = barrio_vals, med_m2_barrio[barrio_key], f"{kind} en {item.barrio}"
         elif med_m2_zona.get(zona_key):
-            peers, ref, scope = fallback_peers, med_m2_zona[zona_key], f"zona {item.zona}"
+            peers, ref, scope = zona_vals, med_m2_zona[zona_key], f"zona {item.zona}"
         elif med_m2_type_bucket.get(type_bucket_key):
-            peers, ref, scope = fallback_peers, med_m2_type_bucket[type_bucket_key], "mismo tipo y tamaño en la ciudad"
+            peers, ref, scope = type_bucket_vals, med_m2_type_bucket[type_bucket_key], "mismo tipo y tamaño en la ciudad"
         else:
-            peers, ref, scope = fallback_peers, med_m2_type.get((city, item.property_type)), "mismo tipo en la ciudad"
+            peers, ref, scope = type_vals, med_m2_type.get((city, item.property_type)), "mismo tipo en la ciudad"
         price_ref = med_price_barrio.get((city, item.barrio, item.property_type))
         vs = None
         if item.price_m2 and ref:
@@ -578,7 +585,7 @@ def summarize(listings: list[Listing]) -> dict:
     by_zona: dict[str, list[Listing]] = defaultdict(list)
     by_type: dict[str, list[Listing]] = defaultdict(list)
     for item in listings:
-        by_barrio[(item.city or "puerto-madryn", item.barrio)].append(item)
+        by_barrio[(item.city or default_city(), item.barrio)].append(item)
         by_zona[item.zona].append(item)
         by_type[item.property_type].append(item)
 

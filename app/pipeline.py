@@ -1,32 +1,69 @@
 from __future__ import annotations
 
+import logging
+import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from threading import Event, Lock
 from typing import Callable
+from urllib.parse import quote
 
 from . import crawl, freshness, store
 from .features import analyze
+from .dedupe import DEDUPE_VERSION, collapse_duplicates
 from .geo import (
     CITIES,
     GEO_VERSION,
-    barrio_overlays,
-    city_only_address,
-    has_street_address,
-    in_water,
+    default_city,
     pin_listing_city,
-    listing_fits_city,
     resolve_city,
+    same_place_ids,
 )
 from .http_client import fetch_json
 from .models import Listing
 from .places import listed_cities, load_custom_places
+from .schedule import (
+    COUNTRY_ID,
+    is_country_place,
+    note_finished,
+    note_search,
+    note_started,
+    note_view,
+    queue_public,
+    set_listing_counts,
+)
 from .scoring import SCORE_VERSION, USD_FALLBACK, apply_unit_price, enrich, summarize, to_usd
 from .scrapers import argenprop, mercadolibre, properati, zonaprop
 from .scrapers.details import enrich_details
 
 Progress = Callable[[str], None]
+log = logging.getLogger(__name__)
+_PORTAL_RE = re.compile(
+    r"zona\s*prop|argenprop|properati|mercado\s*libre|mercadolibre|"
+    r"https?://\S*(?:zonaprop|argenprop|properati|mercadolibre)\S*",
+    re.I,
+)
+
+
+def public_search_text(message: str, city_label: str = "") -> str:
+    raw = (message or "").strip()
+    place = f" en {city_label}" if city_label else ""
+    if not raw:
+        return f"Buscando avisos{place}…"
+    low = _PORTAL_RE.sub(" ", raw)
+    low = re.sub(r"\s{2,}", " ", low).strip(" ·:-")
+    probe = low.lower()
+    if _PORTAL_RE.search(raw) or re.search(r"\b(leyendo|ficha|fichas|listado listo)\b", probe):
+        if "pausad" in probe:
+            return f"Pausando búsqueda{place}…"
+        if "calculando" in probe:
+            return low
+        if "listo" in probe and "aviso" in probe:
+            return low
+        return f"Buscando avisos{place}…"
+    return low or f"Buscando avisos{place}…"
 
 _status = {
     "running": False,
@@ -44,7 +81,10 @@ _stop = Event()
 _scheduler_started = False
 _rest_gen: dict[str, int] = {}
 DAILY_SEC = 24 * 3600
-CHECK_EVERY_SEC = 60 * 60
+CHECK_EVERY_SEC = 45
+BETWEEN_CITIES_SEC = 12
+MAX_JOBS = 3
+MAX_BACKGROUND = 2
 
 
 def _bump_rest(city_id: str) -> int:
@@ -68,60 +108,96 @@ def _job(city_id: str) -> dict:
     return _jobs[city_id]
 
 
+def _place_label(city_id: str) -> str:
+    if is_country_place(city_id):
+        return "todo el país"
+    return (CITIES.get(city_id) or {}).get("label") or city_id.replace("-", " ")
+
+
+def _running_ids() -> set[str]:
+    return {cid for cid, job in _jobs.items() if job.get("running")}
+
+
 def status() -> dict:
     with _lock:
         jobs = {}
         running_cities = []
         logs: list[str] = []
         for city_id, job in _jobs.items():
-            jobs[city_id] = {**job, "logs": list(job["logs"][-30:])}
+            label = _place_label(city_id)
+            jobs[city_id] = {
+                **job,
+                "message": public_search_text(job.get("message") or "", label),
+                "error": public_search_text(job.get("error") or "", label),
+                "logs": [public_search_text(row, label) for row in list(job["logs"][-30:])],
+                "counts": {"avisos": sum((job.get("counts") or {}).values())},
+            }
             if job["running"]:
                 running_cities.append(city_id)
             logs.extend(job["logs"][-10:])
         message = _status["message"]
         if running_cities:
-            message = _job(running_cities[-1])["message"] or message
-        return {
+            last = running_cities[-1]
+            last_label = _place_label(last)
+            message = public_search_text(_job(last).get("message") or message, last_label)
+        else:
+            message = public_search_text(message)
+        payload = {
             "running": bool(running_cities),
             "running_cities": running_cities,
             "mode": (_job(running_cities[-1]).get("mode") if running_cities else ""),
             "jobs": jobs,
             "paused": any(job.get("paused") for job in _jobs.values()),
             "message": message,
-            "logs": logs[-40:] or list(_status["logs"][-40:]),
-            "error": _status.get("error") or "",
+            "logs": [public_search_text(row) for row in (logs[-40:] or list(_status["logs"][-40:]))],
+            "error": public_search_text(_status.get("error") or ""),
             "last_run": store.get_meta("last_run", _status["last_run"]),
             "usd_ars": store.get_meta("usd_ars", str(USD_FALLBACK)),
             "counts": {
-                key: value
-                for job in _jobs.values()
-                for key, value in (job.get("counts") or {}).items()
+                "avisos": sum(sum((job.get("counts") or {}).values()) for job in _jobs.values())
             },
             "crawl": {
                 **crawl.snapshot(),
-                "enabled": store.get_meta("slow_crawl") == "1",
-                "city": store.get_meta("slow_crawl_city"),
+                "enabled": True,
+                "daily": True,
             },
         }
+        from .listings_cache import current_rev
+
+        payload["listings_rev"] = current_rev()
+        from .llm_enrich import queue_stats
+        from .detail_fetch import queue_stats as detail_stats
+
+        payload["llm"] = queue_stats()
+        payload["details"] = detail_stats()
+        running_copy = list(running_cities)
+    payload["queue"] = queue_public(set(running_copy))
+    payload["crawl"]["city"] = next_daily_city()
+    payload["crawl"]["cities"] = daily_city_ids()
+    return payload
 
 
 def _log(message: str, city_id: str | None = None) -> None:
+    label = _place_label(city_id) if city_id else ""
+    text = public_search_text(message, label)
     with _lock:
-        _status["message"] = message
-        _status["logs"].append(message)
+        _status["message"] = text
+        _status["logs"].append(text)
         if len(_status["logs"]) > 80:
             _status["logs"] = _status["logs"][-80:]
         if city_id:
             job = _job(city_id)
-            job["message"] = message
-            job["logs"].append(message)
+            job["message"] = text
+            job["logs"].append(text)
             if len(job["logs"]) > 80:
                 job["logs"] = job["logs"][-80:]
 
 
 def request_pause(city: str | None = None) -> dict:
-    city_id = resolve_city(city) if city else None
-    crawl.request_abort()
+    city_id = COUNTRY_ID if is_country_place(city) else (resolve_city(city) if city else None)
+    if not city_id:
+        crawl.request_abort()
+        _stop.set()
     with _lock:
         targets = [city_id] if city_id else list(_stops)
         found = False
@@ -138,7 +214,6 @@ def request_pause(city: str | None = None) -> dict:
             _status["message"] = "Pausando… lo reunido queda guardado."
         else:
             _status["message"] = "No hay una búsqueda en curso en esa ciudad."
-        _stop.set()
     return status()
 
 
@@ -158,13 +233,26 @@ def usd_rate() -> float:
         return USD_FALLBACK
 
 
-def refresh(city: str | None = None, progress: Progress | None = None, *, fast: bool = True) -> dict:
+def refresh(
+    city: str | None = None,
+    progress: Progress | None = None,
+    *,
+    fast: bool = True,
+    interactive: bool | None = None,
+) -> dict:
     from .places import ensure_place
 
     store.init()
     load_custom_places()
-    city_id = ensure_place(query=city, city=city)
-    label = (CITIES.get(city_id) or {}).get("label") or city_id
+    if is_country_place(city):
+        city_id = COUNTRY_ID
+    else:
+        city_id = ensure_place(query=city, city=city)
+    if interactive is None:
+        interactive = fast
+    if interactive:
+        note_search(city_id)
+    label = _place_label(city_id)
     with _lock:
         job = _job(city_id)
         if job["running"]:
@@ -172,12 +260,19 @@ def refresh(city: str | None = None, progress: Progress | None = None, *, fast: 
                 job["interrupt_for_fast"] = True
                 job["mode"] = "fast"
                 job["message"] = f"Pasando a búsqueda rápida en {label}…"
-                crawl.set_slow(False)
-                crawl.request_abort()
                 stop = _stops.get(city_id)
                 if stop:
                     stop.set()
             return status()
+        running = _running_ids()
+        background_n = sum(1 for cid in running if _jobs[cid].get("mode") != "fast")
+        if not fast and background_n >= MAX_BACKGROUND:
+            return status()
+        if len(running) >= MAX_JOBS:
+            if fast:
+                _preempt_one_slow_locked()
+            else:
+                return status()
         _bump_rest(city_id)
         job["running"] = True
         job["paused"] = False
@@ -185,14 +280,15 @@ def refresh(city: str | None = None, progress: Progress | None = None, *, fast: 
         job["error"] = ""
         job["logs"] = []
         job["message"] = (
-            f"{'Búsqueda rápida' if fast else 'Motor de fondo'} en {label}…"
+            f"{'Búsqueda rápida' if fast else 'Actualización'} en {label}…"
         )
         _stops[city_id] = Event()
         _status["running"] = True
         _status["paused"] = False
         _status["error"] = ""
-    crawl.clear_abort()
-    crawl.set_slow(not fast)
+    if fast:
+        crawl.clear_abort()
+    note_started(city_id, fast=fast)
     store.set_meta("scrape_live", "1")
     threading.Thread(
         target=_run_city_job,
@@ -203,8 +299,21 @@ def refresh(city: str | None = None, progress: Progress | None = None, *, fast: 
     return status()
 
 
+def _preempt_one_slow_locked() -> None:
+    slow = [cid for cid, job in _jobs.items() if job.get("running") and job.get("mode") != "fast"]
+    if not slow:
+        return
+    victim = slow[0]
+    ev = _stops.get(victim)
+    if ev:
+        ev.set()
+    _jobs[victim]["paused"] = True
+    _jobs[victim]["message"] = "Cedo el cupo a una búsqueda con más prioridad…"
+
+
 def _run_city_job(city_id: str, progress: Progress | None = None, fast: bool = True) -> None:
-    city = CITIES.get(city_id) or {"label": city_id, "id": city_id}
+    country = is_country_place(city_id)
+    city = CITIES.get(city_id) or {"label": _place_label(city_id), "id": city_id}
     stop = _stops[city_id]
 
     def report(message: str) -> None:
@@ -212,85 +321,130 @@ def _run_city_job(city_id: str, progress: Progress | None = None, fast: bool = T
         if progress:
             progress(message)
 
-    try:
-        store.init()
-        rate = usd_rate()
-        report(f"{city['label']} · dólar blue ${rate:,.0f}.")
-        sources = [
-            ("zonaprop", zonaprop.scrape),
-            ("argenprop", argenprop.scrape),
-            ("properati", properati.scrape),
-            ("mercadolibre", mercadolibre.scrape),
-        ]
-        counts, paused = _scrape_one_city(
-            city_id,
-            city,
-            sources,
-            report,
-            should_stop=stop.is_set,
-            skip_details=fast,
-        )
-        with _lock:
-            jumping = bool(_job(city_id).get("interrupt_for_fast"))
-        if jumping:
-            report("Cortando para búsqueda rápida…")
-            with _lock:
-                _job(city_id)["counts"] = counts
-        else:
-            report(
-                f"{city['label']}: calculando precios…"
-                if fast
-                else f"{city['label']}: calculando precios y oportunidades…"
-            )
-            listings = store.fetch_all()
-            listings = enrich(listings, rate)
-            for item in listings:
-                store.apply_user_edits(item)
-            store.update_scores(listings)
-            from .market import ensure_ready, take_snapshots
+    with crawl.job_context(slow=not fast, should_stop=stop.is_set):
+        try:
+            store.init()
+            rate = usd_rate()
+            report(f"{city['label']} · dólar blue ${rate:,.0f}.")
+            if not country and not stop.is_set():
+                try:
+                    from .scrapers.rentals import scrape_rentals
+                    from .yields import apply_yields
 
-            ensure_ready(listings)
-            take_snapshots(listings)
-            stats = summarize([x for x in listings if (x.city or "puerto-madryn") == city_id])
-            now = datetime.now(timezone.utc).isoformat()
-            store.set_meta("last_run", now)
-            if not paused:
-                store.set_meta(f"last_complete_run:{city_id}", now)
-                store.set_meta("auto_daily", "1")
+                    n = scrape_rentals(city_id, report, should_stop=stop.is_set, usd_ars=rate)
+                    if n:
+                        wanted = same_place_ids(city_id)
+                        listings = [x for x in store.fetch_all() if (x.city or "") in wanted]
+                        apply_yields(listings)
+                        store.update_scores(listings)
+                except Exception:
+                    report(f"{city['label']}: no se pudieron bajar alquileres ahora; sigo con la venta.")
+            sources = [
+                ("zonaprop", zonaprop.scrape),
+                ("argenprop", argenprop.scrape),
+                ("properati", properati.scrape),
+                ("mercadolibre", mercadolibre.scrape),
+            ]
+            counts, paused = _scrape_one_city(
+                city_id,
+                city,
+                sources,
+                report,
+                should_stop=stop.is_set,
+                skip_details=fast or country,
+            )
+            with _lock:
+                jumping = bool(_job(city_id).get("interrupt_for_fast"))
+            if jumping:
+                report("Cortando para búsqueda rápida…")
+                with _lock:
+                    _job(city_id)["counts"] = counts
+            elif country:
+                now = datetime.now(timezone.utc).isoformat()
+                store.set_meta("last_run", now)
+                if not paused:
+                    store.set_meta(f"last_complete_run:{city_id}", now)
+                    store.set_meta("auto_daily", "1")
+                    if not fast:
+                        store.set_meta(f"last_daily_run:{city_id}", now)
+                shown = sum(counts.values())
+                with _lock:
+                    job = _job(city_id)
+                    job["counts"] = counts
+                    job["last_run"] = now
+                    job["paused"] = paused
+                    job["message"] = (
+                        f"{'Pausado' if paused else 'Listo'} · {city['label']}: "
+                        f"{shown} avisos nuevos en esta pasada."
+                    )
+                    _status["counts"].update(counts)
+                    _status["last_run"] = now
+                    _status["paused"] = paused
+                    _status["message"] = job["message"]
+            else:
+                report(
+                    f"{city['label']}: calculando precios…"
+                    if fast
+                    else f"{city['label']}: calculando precios y oportunidades…"
+                )
+                wanted = same_place_ids(city_id)
+                listings = [x for x in store.fetch_all() if (x.city or "") in wanted]
+                listings = enrich(listings, rate)
+                for item in listings:
+                    store.apply_user_edits(item)
+                from .yields import apply_yields
+
+                apply_yields(listings)
+                store.update_scores(listings)
+                from .market import ensure_ready, take_snapshots
+
+                ensure_ready(listings)
+                take_snapshots(listings)
+                stats = summarize(listings)
+                now = datetime.now(timezone.utc).isoformat()
+                store.set_meta("last_run", now)
+                if not paused:
+                    store.set_meta(f"last_complete_run:{city_id}", now)
+                    store.set_meta("auto_daily", "1")
+                    if not fast:
+                        store.set_meta(f"last_daily_run:{city_id}", now)
+                with _lock:
+                    job = _job(city_id)
+                    job["counts"] = counts
+                    job["last_run"] = now
+                    job["paused"] = paused
+                    job["message"] = (
+                        f"{'Pausado' if paused else 'Listo'} · {city['label']}: "
+                        f"{stats['total']} avisos, {stats['deals']} oportunidades."
+                    )
+                    _status["counts"].update(counts)
+                    _status["last_run"] = now
+                    _status["paused"] = paused
+                    _status["message"] = job["message"]
+        except Exception:
             with _lock:
                 job = _job(city_id)
-                job["counts"] = counts
-                job["last_run"] = now
-                job["paused"] = paused
-                job["message"] = (
-                    f"{'Pausado' if paused else 'Listo'} · {city['label']}: "
-                    f"{stats['total']} avisos, {stats['deals']} oportunidades."
-                )
-                _status["counts"].update(counts)
-                _status["last_run"] = now
-                _status["paused"] = paused
+                job["error"] = f"Error en {city['label']}"
+                job["message"] = f"Error en {city['label']}. Se puede reintentar."
+                _status["error"] = job["error"]
                 _status["message"] = job["message"]
-    except Exception as exc:
-        with _lock:
-            job = _job(city_id)
-            job["error"] = str(exc)
-            job["message"] = f"Error en {city['label']}: {exc}"
-            _status["error"] = str(exc)
-            _status["message"] = job["message"]
-    finally:
-        jumping = False
-        with _lock:
-            job = _job(city_id)
-            jumping = bool(job.pop("interrupt_for_fast", False))
-            job["running"] = False
-            job["mode"] = ""
-            _status["running"] = any(j.get("running") for j in _jobs.values())
-        if jumping:
-            refresh(city_id, fast=True)
-        else:
-            store.set_meta("scrape_live", "0")
-            if store.get_meta("slow_crawl") == "1":
-                _schedule_slow_pass(city_id, soon=fast)
+        finally:
+            jumping = False
+            paused = False
+            with _lock:
+                job = _job(city_id)
+                jumping = bool(job.pop("interrupt_for_fast", False))
+                paused = bool(job.get("paused"))
+                job["running"] = False
+                job["mode"] = ""
+                _status["running"] = any(j.get("running") for j in _jobs.values())
+            note_finished(city_id, fast=fast, paused=paused or jumping)
+            if jumping:
+                refresh(city_id, fast=True)
+            else:
+                if not _running_ids():
+                    store.set_meta("scrape_live", "0")
+                _schedule_daily_next()
 
 
 def _scrape_one_city(
@@ -305,72 +459,112 @@ def _scrape_one_city(
     counts: dict[str, int] = {}
     paused = False
     rate = usd_rate()
+    country = is_country_place(city_id)
+    slow_flag = crawl.is_slow()
+    count_lock = Lock()
     freshness.reset_known(store.listing_ids())
-    report(f"Ciudad: {city['label']}")
+    report(f"{'País' if country else 'Lugar'}: {city['label']}")
 
     def on_chunk(chunk: list[Listing], source: str = "") -> None:
         if not chunk:
             return
         new_n = 0
         for item in chunk:
-            item.city = city_id
+            if not country:
+                item.city = city_id
+                extra = dict(item.extra or {})
+                extra["search_city"] = city_id
+                item.extra = extra
             pin_listing_city(item)
             if item.price and not item.price_usd:
                 item.price_usd = to_usd(item.price, item.currency, rate)
             apply_unit_price(item, rate)
             if not freshness.is_known(item.id):
                 new_n += 1
+                if not country:
+                    from .llm_enrich import mark_await_llm
+
+                    mark_await_llm(item)
         store.upsert_many(chunk)
+        from .detail_fetch import enqueue as enqueue_details
+
+        enqueue_details(chunk)
         key = f"{source}:{city_id}"
-        counts[key] = counts.get(key, 0) + new_n
+        with count_lock:
+            counts[key] = counts.get(key, 0) + new_n
+            shown = sum(counts.values())
         old_n = len(chunk) - new_n
-        shown = sum(counts.values())
         title = (chunk[-1].address or chunk[-1].title or "").strip()
         bit = f" · {title[:48]}" if title else ""
         if old_n and not new_n:
-            report(f"{source} · {city['label']}: sin avisos nuevos, {old_n} ya estaban{bit}")
+            report(f"{city['label']}: sin avisos nuevos, {old_n} ya estaban{bit}")
         elif old_n:
             report(
-                f"{source} · {city['label']}: {new_n} nuevos, {old_n} ya bajados · {shown} nuevos en esta pasada{bit}"
+                f"{city['label']}: {new_n} nuevos, {old_n} ya bajados · {shown} nuevos en esta pasada{bit}"
             )
         else:
-            report(f"{source} · {city['label']}: {new_n} nuevos · {shown} en el mapa{bit}")
+            report(f"{city['label']}: {new_n} nuevos · {shown} en esta pasada{bit}")
 
-    for name, scraper in sources:
+    def run_source(name, scraper) -> tuple[str, bool]:
         if stop():
-            return counts, True
-        report(f"Leyendo {name} en {city['label']}…")
-        try:
-            items = scraper(
-                report,
-                city=city_id,
-                should_stop=stop,
-                on_chunk=lambda chunk, src=name: on_chunk(chunk, src),
-            )
-            for item in items:
-                item.city = city_id
-                pin_listing_city(item)
-            store.upsert_many(items)
-            counts.setdefault(f"{name}:{city_id}", 0)
-            if skip_details:
-                report(f"{name} · {city['label']}: listado listo · {counts[f'{name}:{city_id}']} avisos nuevos.")
-            else:
+            return name, True
+        with crawl.job_context(slow=slow_flag, should_stop=stop):
+            try:
+                items = scraper(
+                    report,
+                    city=city_id,
+                    should_stop=stop,
+                    on_chunk=lambda chunk, src=name: on_chunk(chunk, src),
+                )
+                if not country:
+                    for item in items:
+                        extra = dict(item.extra or {})
+                        extra["search_city"] = city_id
+                        item.extra = extra
+                        if item.city not in {"fuera"} and not item.city:
+                            item.city = city_id
+                        if not freshness.is_known(item.id):
+                            from .llm_enrich import mark_await_llm
+
+                            mark_await_llm(item)
+                        pin_listing_city(item)
+                    store.upsert_many(items)
+                with count_lock:
+                    counts.setdefault(f"{name}:{city_id}", 0)
+                if skip_details:
+                    from .detail_fetch import enqueue as enqueue_details
+
+                    enqueue_details(items)
+                    report(
+                        f"{city['label']}: {counts.get(f'{name}:{city_id}', 0)} avisos nuevos. "
+                        "Siguen cargando en segundo plano."
+                    )
+                    return name, False
                 catalog = [
                     x
                     for x in store.fetch_all()
-                    if x.source == name and (x.city or "puerto-madryn") == city_id
+                    if x.source == name and (x.city or default_city()) == city_id
                 ]
-                report(f"{name} · {city['label']}: listado listo. Reviso fichas pendientes…")
-                paused = _enrich_details(catalog, report, name, city["label"], should_stop=stop) or paused
-        except Exception as exc:
-            counts.setdefault(f"{name}:{city_id}", 0)
-            if crawl.aborted() or stop() or "pausad" in str(exc).lower():
+                report(f"{city['label']}: listado listo. Reviso fichas pendientes…")
+                return name, _enrich_details(catalog, report, name, city["label"], should_stop=stop)
+            except Exception as exc:
+                with count_lock:
+                    counts.setdefault(f"{name}:{city_id}", 0)
+                if crawl.aborted() or stop() or "pausad" in str(exc).lower():
+                    report(f"{city['label']}: pausado.")
+                    return name, True
+                report(f"{city['label']}: un origen no respondió, sigo con el resto.")
+                return name, False
+
+    report(f"Buscando avisos en {city['label']}…")
+    with ThreadPoolExecutor(max_workers=min(4, len(sources) or 1)) as pool:
+        futures = [pool.submit(run_source, name, scraper) for name, scraper in sources]
+        for fut in as_completed(futures):
+            _name, source_paused = fut.result()
+            paused = paused or source_paused
+            if stop():
                 paused = True
-                report(f"{name} · {city['label']}: pausado.")
-            else:
-                report(f"{name} · {city['label']} no respondió: {exc}")
-        if paused or stop():
-            break
+                break
     return counts, paused
 
 
@@ -382,126 +576,284 @@ def _enrich_details(
     items: list[Listing], report: Progress, source: str, city_label: str, should_stop=None
 ) -> bool:
     stop = should_stop or _stop.is_set
+    from .llm_enrich import enqueue
+
     pending = [item for item in items if _needs_details(item)]
-    skipped = len(items) - len(pending)
+    already = [item for item in items if not _needs_details(item)]
+    if already:
+        enqueue(already)
+    skipped = len(already)
     total = len(pending)
     if not total:
         report(
-            f"Fichas {source} · {city_label}: {skipped} ya bajadas, no las vuelvo a pedir hasta otro día."
+            f"{city_label}: las fichas de este lote ya estaban bajadas."
         )
         return False
     if skipped:
         report(
-            f"Fichas {source} · {city_label}: {total} pendientes, {skipped} ya bajadas (las salto)."
+            f"{city_label}: {total} fichas pendientes, {skipped} ya bajadas."
         )
-    for index, item in enumerate(pending, start=1):
-        if stop():
-            report(f"Pausa pedida. Fichas {source} · {city_label}: {index - 1}/{total}.")
-            return True
+
+    workers = 3 if not crawl.is_slow() else 1
+
+    def _one(item: Listing) -> Listing:
         try:
             enrich_details(item, should_stop=stop)
         except Exception:
             analyze(item)
-        store.upsert_many([item])
-        wait = crawl.snapshot().get("wait_s") or 0
-        extra = f" · espera {wait:.0f}s" if crawl.is_slow() and wait else ""
-        label = (item.address or item.title or "")[:48]
-        report(f"Ficha {source} {index}/{total}{extra} · {label}")
+        return item
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
+        futs = [pool.submit(_one, item) for item in pending]
+        for fut in as_completed(futs):
+            if stop():
+                report(f"Pausa pedida. Fichas {city_label}: {done}/{total}.")
+                return True
+            try:
+                item = fut.result()
+            except Exception:
+                continue
+            store.upsert_many([item])
+            enqueue([item])
+            done += 1
+            wait = crawl.snapshot().get("wait_s") or 0
+            extra = f" · espera {wait:.0f}s" if crawl.is_slow() and wait else ""
+            label = (item.address or item.title or "")[:48]
+            report(f"{city_label}: ficha {done}/{total}{extra} · {label}")
     return False
 
 
-def listings_payload(live: bool = False, city: str | None = None) -> dict:
-    store.init()
-    load_custom_places()
-    items = store.fetch_all()
-    rate = float(store.get_meta("usd_ars") or USD_FALLBACK)
-    from .scrapers import locate_item
+_geo_lock = Lock()
+_geo_inflight: set[str] = set()
+_score_lock = Lock()
+_score_inflight = False
+_llm_lock = Lock()
+_llm_kicked: set[str] = set()
+_dedupe_lock = Lock()
+_dedupe_inflight: set[str] = set()
 
-    city_fixed = False
-    for item in items:
-        apply_unit_price(item, rate)
-        if pin_listing_city(item):
-            city_fixed = True
 
-    relocated = False
-    geo_stale = store.get_meta("geo_version") != GEO_VERSION
-    skip_relocate = live
-    if not skip_relocate:
-        if geo_stale:
-            for item in items:
-                weak_geo = in_water(item.lat, item.lon, item.city) or (
-                    city_only_address(item.address)
-                    and not has_street_address(item.address, item.title, item.description)
-                )
-                if weak_geo:
-                    item.lat = item.lon = None
-                    item.has_exact_location = False
-                locate_item(item)
-            relocated = True
-        else:
-            for item in items:
-                if item.has_exact_location:
-                    continue
-                if has_street_address(item.address, item.title, item.description):
-                    locate_item(item)
-                    relocated = True
-        needs_scores = any(item.score is None and item.price for item in items)
-        if items and (
-            relocated
-            or needs_scores
-            or store.get_meta("score_version") != SCORE_VERSION
-            or geo_stale
-            or city_fixed
-        ):
-            items = enrich(items, rate)
-            for item in items:
+def _kick_score_refresh(city_id: str | None) -> None:
+    global _score_inflight
+    if store.get_meta("score_version") == SCORE_VERSION:
+        return
+    with _score_lock:
+        if _score_inflight:
+            return
+        _score_inflight = True
+
+    def _job() -> None:
+        global _score_inflight
+        try:
+            store.init()
+            items = store.fetch_all()
+            rate = float(store.get_meta("usd_ars") or USD_FALLBACK)
+            if city_id:
+                wanted = same_place_ids(city_id)
+                scoped = [item for item in items if (item.city or "") in wanted]
+            else:
+                scoped = items
+            scoped = enrich(scoped, rate)
+            for item in scoped:
                 store.apply_user_edits(item)
-            store.update_scores(items)
+            store.update_scores(scoped)
+            store.set_meta("score_version", SCORE_VERSION)
+        except Exception:
+            pass
+        finally:
+            with _score_lock:
+                _score_inflight = False
+
+    threading.Thread(target=_job, daemon=True, name="score-refresh").start()
+
+
+def _kick_geo_refresh(city_id: str) -> None:
+    if not city_id or city_id in {"fuera", "otros"}:
+        return
+    from .places import ensure_osm_barrios
+
+    ensure_osm_barrios(city_id, blocking=False)
+    if store.get_meta(f"geo_ver:{city_id}") == GEO_VERSION:
+        return
+    with _geo_lock:
+        if city_id in _geo_inflight:
+            return
+        _geo_inflight.add(city_id)
+
+    def _job() -> None:
+        try:
+            store.init()
+            from .scrapers import locate_item
+            from .places import hydrate_place_extent
+
+            hydrate_place_extent(city_id)
+            from .geo import barrio_belongs_to_city, foreign_locality, in_city_radius, listing_mentions_city, needs_address_repin, pin_listing_city
+
+            items = store.fetch_all()
+            rate = float(store.get_meta("usd_ars") or USD_FALLBACK)
+            wanted = same_place_ids(city_id)
+            strays = []
+            for item in items:
+                if (item.city or "") in wanted:
+                    continue
+                if (item.city or "") not in {"fuera", "otros", "argentina", "buenos-aires"}:
+                    continue
+                in_here = item.lat is not None and item.lon is not None and in_city_radius(item.lat, item.lon, city_id)
+                mentions = listing_mentions_city(item, city_id)
+                barrio_here = barrio_belongs_to_city(item, city_id)
+                if not mentions and not in_here:
+                    continue
+                if foreign_locality(item, city_id, remote=False) and not in_here and not (mentions and barrio_here):
+                    continue
+                item.city = city_id
+                extra = dict(item.extra or {})
+                extra.setdefault("search_city", city_id)
+                item.extra = extra
+                strays.append(item)
+            scoped = [item for item in items if (item.city or "") in wanted] + strays
+            to_pin = []
+            seen: set[str] = set()
+            for item in strays:
+                seen.add(item.id)
+                here = item.lat is not None and item.lon is not None and in_city_radius(item.lat, item.lon, city_id)
+                if item.lat is None or needs_address_repin(item) or not here:
+                    to_pin.append(item)
+                else:
+                    pin_listing_city(item)
+            for item in scoped:
+                if item.id in seen:
+                    continue
+                if item.lat is None or needs_address_repin(item):
+                    to_pin.append(item)
+            for item in to_pin:
+                locate_item(item)
+            scoped = enrich(scoped, rate)
+            for item in scoped:
+                store.apply_user_edits(item)
+            store.update_scores(scoped)
+            store.set_meta(f"geo_ver:{city_id}", GEO_VERSION)
             store.set_meta("score_version", SCORE_VERSION)
             store.set_meta("geo_version", GEO_VERSION)
-    if not live:
-        from .market import ensure_ready, take_snapshots
+        except Exception:
+            log.exception("geo refresh failed for %s", city_id)
+        finally:
+            with _geo_lock:
+                _geo_inflight.discard(city_id)
 
-        ensure_ready(items)
-        take_snapshots(items)
-    view_city = resolve_city(city) if city else None
-    if view_city:
-        items = [item for item in items if listing_fits_city(item, view_city)]
-    stats = summarize(items)
-    return {
-        "listings": [item.to_public_dict() for item in items],
-        "stats": stats,
-        "barrios": barrio_overlays(stats.get("by_barrio"), city=view_city),
-        "cities": listed_cities(items),
-        "usd_ars": rate,
-        "last_run": store.get_meta("last_run"),
-        "facebook": [
-            {
-                "label": "Marketplace · Madryn",
-                "url": "https://www.facebook.com/marketplace/puerto-madryn/search?query=casa%20venta",
-            },
-            {
-                "label": "Marketplace · Trelew",
-                "url": "https://www.facebook.com/marketplace/trelew/search?query=casa%20venta",
-            },
-            {
-                "label": "Marketplace · Rawson",
-                "url": "https://www.facebook.com/marketplace/rawson/search?query=casa%20venta",
-            },
-            {
-                "label": "Marketplace · Gaiman",
-                "url": "https://www.facebook.com/marketplace/gaiman/search?query=casa%20venta",
-            },
-            {
-                "label": "Marketplace · Playa Unión",
-                "url": "https://www.facebook.com/marketplace/rawson/search?query=playa%20union%20venta",
-            },
-            {
-                "label": "Marketplace · Microcentro",
-                "url": "https://www.facebook.com/marketplace/buenos-aires/search?query=departamento%20microcentro%20venta",
-            },
-        ],
-    }
+    threading.Thread(target=_job, daemon=True, name=f"geo-refresh-{city_id}").start()
+
+
+def _kick_dedupe(city_id: str) -> None:
+    if not city_id or city_id in {"fuera", "otros", "argentina"}:
+        return
+    if store.get_meta(f"dedupe_ver:{city_id}") == DEDUPE_VERSION:
+        return
+    with _dedupe_lock:
+        if city_id in _dedupe_inflight:
+            return
+        _dedupe_inflight.add(city_id)
+
+    def _job() -> None:
+        try:
+            store.init()
+            wanted = same_place_ids(city_id)
+            items = [item for item in store.fetch_all() if (item.city or "") in wanted]
+            changed = collapse_duplicates(items)
+            if changed:
+                store.update_scores(changed)
+            store.set_meta(f"dedupe_ver:{city_id}", DEDUPE_VERSION)
+        except Exception:
+            log.exception("dedupe failed for %s", city_id)
+        finally:
+            with _dedupe_lock:
+                _dedupe_inflight.discard(city_id)
+
+    threading.Thread(target=_job, daemon=True, name=f"dedupe-{city_id}").start()
+
+
+def _kick_llm_enrich(city_id: str) -> None:
+    from .detail_fetch import enqueue as enqueue_details
+    from .freshness import needs_detail_fetch
+    from .llm_enrich import LLM_SCHEMA, enabled, enqueue as enqueue_llm, needs_improve
+
+    if not enabled() or not city_id or city_id in {"fuera", "otros", "argentina"}:
+        return
+    with _llm_lock:
+        if city_id in _llm_kicked:
+            return
+        _llm_kicked.add(city_id)
+
+    def _job() -> None:
+        try:
+            store.init()
+            pending_details = []
+            pending_llm = []
+            changed = []
+
+            for item in store.fetch_by_cities(same_place_ids(city_id)):
+                extra = dict(item.extra or {})
+                ready = extra.get("llm_ver") == LLM_SCHEMA and extra.get("llm_ready") and not extra.get("llm_partial")
+                if ready:
+                    continue
+                if not extra.get("search_city"):
+                    extra["search_city"] = city_id
+                    item.extra = extra
+                    changed.append(item)
+                if not needs_improve(item):
+                    continue
+                if needs_detail_fetch(item):
+                    pending_details.append(item)
+                else:
+                    pending_llm.append(item)
+            if changed:
+                store.upsert_many(changed)
+            enqueue_details(pending_details)
+            enqueue_llm(pending_llm)
+            log.info(
+                "llm kick %s: %s fichas, %s a limpiar",
+                city_id,
+                len(pending_details),
+                len(pending_llm),
+            )
+        except Exception:
+            log.exception("llm enrich kick failed for %s", city_id)
+            with _llm_lock:
+                _llm_kicked.discard(city_id)
+
+    threading.Thread(target=_job, daemon=True, name=f"llm-enrich-{city_id}").start()
+
+
+def _marketplace_links(city_id: str | None) -> list[dict]:
+    if not city_id or city_id in {"fuera", "otros"}:
+        return []
+    cfg = CITIES.get(city_id) or {}
+    label = cfg.get("label") or city_id.replace("-", " ").title()
+    query = quote(f"departamento venta {label}")
+    return [
+        {
+            "label": f"Marketplace · {label}",
+            "url": f"https://www.facebook.com/marketplace/search/?query={query}",
+        }
+    ]
+
+
+def listings_payload(live: bool = False, city: str | None = None, since: int | None = None) -> dict:
+    from .listings_cache import cache_ready, payload as cache_payload, start_warmup
+
+    start_warmup()
+    view_city = resolve_city(city)
+    data = cache_payload(view_city, since=since)
+    if view_city and not live:
+        threading.Thread(target=note_view, args=(view_city,), daemon=True, name="note-view").start()
+    if view_city and not data.get("warming"):
+        if cache_ready():
+            _kick_geo_refresh(view_city)
+            _kick_score_refresh(view_city)
+            _kick_dedupe(view_city)
+        _kick_llm_enrich(view_city)
+    data["live"] = bool(live)
+    return data
 
 
 def add_manual(payload: dict) -> Listing:
@@ -522,7 +874,7 @@ def add_manual(payload: dict) -> Listing:
         bathrooms=float(payload["bathrooms"]) if payload.get("bathrooms") else None,
         description=str(payload.get("notes") or ""),
         publisher="Carga manual / Facebook",
-        city=str(payload.get("city") or "puerto-madryn"),
+        city=str(payload.get("city") or default_city()),
     )
     from .scrapers import locate_item
 
@@ -546,8 +898,7 @@ def edit_listing(payload: dict) -> Listing:
     return next((row for row in listings if row.id == item.id), item)
 
 
-def _last_complete_age_sec() -> float | None:
-    raw = store.get_meta("last_complete_run") or store.get_meta("last_run")
+def _parse_age_sec(raw: str | None) -> float | None:
     if not raw:
         return None
     try:
@@ -559,96 +910,73 @@ def _last_complete_age_sec() -> float | None:
         return None
 
 
-def set_slow_crawl(enabled: bool, city: str | None = None) -> dict:
-    from .places import ensure_place
+def daily_city_ids() -> list[str]:
+    skip = {"fuera", "otros"}
+    from .listings_cache import cached_city_ids
+    from .schedule import pool_ids
 
-    store.init()
-    load_custom_places()
-    if enabled:
-        city_id = ensure_place(query=city, city=city)
-        store.set_meta("slow_crawl", "1")
-        store.set_meta("slow_crawl_city", city_id)
-        with _lock:
-            already = bool(_job(city_id).get("running"))
-        if already:
-            return status()
-        refresh(city_id, fast=False)
-    else:
-        city_id = resolve_city(city) if city else None
-        city_id = city_id or store.get_meta("slow_crawl_city")
-        store.set_meta("slow_crawl", "0")
-        crawl.set_slow(False)
-        if city_id:
-            _bump_rest(city_id)
-            with _lock:
-                job = _jobs.get(city_id)
-                pause_slow = bool(job and job.get("running") and job.get("mode") == "slow")
-            if pause_slow:
-                request_pause(city_id)
-    return status()
+    ids = [cid for cid in cached_city_ids() if cid not in skip]
+    extra = [cid for cid in pool_ids() if cid not in skip]
+    seen = []
+    for cid in [*ids, *extra]:
+        if cid not in seen:
+            seen.append(cid)
+    return seen
 
 
-def _schedule_slow_pass(city_id: str, soon: bool = False) -> None:
-    if store.get_meta("slow_crawl") != "1":
-        return
-    target = store.get_meta("slow_crawl_city") or city_id
-    if target != city_id:
-        return
-    rest = crawl.rest_seconds(soon=soon)
-    label = (CITIES.get(city_id) or {}).get("label") or city_id
-    gen = _bump_rest(city_id)
-    if soon:
-        _log(f"Motor de fondo · {label}: en {max(1, int(rest))} s sigue juntando avisos.", city_id)
-    else:
-        minutes = max(1, int(rest / 60))
-        _log(f"Motor de fondo · {label}: descanso {minutes} min y sigue juntando avisos.", city_id)
+def _city_daily_age_sec(city_id: str) -> float | None:
+    return _parse_age_sec(
+        store.get_meta(f"last_daily_run:{city_id}") or store.get_meta(f"last_complete_run:{city_id}")
+    )
+
+
+def next_daily_city() -> str | None:
+    from .schedule import next_background_city
+
+    return next_background_city(_running_ids())
+
+
+def set_slow_crawl(_enabled: bool, _city: str | None = None) -> dict:
+    return {
+        **status(),
+        "message": "El motor recorre el país en paralelo: primero lo que se busca en Lugar, después el resto, sin dejar a nadie sin turno.",
+    }
+
+
+def _schedule_daily_next() -> None:
+    gen = _bump_rest("_daily")
 
     def later() -> None:
-        left = rest
-        while left > 0:
-            if store.get_meta("slow_crawl") != "1":
-                return
-            if _rest_gen.get(city_id) != gen:
-                return
-            time.sleep(min(2.0, left))
-            left -= 2.0
-        if store.get_meta("slow_crawl") != "1":
+        time.sleep(BETWEEN_CITIES_SEC)
+        if _rest_gen.get("_daily") != gen:
             return
-        if _rest_gen.get(city_id) != gen:
-            return
-        with _lock:
-            if _job(city_id).get("running"):
-                return
-        refresh(city_id, fast=False)
+        maybe_daily_refresh()
 
-    threading.Thread(target=later, daemon=True, name="propmap-slow-rest").start()
-
-
-def _resume_slow_if_needed() -> None:
-    if store.get_meta("slow_crawl") != "1":
-        return
-    city = store.get_meta("slow_crawl_city") or "puerto-madryn"
-    refresh(city, fast=False)
+    threading.Thread(target=later, daemon=True, name="propmap-daily-next").start()
 
 
 def maybe_daily_refresh() -> None:
-    if store.get_meta("slow_crawl") == "1":
+    store.init()
+    load_custom_places()
+    if crawl.aborted() and not _running_ids():
         return
-    if store.get_meta("auto_daily") != "1":
+    from .listings_cache import city_counts
+    from .schedule import next_jobs
+
+    try:
+        set_listing_counts(city_counts())
+    except Exception:
+        pass
+    running = _running_ids()
+    background_n = sum(1 for cid in running if (_jobs.get(cid) or {}).get("mode") != "fast")
+    slots = min(MAX_JOBS - len(running), MAX_BACKGROUND - background_n)
+    if slots <= 0:
         return
-    with _lock:
-        if any(job.get("running") for job in _jobs.values()):
-            return
-    age = _last_complete_age_sec()
-    if age is None or age > DAILY_SEC:
-        for city_id, cfg in CITIES.items():
-            if not cfg.get("builtin"):
-                continue
-            with _lock:
-                if _job(city_id)["running"]:
-                    continue
-            refresh(city_id, fast=False)
-            time.sleep(1)
+    for city_id, fast in next_jobs(running, slots):
+        label = _place_label(city_id)
+        _log(f"Motor · toca {label}{' (rápido)' if fast else ''}.", city_id)
+        refresh(city_id, fast=fast, interactive=False)
+        running.add(city_id)
 
 
 def start_background_scraper() -> None:
@@ -660,7 +988,9 @@ def start_background_scraper() -> None:
     def loop() -> None:
         time.sleep(8)
         try:
-            _resume_slow_if_needed()
+            store.init()
+            store.set_meta("slow_crawl", "0")
+            maybe_daily_refresh()
         except Exception:
             pass
         while True:

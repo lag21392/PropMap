@@ -11,62 +11,16 @@ from ..text_quality import clean_portal_address
 from . import detect_type, locate_item, paginate, parse_number
 from .urls import mercadolibre_urls
 
-CITY_SEARCHES = {
-    "puerto-madryn": [
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/puerto-madryn/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/chubut/puerto-madryn/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/ph/venta/chubut/puerto-madryn/", "ph"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/puerto-madryn/", "terreno"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/el-doradillo/", "terreno"),
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/el-doradillo/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/inmuebles/venta/chubut/punta-cuevas/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/punta-cuevas/", "terreno"),
-        ("https://inmuebles.mercadolibre.com.ar/inmuebles/venta/chubut/playa-parana/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/cerro-avanzado/", "terreno"),
-    ],
-    "trelew": [
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/trelew/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/chubut/trelew/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/ph/venta/chubut/trelew/", "ph"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/trelew/", "terreno"),
-    ],
-    "rawson": [
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/rawson/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/chubut/rawson/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/ph/venta/chubut/rawson/", "ph"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/rawson/", "terreno"),
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/playa-union/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/playa-union/", "terreno"),
-    ],
-    "gaiman": [
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/gaiman/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/chubut/gaiman/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/ph/venta/chubut/gaiman/", "ph"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/gaiman/", "terreno"),
-    ],
-    "playa-union": [
-        ("https://inmuebles.mercadolibre.com.ar/casas/venta/chubut/playa-union/", "casa"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/chubut/playa-union/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/ph/venta/chubut/playa-union/", "ph"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/chubut/playa-union/", "terreno"),
-    ],
-    "microcentro-caba": [
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/capital-federal/microcentro/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/capital-federal/san-nicolas/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/capital-federal/monserrat/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/ph/venta/capital-federal/san-nicolas/", "ph"),
-        ("https://inmuebles.mercadolibre.com.ar/departamentos/venta/capital-federal/retiro/", "departamento"),
-        ("https://inmuebles.mercadolibre.com.ar/terrenos/venta/capital-federal/san-nicolas/", "terreno"),
-    ],
-}
 
+def scrape(progress=lambda _m: None, city: str | None = None, should_stop=None, on_chunk=None) -> list[Listing]:
+    from ..geo import default_city
 
-def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=None, on_chunk=None) -> list[Listing]:
+    city = city or default_city()
     listings: list[Listing] = []
-    for url, ptype in mercadolibre_urls(city, CITY_SEARCHES):
+    for url, ptype in mercadolibre_urls(city):
         if should_stop and should_stop():
             break
-        progress(f"Mercado Libre · {city} · {ptype}s")
+        progress(f"Revisando {ptype}s…")
         try:
             listings.extend(
                 paginate(
@@ -75,8 +29,8 @@ def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=No
                     on_chunk=on_chunk,
                 )
             )
-        except Exception as exc:
-            progress(f"Mercado Libre {city} {ptype}: {exc}")
+        except Exception:
+            progress("Un lote no respondió, sigo…")
     return listings
 
 
@@ -143,6 +97,7 @@ def _from_cards(html: str, fallback_type: str, city: str) -> list[Listing]:
                 image=image,
                 description=title[:900],
                 city=city,
+                extra={"photos": [image]} if image else {},
             )
         )
     return items

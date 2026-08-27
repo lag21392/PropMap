@@ -3,6 +3,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+SOURCE_LABELS = {
+    "zonaprop": "ZonaProp",
+    "mercadolibre": "Mercado Libre",
+    "properati": "Properati",
+    "argenprop": "Argenprop",
+    "manual": "Carga manual",
+}
+
 
 @dataclass
 class Listing:
@@ -39,7 +47,7 @@ class Listing:
     favorite: bool = False
     notes: str = ""
     contacted: bool = False
-    city: str = "puerto-madryn"
+    city: str = "caba"
     quality_score: float | None = None
     quality_label: str = ""
     details_scraped: bool = False
@@ -55,7 +63,9 @@ class Listing:
         return data
 
     def to_public_dict(self) -> dict[str, Any]:
-        return {
+        from .geo import apply_public_location
+
+        data = {
             "id": self.id,
             "source": self.source,
             "url": self.url,
@@ -83,28 +93,58 @@ class Listing:
             "deal_label": self.deal_label,
             "vs_barrio_pct": self.vs_barrio_pct,
             "has_exact_location": self.has_exact_location,
-            "favorite": self.favorite,
-            "notes": self.notes,
-            "contacted": self.contacted or bool((self.extra or {}).get("contacted")),
+            "favorite": False,
+            "notes": "",
+            "contacted": False,
             "city": self.city,
             "quality_score": self.quality_score,
             "quality_label": self.quality_label,
             "details_scraped": self.details_scraped,
             "amenities": (self.extra or {}).get("amenities") or [],
+            "tags": (self.extra or {}).get("tags") or (self.extra or {}).get("amenities") or [],
             "expenses": (self.extra or {}).get("expenses"),
             "description": self.description or "",
             "published_at": self.published_at,
             "deal_score": (self.extra or {}).get("deal_score"),
             "is_outlier": bool((self.extra or {}).get("is_outlier")),
             "deal_reasons": (self.extra or {}).get("deal_reasons") or [],
+            "monthly_rent_usd": (self.extra or {}).get("monthly_rent_usd"),
+            "monthly_yield_pct": (self.extra or {}).get("monthly_yield_pct"),
+            "nightly_usd": (self.extra or {}).get("nightly_usd"),
+            "temporal_yield_pct": (self.extra or {}).get("temporal_yield_pct"),
+            "occupancy_pct": (self.extra or {}).get("occupancy_pct"),
+            "rental_score": (self.extra or {}).get("rental_score"),
+            "rental_label": (self.extra or {}).get("rental_label") or "",
+            "rental_reasons": (self.extra or {}).get("rental_reasons") or [],
+            "rental_month_scope": (self.extra or {}).get("rental_month_scope") or "",
+            "rental_night_scope": (self.extra or {}).get("rental_night_scope") or "",
+            "rental_month_n": (self.extra or {}).get("rental_month_n") or 0,
+            "rental_night_n": (self.extra or {}).get("rental_night_n") or 0,
             "data_fixes": (self.extra or {}).get("data_fixes") or [],
             "exclude_from_comps": bool((self.extra or {}).get("exclude_from_comps")),
+            "location_kind": (self.extra or {}).get("location_kind") or "",
+            "intersection": (self.extra or {}).get("intersection") or "",
+            "between": (self.extra or {}).get("between") or "",
+            "approx_address": (self.extra or {}).get("approx_address") or "",
+            "street": (self.extra or {}).get("street") or "",
+            "street_number": (self.extra or {}).get("street_number"),
+            "portal_lat": (self.extra or {}).get("portal_lat"),
+            "portal_lon": (self.extra or {}).get("portal_lon"),
+            "mortgage_credit": (self.extra or {}).get("mortgage_credit"),
+            "floor": (self.extra or {}).get("llm", {}).get("floor") if isinstance((self.extra or {}).get("llm"), dict) else None,
+            "orientation": (self.extra or {}).get("llm", {}).get("orientation") if isinstance((self.extra or {}).get("llm"), dict) else None,
+            "condition": (self.extra or {}).get("llm", {}).get("condition") if isinstance((self.extra or {}).get("llm"), dict) else None,
             "lot_m2": self.total_m2,
-            "source_label": {
-                "zonaprop": "ZonaProp",
-                "mercadolibre": "Mercado Libre",
-                "properati": "Properati",
-                "argenprop": "Argenprop",
-                "manual": "Carga manual",
-            }.get(self.source, self.source),
+            "source_label": SOURCE_LABELS.get(self.source, self.source),
+            "sources": (self.extra or {}).get("sources") or [
+                {
+                    "id": self.id,
+                    "source": self.source,
+                    "url": self.url,
+                    "label": SOURCE_LABELS.get(self.source, self.source),
+                }
+            ],
+            "photos": (self.extra or {}).get("photos") or ([self.image] if self.image else []),
+            "duplicate_of": (self.extra or {}).get("duplicate_of") or "",
         }
+        return apply_public_location(data)

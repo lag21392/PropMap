@@ -9,7 +9,14 @@ TYPE_LABEL = {
     "departamento": "Depto",
     "ph": "PH",
     "terreno": "Terreno",
+    "local": "Local",
+    "oficina": "Oficina",
+    "galpon": "Galpón",
 }
+CREDIT_RE = re.compile(
+    r"apto\s+cr[eé]dito|cr[eé]dito\s+hipotecario|\buva\b|procrear|apto\s+bancario",
+    re.I,
+)
 
 FEATURE_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("cochera", ("cochera", "garage", "estacionamiento", "parking")),
@@ -20,7 +27,7 @@ FEATURE_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("ascensor", ("ascensor", "elevador")),
     ("luminoso", ("luminoso", "luminosa", "luz natural", "mucho sol")),
     ("vista al mar", ("vista al mar", "vista al golfo", "frente al mar", "al agua")),
-    ("apto crédito", ("apto credito", "apto crédito", "apto bancario")),
+    ("apto crédito", ("apto credito", "apto crédito", "apto bancario", "credito hipotecario", "crédito hipotecario", "procrear")),
     ("reciclado", ("reciclado", "reciclada", "a nuevo", "refaccionado")),
     ("calefacción", ("calefaccion", "calefacción", "piso radiante")),
     ("aire acondicionado", ("aire acondicionado", "split")),
@@ -80,6 +87,8 @@ def analyze(item: Listing) -> Listing:
         expenses = extract_expenses(blob)
         if expenses:
             extra["expenses"] = expenses
+    if extra.get("mortgage_credit") is None and CREDIT_RE.search(blob):
+        extra["mortgage_credit"] = True
     item.extra = extra
     fill_areas(item, blob)
     item.quality_score = _quality(item, amenities)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 from datetime import datetime, timezone
@@ -10,11 +11,24 @@ from urllib.parse import unquote, urljoin
 from ..features import analyze, extract_features
 from ..http_client import decode_js_object, fetch_bytes, fetch_text
 from ..models import Listing
-from ..text_quality import address_quality, clean_portal_address, title_quality
-from . import detect_type, parse_number
+from ..text_quality import address_quality, clean_portal_address, looks_like_intersection, title_quality
+from . import attach_location_facts, detect_type, parse_number
 
-DETAILS_PARSER = "4"
+DETAILS_PARSER = "8"
 PDF_HREF = re.compile(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', re.I)
+ZP_MAP_LAT = re.compile(
+    r"(?:const|let|var)\s+mapLatOf\s*=\s*[\"']([A-Za-z0-9+/=]+)[\"']",
+    re.I,
+)
+ZP_MAP_LNG = re.compile(
+    r"(?:const|let|var)\s+mapLngOf\s*=\s*[\"']([A-Za-z0-9+/=]+)[\"']",
+    re.I,
+)
+ZP_ADDR_VIS = re.compile(
+    r"""['"]address['"]\s*:\s*\{\s*['"]name['"]\s*:\s*['"]([^'"]+)['"]"""
+    r"""\s*,\s*['"]visibility['"]\s*:\s*['"](\w+)['"]""",
+    re.I,
+)
 JSON_LD = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.S)
 ML_COORDS = re.compile(
     r'"latitude"\s*:\s*"(-?\d+\.\d+)"\s*,\s*"longitude"\s*:\s*"(-?\d+\.\d+)"',
@@ -25,8 +39,18 @@ ML_COORDS_SWAP = re.compile(
     re.I,
 )
 MAP_CENTER = re.compile(r"[?&]center=(-?\d+\.\d+)(?:%2C|,)(-?\d+\.\d+)", re.I)
+MAP_MARKERS = re.compile(
+    r"[?&]markers(?:[^=]*=)*(-?\d+\.\d+)(?:%2C|,)(-?\d+\.\d+)",
+    re.I,
+)
+GMAPS_AT = re.compile(r"maps\.[^/\"']+/[^\"']*@(-?\d+\.\d+),(-?\d+\.\d+)", re.I)
+GMAPS_2D3D = re.compile(r"!2d(-?\d+\.\d+)!3d(-?\d+\.\d+)")
 GENERIC_LATLON = re.compile(
     r'data-(?:lat|latitude)=["\'](-?\d+\.\d+)["\'][^>]{0,80}data-(?:lng|lon|longitude)=["\'](-?\d+\.\d+)["\']',
+    re.I,
+)
+PROPERATI_DESC = re.compile(
+    r'id=["\']description-text["\'][^>]*>([\s\S]*?)</div>',
     re.I,
 )
 PROPERATI_MAP = re.compile(
@@ -78,6 +102,9 @@ def enrich_details(item: Listing, should_stop=lambda: False) -> Listing:
 
 
 def _from_zonaprop_state(item: Listing, html: str) -> None:
+    url = (item.url or "").lower()
+    if item.source != "zonaprop" and "zonaprop.com" not in url:
+        return
     state = decode_js_object(html, "window.__PRELOADED_STATE__") or {}
     posting = (
         (state.get("postingStore") or {}).get("posting")
@@ -85,39 +112,95 @@ def _from_zonaprop_state(item: Listing, html: str) -> None:
         or state.get("posting")
         or {}
     )
-    if not isinstance(posting, dict) or not posting:
-        return
-    desc = posting.get("descriptionNormalized") or posting.get("description") or ""
-    if desc and len(str(desc)) > len(item.description or ""):
-        item.description = unescape(str(desc))[:2000]
-    loc = posting.get("postingLocation") or {}
-    geo = ((loc.get("postingGeolocation") or {}).get("geolocation") or {})
-    lat = _num(geo.get("latitude"))
-    lon = _num(geo.get("longitude"))
-    if lat and lon:
-        item.lat, item.lon = lat, lon
-    address = ((loc.get("address") or {}).get("name") or "").strip()
-    if address:
-        _set_address(item, address)
-    expenses = posting.get("expenses") or {}
-    amount = parse_number(str(expenses.get("amount") or expenses.get("formattedAmount") or ""))
-    extra = dict(item.extra or {})
-    if amount:
-        extra["expenses"] = amount
-    amenities = list(extra.get("amenities") or [])
-    features = posting.get("mainFeatures") or posting.get("generalFeatures") or {}
-    if isinstance(features, dict):
-        for node in features.values():
-            if not isinstance(node, dict):
+    if isinstance(posting, dict) and posting:
+        desc = posting.get("descriptionNormalized") or posting.get("description") or ""
+        if desc and len(str(desc)) > len(item.description or ""):
+            item.description = unescape(str(desc))[:2000]
+        loc = posting.get("postingLocation") or {}
+        geo = ((loc.get("postingGeolocation") or {}).get("geolocation") or {})
+        lat = _num(geo.get("latitude"))
+        lon = _num(geo.get("longitude"))
+        if lat and lon:
+            item.lat, item.lon = lat, lon
+        address = ((loc.get("address") or {}).get("name") or "").strip()
+        if address:
+            _set_address(item, address)
+        from . import portal_neighborhood
+
+        neighborhood = portal_neighborhood(loc.get("neighborhood"), loc.get("barrio"), loc.get("zone"))
+        if neighborhood:
+            extra_loc = dict(item.extra or {})
+            extra_loc["barrio"] = neighborhood
+            item.extra = extra_loc
+            if item.barrio in {"", "Sin clasificar"}:
+                item.barrio = neighborhood
+        expenses = posting.get("expenses") or {}
+        amount = parse_number(str(expenses.get("amount") or expenses.get("formattedAmount") or ""))
+        extra = dict(item.extra or {})
+        if amount:
+            extra["expenses"] = amount
+        amenities = list(extra.get("amenities") or [])
+        features = posting.get("mainFeatures") or posting.get("generalFeatures") or {}
+        if isinstance(features, dict):
+            for node in features.values():
+                if not isinstance(node, dict):
+                    continue
+                label = str(node.get("label") or node.get("value") or "").strip()
+                if label and label not in amenities:
+                    amenities.append(label)
+        extra["amenities"] = amenities
+        item.extra = extra
+        pictures = ((posting.get("visiblePictures") or {}).get("pictures") or [])
+        photo_urls = []
+        for pic in pictures:
+            if not isinstance(pic, dict):
                 continue
-            label = str(node.get("label") or node.get("value") or "").strip()
-            if label and label not in amenities:
-                amenities.append(label)
-    extra["amenities"] = amenities
+            href = pic.get("url730x532") or pic.get("url360x266") or pic.get("url") or ""
+            if href:
+                photo_urls.append(href)
+        if photo_urls and not item.image:
+            item.image = photo_urls[0]
+        if photo_urls:
+            from ..dedupe import add_photos
+
+            add_photos(item, photo_urls)
+    _from_zonaprop_map(item, html)
+
+
+def _from_zonaprop_map(item: Listing, html: str) -> None:
+    """Pin del mapa de la ficha: ZonaProp ya no manda __PRELOADED_STATE__ y cifra lat/lon en base64."""
+    extra = dict(item.extra or {})
+    addr = ZP_ADDR_VIS.search(html)
+    visibility = (addr.group(2) if addr else "").strip().lower()
+    if addr:
+        _set_address(item, addr.group(1))
+    lat = lon = None
+    lat_m = ZP_MAP_LAT.search(html)
+    lng_m = ZP_MAP_LNG.search(html)
+    if lat_m and lng_m:
+        lat, lon = _b64_coord(lat_m.group(1)), _b64_coord(lng_m.group(1))
+    if lat and lon:
+        _set_coords(item, lat, lon)
+        extra["portal_lat"] = item.lat
+        extra["portal_lon"] = item.lon
+    if visibility in {"exact", "accurate"} or (not visibility and lat and lon):
+        extra["map_visibility"] = visibility or "exact"
+        extra["portal_exact"] = True
+        extra["portal_approx"] = False
+    elif visibility:
+        extra["map_visibility"] = visibility
+        extra["portal_exact"] = False
+        extra["portal_approx"] = True
+        item.has_exact_location = False
     item.extra = extra
-    pictures = ((posting.get("visiblePictures") or {}).get("pictures") or [])
-    if pictures and not item.image:
-        item.image = pictures[0].get("url730x532") or pictures[0].get("url360x266") or item.image
+
+
+def _b64_coord(raw: str) -> float | None:
+    try:
+        text = base64.b64decode(raw).decode("ascii").strip()
+    except Exception:
+        return None
+    return _num(text)
 
 
 def _from_mercadolibre(item: Listing, html: str) -> None:
@@ -194,7 +277,9 @@ def _from_json_ld(item: Listing, html: str) -> None:
                 if addr.get("streetAddress"):
                     _set_address(item, line)
             geo = node.get("geo") if isinstance(node.get("geo"), dict) else {}
-            _set_coords(item, geo.get("latitude"), geo.get("longitude"))
+            extra_geo = item.extra or {}
+            if not extra_geo.get("portal_approx") and not extra_geo.get("portal_exact"):
+                _set_coords(item, geo.get("latitude"), geo.get("longitude"))
             floor = node.get("floorSize") if isinstance(node.get("floorSize"), dict) else {}
             area = parse_number(str(floor.get("value") or ""))
             if area and not item.covered_m2:
@@ -216,15 +301,54 @@ def _from_properati(item: Listing, html: str) -> None:
     url = (item.url or "").lower()
     if item.source != "properati" and "properati.com" not in url:
         return
-    found = PROPERATI_MAP.search(html)
-    if not found:
-        return
-    visibility = (found.group(4) or "").lower()
-    address = unescape(found.group(3) or "").replace("\\u0026", "&")
+    box = PROPERATI_DESC.search(html)
+    if box:
+        _set_description(item, box.group(1))
+    block = _js_block(html, "mapData")
+    lat = lon = address = visibility = ""
+    if block:
+        lat = _coord_field(block, "latitude")
+        lon = _coord_field(block, "longitude")
+        address = _quoted_field(block, "address")
+        visibility = _quoted_field(block, "visibility").lower()
+    if not (lat and lon) or not address:
+        found = PROPERATI_MAP.search(html)
+        if found:
+            if not (lat and lon):
+                lat, lon = found.group(1), found.group(2)
+            if not address:
+                address = unescape(found.group(3) or "").replace("\\u0026", "&")
+            if not visibility:
+                visibility = (found.group(4) or "").lower()
+    extra = dict(item.extra or {})
+    if not (lat and lon):
+        # El clic en "Ver mapa" abre el mismo widget Navent / mapa estático.
+        _from_zonaprop_map(item, html)
+        extra = dict(item.extra or {})
+        if item.lat and item.lon:
+            lat, lon = str(item.lat), str(item.lon)
+        visibility = visibility or str(extra.get("map_visibility") or "").lower()
+    if not (lat and lon):
+        wlat, wlon = _map_widget_coords(html)
+        if wlat and wlon:
+            lat, lon = wlat, wlon
+            visibility = visibility or "approximate"
+    if visibility:
+        extra["map_visibility"] = visibility
+    if re.search(r"enableApproximateArea\s*:\s*true", block or html, re.I):
+        extra["portal_approx_area"] = True
     if address:
-        _set_address(item, address)
-    if visibility == "accurate":
-        _set_coords(item, found.group(1), found.group(2))
+        _set_address(item, _street_line(address))
+    if lat and lon:
+        _set_coords(item, lat, lon)
+        extra["portal_lat"] = item.lat
+        extra["portal_lon"] = item.lon
+        extra["portal_approx"] = visibility != "accurate"
+        extra["portal_map"] = "ver_mapa"
+        if extra["portal_approx"]:
+            extra["portal_exact"] = False
+            item.has_exact_location = False
+    item.extra = extra
 
 
 def _from_visible_html(item: Listing, html: str) -> None:
@@ -252,13 +376,24 @@ def _from_visible_html(item: Listing, html: str) -> None:
 def _coords_from_html(item: Listing, html: str) -> None:
     if item.lat and item.lon:
         return
-    generic = GENERIC_LATLON.search(html)
-    if generic:
-        _set_coords(item, generic.group(1), generic.group(2))
+    if (item.extra or {}).get("portal_approx"):
         return
-    center = MAP_CENTER.search(unquote(html))
-    if center:
-        _set_coords(item, center.group(1), center.group(2))
+    lat, lon = _map_widget_coords(html)
+    if lat and lon:
+        _set_coords(item, lat, lon)
+
+
+def _map_widget_coords(html: str) -> tuple[str, str]:
+    """Centro del mapa que se ve al tocar Ver mapa: static map, iframe o data-lat."""
+    blob = unquote(html or "")
+    for pattern in (MAP_CENTER, MAP_MARKERS, GMAPS_AT, GENERIC_LATLON):
+        found = pattern.search(blob) or pattern.search(html or "")
+        if found:
+            return found.group(1), found.group(2)
+    embed = GMAPS_2D3D.search(blob)
+    if embed:
+        return embed.group(2), embed.group(1)
+    return "", ""
 
 
 def _set_coords(item: Listing, lat, lon) -> None:
@@ -276,8 +411,91 @@ def _set_coords(item: Listing, lat, lon) -> None:
 
 def _set_address(item: Listing, candidate: str) -> None:
     cand = clean_portal_address(unescape(candidate or ""))
+    if not cand:
+        return
+    extra = dict(item.extra or {})
+    from ..geo import parse_street
+    from ..geo_tools import parse_plain_locations
+
+    found = parse_plain_locations(cand)
+    if found.get("corners"):
+        extra.setdefault("intersection", " y ".join(found["corners"][0]))
+    if found.get("between"):
+        extra.setdefault("between", " y ".join(found["between"][0]))
+    st, num = parse_street(cand)
+    cur_st, cur_num = parse_street(item.address or "")
+    if looks_like_intersection(cand) and not (st and num):
+        extra.setdefault("intersection", cand)
+        extra.setdefault("approx_address", cand)
+        item.extra = extra
+        attach_location_facts(item)
+        return
+    if cur_st and cur_num and not (st and num):
+        extra.setdefault("approx_address", cand)
+        item.extra = extra
+        return
+    if st and num:
+        extra["street"] = st
+        extra["street_number"] = num
     if address_quality(cand) > address_quality(item.address or ""):
         item.address = cand
+    item.extra = extra
+    attach_location_facts(item)
+
+
+def _set_description(item: Listing, raw: str) -> None:
+    text = unescape(re.sub(r"<[^>]+>", " ", raw or ""))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > max(80, len(item.description or "")):
+        item.description = text[:2000]
+
+
+def _js_block(html: str, key: str) -> str:
+    found = re.search(rf"{re.escape(key)}\s*:\s*\{{", html)
+    if not found:
+        return ""
+    start = html.find("{", found.start())
+    depth = 0
+    for idx in range(start, min(len(html), start + 12000)):
+        ch = html[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start : idx + 1]
+    return ""
+
+
+def _quoted_field(block: str, name: str) -> str:
+    found = re.search(rf"{re.escape(name)}\s*:\s*[\"']([^\"']*)[\"']", block, re.I)
+    if not found:
+        return ""
+    return unescape(found.group(1)).replace("\\u0026", "&").strip()
+
+
+def _coord_field(block: str, name: str) -> str:
+    quoted = _quoted_field(block, name)
+    if quoted:
+        return quoted
+    found = re.search(rf"{re.escape(name)}\s*:\s*(-?\d+\.\d+)", block, re.I)
+    return found.group(1) if found else ""
+
+
+def _street_line(text: str) -> str:
+    cleaned = clean_portal_address(text)
+    parts = [part.strip(" ,") for part in cleaned.split(",") if part.strip(" ,")]
+    if not parts:
+        return cleaned
+    from ..geo import parse_street
+
+    street, number = parse_street(parts[0])
+    if not (street and number):
+        return cleaned
+    if len(parts) > 1 and len(parts[1]) <= 40:
+        return f"{parts[0]}, {parts[1]}"
+    return parts[0]
 
 
 def _address_quality(text: str) -> int:

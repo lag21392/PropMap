@@ -4,6 +4,7 @@ import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .geo import default_city
 from .models import Listing
 from .places import public_place
 from .scoring import excluded_from_comps
@@ -207,7 +208,7 @@ def take_snapshots(listings: list[Listing]) -> None:
     day = today()
     groups: dict[tuple[str, str], list[Listing]] = {}
     for item in listings:
-        city = item.city or "puerto-madryn"
+        city = item.city or default_city()
         groups.setdefault((city, "all"), []).append(item)
         if item.property_type in TYPES:
             groups.setdefault((city, item.property_type), []).append(item)
@@ -335,10 +336,17 @@ def _headline(
     return f"{what} en {city_label} · el m² {verb} {pct} según {window} · {tone} ({median}){deal_bit}."
 
 
+def _yield_block(items: list[Listing], city: str) -> dict[str, Any]:
+    from .yields import apply_yields, yield_stats
+
+    apply_yields(items)
+    return yield_stats(items)
+
+
 def market_payload(city: str, property_type: str = "") -> dict[str, Any]:
     from . import store
 
-    city = city or "puerto-madryn"
+    city = city or default_city()
     kind = property_type if property_type in TYPES else "all"
     from .geo import listing_fits_city, pin_listing_city
 
@@ -516,4 +524,5 @@ def market_payload(city: str, property_type: str = "") -> dict[str, Any]:
         "new_deals": highlights[:8],
         "tracked": sum(1 for i in items if i.price_usd),
         "days": len(series),
+        "yields": _yield_block(items, city),
     }

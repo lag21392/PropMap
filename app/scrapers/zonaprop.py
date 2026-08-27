@@ -3,76 +3,21 @@ from __future__ import annotations
 from ..http_client import decode_js_object, fetch_text
 from ..models import Listing
 from . import detect_type as detect_type
-from . import locate_item, paginate, parse_number
+from . import locate_item, paginate, parse_number, portal_neighborhood
 from .urls import zonaprop_paths
 
 BASE = "https://www.zonaprop.com.ar"
-CITY_SEARCHES = {
-    "puerto-madryn": [
-        ("casas-venta-puerto-madryn", "casa"),
-        ("departamentos-venta-puerto-madryn", "departamento"),
-        ("ph-venta-puerto-madryn", "ph"),
-        ("terrenos-venta-puerto-madryn", "terreno"),
-        ("inmuebles-venta-el-doradillo", ""),
-        ("terrenos-venta-el-doradillo", "terreno"),
-        ("casas-venta-el-doradillo", "casa"),
-        ("inmuebles-venta-punta-cuevas", ""),
-        ("terrenos-venta-punta-cuevas", "terreno"),
-        ("inmuebles-venta-playa-parana", ""),
-        ("casas-venta-playa-parana", "casa"),
-        ("terrenos-venta-cerro-avanzado", "terreno"),
-        ("inmuebles-venta-cerro-avanzado", ""),
-        ("inmuebles-venta-puerto-madryn", ""),
-    ],
-    "trelew": [
-        ("casas-venta-trelew", "casa"),
-        ("departamentos-venta-trelew", "departamento"),
-        ("ph-venta-trelew", "ph"),
-        ("terrenos-venta-trelew", "terreno"),
-        ("inmuebles-venta-trelew", ""),
-    ],
-    "rawson": [
-        ("casas-venta-rawson", "casa"),
-        ("departamentos-venta-rawson", "departamento"),
-        ("ph-venta-rawson", "ph"),
-        ("terrenos-venta-rawson", "terreno"),
-        ("casas-venta-playa-union", "casa"),
-        ("terrenos-venta-playa-union", "terreno"),
-        ("inmuebles-venta-rawson", ""),
-    ],
-    "gaiman": [
-        ("casas-venta-gaiman", "casa"),
-        ("departamentos-venta-gaiman", "departamento"),
-        ("ph-venta-gaiman", "ph"),
-        ("terrenos-venta-gaiman", "terreno"),
-        ("inmuebles-venta-gaiman", ""),
-    ],
-    "playa-union": [
-        ("casas-venta-playa-union", "casa"),
-        ("departamentos-venta-playa-union", "departamento"),
-        ("ph-venta-playa-union", "ph"),
-        ("terrenos-venta-playa-union", "terreno"),
-        ("inmuebles-venta-playa-union", ""),
-    ],
-    "microcentro-caba": [
-        ("departamentos-venta-microcentro", "departamento"),
-        ("departamentos-venta-san-nicolas", "departamento"),
-        ("departamentos-venta-monserrat", "departamento"),
-        ("departamentos-venta-retiro", "departamento"),
-        ("ph-venta-san-nicolas", "ph"),
-        ("ph-venta-microcentro", "ph"),
-        ("terrenos-venta-microcentro", "terreno"),
-        ("terrenos-venta-san-nicolas", "terreno"),
-    ],
-}
 
 
-def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=None, on_chunk=None) -> list[Listing]:
+def scrape(progress=lambda _m: None, city: str | None = None, should_stop=None, on_chunk=None) -> list[Listing]:
+    from ..geo import default_city
+
+    city = city or default_city()
     listings: list[Listing] = []
-    for slug, ptype in zonaprop_paths(city, CITY_SEARCHES):
+    for slug, ptype in zonaprop_paths(city):
         if should_stop and should_stop():
             break
-        progress(f"ZonaProp · {city} · {ptype or 'inmuebles'}")
+        progress(f"Revisando {ptype or 'inmuebles'}…")
         try:
             listings.extend(
                 paginate(
@@ -81,8 +26,8 @@ def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=No
                     on_chunk=on_chunk,
                 )
             )
-        except Exception as exc:
-            progress(f"ZonaProp {city} {ptype}: {exc}")
+        except Exception:
+            progress(f"Un lote no respondió, sigo…")
     return listings
 
 
@@ -131,11 +76,25 @@ def _parse(raw: dict, fallback_type: str, city: str) -> Listing | None:
         currency = "USD"
     loc = raw.get("postingLocation") or {}
     geo = ((loc.get("postingGeolocation") or {}).get("geolocation") or {})
-    address = (loc.get("address") or {}).get("name") or ""
+    addr_node = loc.get("address") or {}
+    if isinstance(addr_node, dict):
+        address = addr_node.get("name") or ""
+        visibility = str(addr_node.get("visibility") or "").strip().lower()
+    else:
+        address = str(addr_node or "")
+        visibility = ""
+    neighborhood = portal_neighborhood(loc.get("neighborhood"), loc.get("barrio"), loc.get("zone"))
     pictures = ((raw.get("visiblePictures") or {}).get("pictures") or [])
     image = ""
-    if pictures:
-        image = pictures[0].get("url360x266") or pictures[0].get("url730x532") or ""
+    photo_urls = []
+    for pic in pictures:
+        if not isinstance(pic, dict):
+            continue
+        href = pic.get("url730x532") or pic.get("url360x266") or pic.get("url") or ""
+        if href:
+            photo_urls.append(href)
+    if photo_urls:
+        image = photo_urls[0]
     publisher = ((raw.get("publisher") or {}).get("name") or "").strip()
     title = raw.get("title") or raw.get("generatedTitle") or "Propiedad en venta"
     text = " ".join(
@@ -164,6 +123,20 @@ def _parse(raw: dict, fallback_type: str, city: str) -> Listing | None:
                     amenities.append(label)
     expenses = raw.get("expenses") or {}
     extra = {"amenities": amenities}
+    if photo_urls:
+        extra["photos"] = photo_urls[:24]
+    if neighborhood:
+        extra["barrio"] = neighborhood
+        if neighborhood and neighborhood.lower() not in address.lower():
+            address = f"{address}, {neighborhood}" if address else neighborhood
+    if visibility:
+        extra["map_visibility"] = visibility
+        if visibility in {"exact", "accurate"}:
+            extra["portal_exact"] = True
+            extra["portal_approx"] = False
+        else:
+            extra["portal_exact"] = False
+            extra["portal_approx"] = True
     amount = parse_number(str(expenses.get("amount") or expenses.get("formattedAmount") or ""))
     if amount:
         extra["expenses"] = amount

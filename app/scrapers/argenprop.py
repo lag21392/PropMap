@@ -9,57 +9,15 @@ from .urls import argenprop_urls
 BASE = "https://www.argenprop.com"
 
 
-def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=None, on_chunk=None) -> list[Listing]:
-    CITY_SEARCHES = {
-        "puerto-madryn": [
-            (f"{BASE}/casas/venta/puerto-madryn", "casa"),
-            (f"{BASE}/departamentos/venta/puerto-madryn", "departamento"),
-            (f"{BASE}/ph/venta/puerto-madryn", "ph"),
-            (f"{BASE}/terrenos/venta/puerto-madryn", "terreno"),
-            (f"{BASE}/terrenos/venta/el-doradillo", "terreno"),
-            (f"{BASE}/casas/venta/el-doradillo", "casa"),
-            (f"{BASE}/terrenos/venta/punta-cuevas", "terreno"),
-            (f"{BASE}/casas/venta/punta-cuevas", "casa"),
-            (f"{BASE}/casas/venta/playa-parana", "casa"),
-            (f"{BASE}/terrenos/venta/cerro-avanzado", "terreno"),
-        ],
-        "trelew": [
-            (f"{BASE}/casas/venta/trelew", "casa"),
-            (f"{BASE}/departamentos/venta/trelew", "departamento"),
-            (f"{BASE}/ph/venta/trelew", "ph"),
-            (f"{BASE}/terrenos/venta/trelew", "terreno"),
-        ],
-        "rawson": [
-            (f"{BASE}/casas/venta/rawson", "casa"),
-            (f"{BASE}/departamentos/venta/rawson", "departamento"),
-            (f"{BASE}/ph/venta/rawson", "ph"),
-            (f"{BASE}/terrenos/venta/rawson", "terreno"),
-            (f"{BASE}/casas/venta/playa-union", "casa"),
-        ],
-        "gaiman": [
-            (f"{BASE}/casas/venta/gaiman", "casa"),
-            (f"{BASE}/departamentos/venta/gaiman", "departamento"),
-            (f"{BASE}/ph/venta/gaiman", "ph"),
-            (f"{BASE}/terrenos/venta/gaiman", "terreno"),
-        ],
-        "playa-union": [
-            (f"{BASE}/casas/venta/playa-union", "casa"),
-            (f"{BASE}/departamentos/venta/playa-union", "departamento"),
-            (f"{BASE}/ph/venta/playa-union", "ph"),
-            (f"{BASE}/terrenos/venta/playa-union", "terreno"),
-        ],
-        "microcentro-caba": [
-            (f"{BASE}/departamentos/venta/microcentro", "departamento"),
-            (f"{BASE}/departamentos/venta/san-nicolas", "departamento"),
-            (f"{BASE}/ph/venta/san-nicolas", "ph"),
-            (f"{BASE}/terrenos/venta/microcentro", "terreno"),
-        ],
-    }
+def scrape(progress=lambda _m: None, city: str | None = None, should_stop=None, on_chunk=None) -> list[Listing]:
+    from ..geo import default_city
+
+    city = city or default_city()
     listings: list[Listing] = []
-    for url, ptype in argenprop_urls(city, CITY_SEARCHES):
+    for url, ptype in argenprop_urls(city):
         if should_stop and should_stop():
             break
-        progress(f"Argenprop · {city} · {ptype}s")
+        progress(f"Revisando {ptype}s…")
         try:
             listings.extend(
                 paginate(
@@ -68,12 +26,15 @@ def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=No
                     on_chunk=on_chunk,
                 )
             )
-        except Exception as exc:
-            progress(f"Argenprop {city} {ptype}: {exc}")
+        except Exception:
+            progress("Un lote no respondió, sigo…")
     return listings
 
 
-def _page(url: str, fallback_type: str, page: int, city: str = "puerto-madryn") -> list[Listing]:
+def _page(url: str, fallback_type: str, page: int, city: str | None = None) -> list[Listing]:
+    from ..geo import default_city
+
+    city = city or default_city()
     page_url = url if page == 1 else f"{url}?pagina-{page}"
     doc = tree(page_url)
     cards = doc.xpath('//*[@data-item-card]')
@@ -121,6 +82,7 @@ def _page(url: str, fallback_type: str, page: int, city: str = "puerto-madryn") 
             publisher=publisher,
             description=text[:800],
             city=city,
+            extra={"photos": [img]} if img else {},
         )
         items.append(locate_item(item))
     return items

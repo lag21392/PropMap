@@ -1,0 +1,205 @@
+services:
+  propmap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: propmap:local
+    container_name: propmap
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./static:/app/static:ro
+      - ./app:/app/app:ro
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DATA_DIR: /app/data
+      SEARCH_PASSWORD: "${SEARCH_PASSWORD}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
+      AUTH_SECRET: "${AUTH_SECRET:-}"
+      AUTH_DEV_SHOW_LINK: "${AUTH_DEV_SHOW_LINK:-1}"
+      SMTP_HOST: "${SMTP_HOST:-propmap-mail}"
+      SMTP_PORT: "${SMTP_PORT:-1025}"
+      SMTP_TLS: "${SMTP_TLS:-0}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM: "${SMTP_FROM:-PropMap <cuenta@propmap.local>}"
+      MAIL_ADDRESS: "${MAIL_ADDRESS:-cuenta@propmap.local}"
+      MAIL_UI_URL: "${MAIL_UI_URL:-http://127.0.0.1:7500}"
+      LLM_URL: "${LLM_URL:-http://propmap-llm:8080}"
+      LLM_MODEL: "${LLM_MODEL:-qwen35-9b-iq2xxs}"
+      LLM_WORKERS: "${LLM_WORKERS:-1}"
+      OLLAMA_URL: "${LLM_URL:-http://propmap-llm:8080}"
+      OLLAMA_MODEL: "${LLM_MODEL:-qwen35-9b-iq2xxs}"
+      MATOMO_INTERNAL_URL: "${MATOMO_INTERNAL_URL}"
+      MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL}"
+      MATOMO_USER: "${MATOMO_USER}"
+      MATOMO_PASSWORD: "${MATOMO_PASSWORD}"
+      MATOMO_EMAIL: "${MATOMO_EMAIL}"
+      MATOMO_SITE_NAME: "${MATOMO_SITE_NAME}"
+      MATOMO_SITE_URL: "${MATOMO_SITE_URL}"
+      MATOMO_TIMEZONE: "${MATOMO_TIMEZONE}"
+      MATOMO_DB_HOST: "matomo-db"
+      MATOMO_DB_NAME: "${MATOMO_DB_NAME}"
+      MATOMO_DB_USER: "${MATOMO_DB_USER}"
+      MATOMO_DB_PASSWORD: "${MATOMO_DB_PASSWORD}"
+    depends_on:
+      - matomo
+      - propmap-mail
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  matomo-db:
+    image: mariadb:lts
+    container_name: propmap-matomo-db
+    restart: unless-stopped
+    command: --max-allowed-packet=64MB
+    env_file:
+      - .env
+    environment:
+      MARIADB_AUTO_UPGRADE: "1"
+      MARIADB_DATABASE: "${MATOMO_DB_NAME}"
+      MARIADB_USER: "${MATOMO_DB_USER}"
+      MARIADB_PASSWORD: "${MATOMO_DB_PASSWORD}"
+      MARIADB_ROOT_PASSWORD: "${MATOMO_DB_ROOT_PASSWORD}"
+    volumes:
+      - matomo-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 8s
+      timeout: 5s
+      retries: 20
+
+  matomo:
+    image: matomo:latest
+    container_name: propmap-matomo
+    restart: unless-stopped
+    depends_on:
+      matomo-db:
+        condition: service_healthy
+    environment:
+      MATOMO_DATABASE_ADAPTER: mysql
+      MATOMO_DATABASE_TABLES_PREFIX: matomo_
+      MATOMO_DATABASE_HOST: matomo-db
+      MATOMO_DATABASE_USERNAME: "${MATOMO_DB_USER}"
+      MATOMO_DATABASE_PASSWORD: "${MATOMO_DB_PASSWORD}"
+      MATOMO_DATABASE_DBNAME: "${MATOMO_DB_NAME}"
+    volumes:
+      - matomo-html:/var/www/html
+    ports:
+      - "3102:80"
+
+  matomo-cron:
+    image: matomo:latest
+    container_name: propmap-matomo-cron
+    restart: unless-stopped
+    user: www-data
+    depends_on:
+      - matomo
+    volumes:
+      - matomo-html:/var/www/html
+    entrypoint:
+      - /bin/sh
+      - -c
+      - while true; do php /var/www/html/console core:archive --url=http://matomo/ || true; sleep 300; done
+
+  matomo-init:
+    image: matomo:latest
+    container_name: propmap-matomo-init
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MATOMO_DATABASE_HOST: matomo-db
+      MATOMO_DATABASE_USERNAME: "${MATOMO_DB_USER}"
+      MATOMO_DATABASE_PASSWORD: "${MATOMO_DB_PASSWORD}"
+      MATOMO_DATABASE_DBNAME: "${MATOMO_DB_NAME}"
+      MATOMO_DATABASE_TABLES_PREFIX: matomo_
+    depends_on:
+      matomo-db:
+        condition: service_healthy
+      matomo:
+        condition: service_started
+    volumes:
+      - matomo-html:/var/www/html
+      - ./scripts/matomo-bootstrap.sh:/init/bootstrap.sh:ro
+      - ./scripts/matomo-install.php:/init/install.php:ro
+    entrypoint: ["/bin/bash", "/init/bootstrap.sh"]
+
+  propmap-mail:
+    image: axllent/mailpit:latest
+    container_name: propmap-mail
+    restart: unless-stopped
+    ports:
+      - "7500:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      MP_MAX_MESSAGES: "2000"
+    volumes:
+      - mailpit:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  propmap-llm:
+    build:
+      context: .
+      dockerfile: Dockerfile.llm
+    image: propmap-llm:cuda61
+    container_name: propmap-llm
+    restart: unless-stopped
+    runtime: nvidia
+    ports:
+      - "7510:8080"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      LLM_MODEL: "${LLM_MODEL:-qwen35-9b-iq2xxs}"
+      LLM_PARALLEL: "${LLM_PARALLEL:-1}"
+      LLM_CTX: "${LLM_CTX:-4096}"
+      LLM_CACHE_TYPE: "${LLM_CACHE_TYPE:-q8_0}"
+      LLM_THREADS: "${LLM_THREADS:-1}"
+      MODEL_DIR: /models
+    volumes:
+      - ./data/llm:/models
+      - ./scripts/llm-serve.sh:/init/serve.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+volumes:
+  matomo-db:
+  matomo-html:
+  mailpit:

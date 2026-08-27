@@ -2,22 +2,40 @@
 
 App local para juntar casas, PH y departamentos **en venta** en Puerto Madryn, verlos en un mapa y comparar el precio con el promedio del barrio.
 
-No hay que crear cuentas ni pegar API keys. Corre en tu PC y lee los avisos públicos de ZonaProp, Argenprop, Properati y Mercado Libre. Facebook Marketplace pide login, así que queda como atajo + carga manual.
+No hay que crear cuentas ni pegar API keys. Corre en Linux (Docker o Python) y lee los avisos públicos de ZonaProp, Argenprop, Properati y Mercado Libre. Facebook Marketplace pide login, así que queda como atajo + carga manual.
 
 ## Cómo usarla
 
-```bat
-run.bat
+### Docker (recomendado)
+
+En Linux, con Docker Engine y Compose v2:
+
+```bash
+./run.sh
 ```
 
 o:
 
-```bat
-python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```bash
+docker compose up --build
 ```
 
 Abrí [http://127.0.0.1:8000](http://127.0.0.1:8000) y tocá **Buscar avisos ahora**.
+
+Los avisos se guardan en `./data/` (SQLite). Para dejarla en segundo plano:
+
+```bash
+docker compose up --build -d
+```
+
+Parar: `docker compose down`.
+
+### Linux, sin Docker
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
 ## Qué muestra
 

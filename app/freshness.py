@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Iterable
 
 from .models import Listing
@@ -13,23 +14,28 @@ except Exception:
     _AR = timezone.utc
 
 _known: set[str] = set()
+_lock = Lock()
 
 
 def reset_known(ids: Iterable[str] | None = None) -> None:
     global _known
-    _known = set(ids or ())
+    with _lock:
+        _known = set(ids or ())
 
 
 def known_ids() -> set[str]:
-    return _known
+    with _lock:
+        return set(_known)
 
 
 def is_known(listing_id: str) -> bool:
-    return listing_id in _known
+    with _lock:
+        return listing_id in _known
 
 
 def note_ids(ids: Iterable[str]) -> None:
-    _known.update(ids)
+    with _lock:
+        _known.update(ids)
 
 
 def same_local_day(raw: str | None, now: datetime | None = None) -> bool:
@@ -55,13 +61,13 @@ def needs_detail_fetch(item: Listing, now: datetime | None = None) -> bool:
     scraped = bool(item.details_scraped) or bool(extra.get("details_at"))
     if not scraped:
         return True
-    if same_local_day(extra.get("details_at"), now=now):
-        return False
     from .scrapers.details import DETAILS_PARSER
 
     parser = extra.get("details_parser")
     if parser and parser != DETAILS_PARSER:
         return True
+    if same_local_day(extra.get("details_at"), now=now):
+        return False
     listed_price = item.price
     saved_price = extra.get("detail_price")
     try:

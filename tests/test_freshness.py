@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from app.freshness import needs_detail_fetch, reset_known, same_local_day
 from app.models import Listing
 from app.scrapers import paginate
+from app.scrapers.details import DETAILS_PARSER
 
 
 def _item(source_id: str, **kwargs) -> Listing:
@@ -38,9 +39,19 @@ def test_already_downloaded_today_is_skipped():
     item = _item(
         "1",
         details_scraped=True,
-        extra={"details_at": now.isoformat(), "details_parser": "4", "detail_price": 100000},
+        extra={"details_at": now.isoformat(), "details_parser": DETAILS_PARSER, "detail_price": 100000},
     )
     assert needs_detail_fetch(item, now=now) is False
+
+
+def test_same_day_old_parser_needs_fetch():
+    now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
+    item = _item(
+        "1",
+        details_scraped=True,
+        extra={"details_at": now.isoformat(), "details_parser": "6", "detail_price": 100000},
+    )
+    assert needs_detail_fetch(item, now=now) is True
 
 
 def test_same_day_even_if_price_changed_is_skipped():
@@ -49,7 +60,7 @@ def test_same_day_even_if_price_changed_is_skipped():
         "1",
         price=120000,
         details_scraped=True,
-        extra={"details_at": now.isoformat(), "details_parser": "4", "detail_price": 100000},
+        extra={"details_at": now.isoformat(), "details_parser": DETAILS_PARSER, "detail_price": 100000},
     )
     assert needs_detail_fetch(item, now=now) is False
 
@@ -62,7 +73,7 @@ def test_next_day_same_price_is_skipped():
         details_scraped=True,
         extra={
             "details_at": (now - timedelta(days=1)).isoformat(),
-            "details_parser": "4",
+            "details_parser": DETAILS_PARSER,
             "detail_price": 100000,
         },
     )
@@ -77,7 +88,7 @@ def test_next_day_price_change_needs_fetch():
         details_scraped=True,
         extra={
             "details_at": (now - timedelta(days=1)).isoformat(),
-            "details_parser": "4",
+            "details_parser": DETAILS_PARSER,
             "detail_price": 100000,
         },
     )

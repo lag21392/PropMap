@@ -17,6 +17,13 @@ WEAK_PLACES = {
 }
 
 
+def looks_like_intersection(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw or re.search(r"\d", raw):
+        return False
+    return bool(re.search(r"\s+y\s+", raw, re.I))
+
+
 def address_quality(text: str) -> int:
     t = (text or "").strip()
     folded = fold(t)

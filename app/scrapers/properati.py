@@ -7,65 +7,22 @@ from lxml import html as lhtml
 
 from ..http_client import fetch_text
 from ..models import Listing
+from ..text_quality import address_quality
 from . import detect_type, first_int, locate_item, paginate, parse_number
 from .urls import properati_urls
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
-CITY_SEARCHES = {
-    "puerto-madryn": [
-        ("https://www.properati.com.ar/s/puerto-madryn/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/puerto-madryn/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/puerto-madryn/ph/venta", "ph"),
-        ("https://www.properati.com.ar/s/puerto-madryn/terreno/venta", "terreno"),
-        ("https://www.properati.com.ar/s/el-doradillo/terreno/venta", "terreno"),
-        ("https://www.properati.com.ar/s/el-doradillo/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/punta-cuevas/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/punta-cuevas/terreno/venta", "terreno"),
-        ("https://www.properati.com.ar/s/playa-parana/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/cerro-avanzado/terreno/venta", "terreno"),
-    ],
-    "trelew": [
-        ("https://www.properati.com.ar/s/trelew/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/trelew/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/trelew/ph/venta", "ph"),
-        ("https://www.properati.com.ar/s/trelew/terreno/venta", "terreno"),
-    ],
-    "rawson": [
-        ("https://www.properati.com.ar/s/rawson/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/rawson/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/rawson/ph/venta", "ph"),
-        ("https://www.properati.com.ar/s/rawson/terreno/venta", "terreno"),
-        ("https://www.properati.com.ar/s/playa-union/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/playa-union/terreno/venta", "terreno"),
-    ],
-    "gaiman": [
-        ("https://www.properati.com.ar/s/gaiman/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/gaiman/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/gaiman/ph/venta", "ph"),
-        ("https://www.properati.com.ar/s/gaiman/terreno/venta", "terreno"),
-    ],
-    "playa-union": [
-        ("https://www.properati.com.ar/s/playa-union/casa/venta", "casa"),
-        ("https://www.properati.com.ar/s/playa-union/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/playa-union/ph/venta", "ph"),
-        ("https://www.properati.com.ar/s/playa-union/terreno/venta", "terreno"),
-    ],
-    "microcentro-caba": [
-        ("https://www.properati.com.ar/s/microcentro/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/san-nicolas/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/monserrat/departamento/venta", "departamento"),
-        ("https://www.properati.com.ar/s/microcentro/terreno/venta", "terreno"),
-    ],
-}
 
+def scrape(progress=lambda _m: None, city: str | None = None, should_stop=None, on_chunk=None) -> list[Listing]:
+    from ..geo import default_city
 
-def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=None, on_chunk=None) -> list[Listing]:
+    city = city or default_city()
     listings: list[Listing] = []
-    for url, ptype in properati_urls(city, CITY_SEARCHES):
+    for url, ptype in properati_urls(city):
         if should_stop and should_stop():
             break
-        progress(f"Properati · {city} · {ptype}s")
+        progress(f"Revisando {ptype}s…")
         try:
             listings.extend(
                 paginate(
@@ -74,12 +31,15 @@ def scrape(progress=lambda _m: None, city: str = "puerto-madryn", should_stop=No
                     on_chunk=on_chunk,
                 )
             )
-        except Exception as exc:
-            progress(f"Properati {city} {ptype}: {exc}")
+        except Exception:
+            progress("Un lote no respondió, sigo…")
     return listings
 
 
-def _page(url: str, fallback_type: str, page: int, city: str = "puerto-madryn") -> list[Listing]:
+def _page(url: str, fallback_type: str, page: int, city: str | None = None) -> list[Listing]:
+    from ..geo import default_city
+
+    city = city or default_city()
     page_url = url if page == 1 else f"{url}/{page}"
     html = fetch_text(page_url)
     doc = lhtml.fromstring(html)
@@ -109,7 +69,7 @@ def _page(url: str, fallback_type: str, page: int, city: str = "puerto-madryn") 
         )
         address = " ".join(
             card.xpath('.//*[@data-test="snippet__location"]//text() | .//*[contains(@class,"location")]//text()')
-        ).strip() or "Puerto Madryn"
+        ).strip()
         publisher_name = " ".join(card.xpath('.//*[@data-test="agency-name"]//text()')).strip()
         geo = _match_ld(geo_by_id, href, img, text)
         if geo and geo.get("address") and _usable_address(geo["address"]):
@@ -136,6 +96,7 @@ def _page(url: str, fallback_type: str, page: int, city: str = "puerto-madryn") 
             city=city,
             lat=lat,
             lon=lon,
+            extra={"photos": [img]} if img else {},
         )
         items.append(locate_item(item))
     return items
@@ -201,14 +162,7 @@ def _match_ld(index: dict[str, dict], href: str, img: str, text: str) -> dict | 
 
 
 def _usable_address(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if len(t) < 8:
-        return False
-    weak = {"puerto madryn", "trelew", "chubut", "argentina", "capital federal", "biedma"}
-    parts = [p.strip(" ,") for p in re.split(r"[,/]", t) if p.strip()]
-    if parts and all(p in weak for p in parts):
-        return False
-    return bool(re.search(r"\d|&|calle|av\.|avenida|pasaje", t, re.I))
+    return address_quality(text) >= 5
 
 
 def _as_float(value) -> float | None:
