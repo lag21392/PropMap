@@ -74,6 +74,8 @@ def test_prompt_is_city_specific_and_clamp_drops_invented_barrio():
     assert "rooms=N+1" in EXTRACT_SYSTEM
     assert "2 habitaciones" in EXTRACT_SYSTEM
     assert "uncovered_m2" in EXTRACT_SYSTEM
+    assert "province" in EXTRACT_SYSTEM
+    assert "city_label" in EXTRACT_SYSTEM
     assert "covered_m2 + uncovered_m2" in EXTRACT_SYSTEM
     assert len(EXTRACT_SYSTEM) > 700
     names = {row["nombre"] for row in barrios_for_prompt("puerto-madryn", "Desembarco")}

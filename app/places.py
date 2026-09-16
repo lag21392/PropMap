@@ -30,7 +30,7 @@ from .geo import (
     _extent_radius_km,
     _point_in_rings,
 )
-from .place_api import lookup_place, province_slug, search_localidades
+from .place_api import lookup_place, province_slug, provinces, search_city_places
 
 log = logging.getLogger(__name__)
 SEARCH_CACHE_TTL_SEC = 7 * 24 * 3600
@@ -105,7 +105,121 @@ def _same_place_token(left: str, right: str) -> bool:
 
 def _label_key(city_id: str, cfg: dict | None = None) -> str:
     row = cfg or CITIES.get(city_id) or {}
-    return _norm_place_name(str(row.get("label") or city_id.replace("-", " ")))
+    name = _norm_place_name(str(row.get("label") or city_id.replace("-", " ")))
+    if city_id in CABA_IDS or city_id == DEFAULT_CITY:
+        return name
+    prov = _norm_place_name(province_slug(str(row.get("province") or row.get("province_label") or "")))
+    if prov in {"capital federal", "caba", "ciudad autonoma de buenos aires"}:
+        return name
+    return f"{name}|{prov}" if prov else name
+
+
+def _prefer_suggest_row(new: dict, old: dict) -> bool:
+    """Ante homónimos, quedate con el id ciudad-provincia, no el slug pelado."""
+    new_id = str(new.get("id") or "")
+    old_id = str(old.get("id") or "")
+    label = str(new.get("label") or old.get("label") or "")
+    province = str(new.get("province") or old.get("province") or "")
+    want = _place_id(label, province)
+    if new_id == want and old_id != want:
+        return True
+    if old_id == want and new_id != want:
+        return False
+    new_prov = bool(str(new.get("province") or new.get("province_label") or "").strip())
+    old_prov = bool(str(old.get("province") or old.get("province_label") or "").strip())
+    if new_prov != old_prov:
+        return new_prov
+    return len(new_id) > len(old_id)
+
+
+def _merge_search_hit(
+    out: list[dict],
+    seen_ids: set[str],
+    seen_keys: dict[str, int],
+    row: dict,
+    *,
+    limit: int | None = None,
+) -> bool:
+    cid = str(row.get("id") or "")
+    if not cid or cid in seen_ids or not _search_hit_ok(row):
+        return False
+    if not str(row.get("province_label") or "").strip():
+        pretty = _province_display(str(row.get("province") or ""))
+        if pretty and not _is_caba_province(pretty):
+            row["province_label"] = pretty
+    key = _label_key(cid, row)
+    if key in seen_keys:
+        i = seen_keys[key]
+        prev = out[i]
+        if not _prefer_suggest_row(row, prev):
+            return False
+        seen_ids.discard(str(prev.get("id") or ""))
+        seen_ids.add(cid)
+        out[i] = row
+        return True
+    if limit is not None and len(out) >= limit:
+        return False
+    seen_ids.add(cid)
+    seen_keys[key] = len(out)
+    out.append(row)
+    return True
+
+
+def _is_caba_province(province: str) -> bool:
+    token = fold(province_slug(province or "")).replace(" ", "-")
+    return token in {"capital-federal", "caba", "ciudad-autonoma-de-buenos-aires"}
+
+
+def _place_id(name: str, province: str = "") -> str:
+    base = slug_place(name)
+    if not base or base in CABA_IDS or _is_caba_province(province):
+        return base
+    prov = province_slug(province or "")
+    if not prov:
+        return base
+    return f"{base}-{prov}"
+
+
+def _province_display(value: str) -> str:
+    token = province_slug(value or "")
+    if not token:
+        return ""
+    for row in provinces():
+        slug = str(row.get("slug") or "")
+        nombre = str(row.get("nombre") or "")
+        if slug == token or fold(nombre) == fold(value) or fold(nombre) == fold(token):
+            return nombre
+    return str(value).replace("-", " ").title()
+
+
+def _place_hint(cfg: dict) -> str:
+    label = str(cfg.get("label") or cfg.get("id") or "").strip()
+    pretty = _province_display(str(cfg.get("province") or ""))
+    if pretty and not _is_caba_province(pretty):
+        return f"{label}, {pretty}"
+    return label
+
+
+def apply_city_province(city_id: str, province: str) -> None:
+    """Completa la provincia de un lugar ya cargado con lo que dio Georef. No pisa un valor."""
+    cid = (city_id or "").strip()
+    raw = (province or "").strip()
+    if not cid or not raw:
+        return
+    cfg = CITIES.get(cid)
+    if not cfg or cid in CABA_IDS:
+        return
+    if _is_caba_province(raw):
+        return
+    current = str(cfg.get("province") or "").strip()
+    if current and not _is_caba_province(current):
+        return
+    cfg["province"] = province_slug(raw)
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            _persist()
+        except Exception:
+            pass
 
 
 def _prefer_listed_id(left: str, right: str) -> bool:
@@ -163,6 +277,8 @@ def _is_city_place(row: dict) -> bool:
         return name in {"caba", "capital federal", "ciudad autonoma de buenos aires"}
     if censal or mun:
         return bool(name) and (name == censal or name == mun)
+    if not prov:
+        return False
     return kind in _SEARCHABLE_KINDS
 
 
@@ -221,10 +337,6 @@ def _listed_row_is_city(cid: str, cfg: dict) -> bool:
         return True
     if _junk_place_row(cid, cfg):
         return False
-    cached = lookup_place(str(cfg.get("label") or cid), remote=False)
-    parsed = _from_georef_place(cached) if cached else None
-    if parsed:
-        return _search_hit_ok(parsed)
     row = {
         "id": cid,
         "label": cfg.get("label") or cid,
@@ -237,9 +349,13 @@ def _listed_row_is_city(cid: str, cfg: dict) -> bool:
         "categoria": cfg.get("categoria") or "",
         "province": cfg.get("province") or "",
     }
-    if row["municipio"] or row["localidad_censal"]:
+    if cfg.get("province") and _has_map_coords(cfg):
         return _is_city_place(row)
-    return True
+    cached = lookup_place(str(cfg.get("label") or cid), remote=False)
+    parsed = _from_georef_place(cached) if cached else None
+    if parsed:
+        return _search_hit_ok(parsed)
+    return _is_city_place(row)
 
 
 _PLACE_PREFIX = re.compile(
@@ -300,23 +416,25 @@ def preload_priority_places() -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+def _row_matches_query(query: str, row: dict) -> bool:
+    names = [str(row.get("label") or ""), str(row.get("id") or ""), str(row.get("slug") or "")]
+    return _name_hit(fold(query), [name for name in names if name])
+
+
 def search_places(query: str, limit: int = 8) -> list[dict]:
     q = (query or "").strip()
     if len(q) < 2:
         return []
     out: list[dict] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_keys: dict[str, int] = {}
     folded = fold(q)
 
     def add(row: dict) -> None:
-        cid = row.get("id")
-        if not cid or cid in seen or not _search_hit_ok(row):
-            return
-        seen.add(cid)
-        out.append(row)
+        _merge_search_hit(out, seen_ids, seen_keys, row)
 
     for city_id, cfg in list(CITIES.items()):
-        if not cfg.get("builtin") and city_id not in catalog_place_ids():
+        if is_cache_artifact_id(city_id) or not _has_map_coords(cfg):
             continue
         names = [cfg["label"], city_id, *(cfg.get("aliases") or [])]
         if _name_hit(folded, names) and _listed_row_is_city(city_id, cfg):
@@ -324,11 +442,11 @@ def search_places(query: str, limit: int = 8) -> list[dict]:
     cached = _read_search_cache(folded)
     if cached:
         for row in cached:
-            if isinstance(row, dict):
+            if isinstance(row, dict) and _row_matches_query(q, row):
                 add(row)
         if out:
             return out[:limit]
-    if out and len(folded) >= 4:
+    if out and len(folded) < 4:
         threading.Thread(
             target=_refresh_place_search,
             args=(q, limit),
@@ -344,29 +462,26 @@ def search_places(query: str, limit: int = 8) -> list[dict]:
 
 def _search_places_remote(q: str, limit: int) -> list[dict]:
     out: list[dict] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_keys: dict[str, int] = {}
     for variant in _query_variants(q):
-        for place in search_localidades(variant, limit=limit):
+        for place in search_city_places(variant, limit=limit):
             parsed = _from_georef_place(place)
-            if not parsed:
+            if not parsed or not _row_matches_query(q, parsed):
                 continue
             parsed["id"] = _adopt_existing_city(parsed)
-            if parsed["id"] in seen or not _search_hit_ok(parsed):
-                continue
-            seen.add(parsed["id"])
-            out.append(parsed)
+            _merge_search_hit(out, seen_ids, seen_keys, parsed, limit=limit)
             if len(out) >= limit:
                 return out[:limit]
+    if out:
+        return out[:limit]
     rows = _nominatim({"q": q, "countrycodes": "ar", "format": "json", "addressdetails": 1, "limit": limit})
     for row in rows:
         parsed = _from_nominatim(row)
-        if not parsed:
+        if not parsed or not _row_matches_query(q, parsed):
             continue
         parsed["id"] = _adopt_existing_city(parsed)
-        if parsed["id"] in seen or not _search_hit_ok(parsed):
-            continue
-        seen.add(parsed["id"])
-        out.append(parsed)
+        _merge_search_hit(out, seen_ids, seen_keys, parsed, limit=limit)
     return out[:limit]
 
 
@@ -386,7 +501,7 @@ def _read_search_cache(key: str) -> list[dict] | None:
     if os.environ.get("PROPMAP_TEST") == "1":
         return None
     try:
-        raw = store.get_meta(f"place_search:{key}")
+        raw = store.get_meta(f"place_search:v2:{key}")
         blob = json.loads(raw) if raw else None
     except Exception:
         return None
@@ -413,7 +528,7 @@ def _write_search_cache(key: str, places: list[dict]) -> None:
         return
     try:
         store.set_meta(
-            f"place_search:{key}",
+            f"place_search:v2:{key}",
             json.dumps({"at": now, "places": rows}, ensure_ascii=False),
         )
     except Exception:
@@ -422,7 +537,7 @@ def _write_search_cache(key: str, places: list[dict]) -> None:
 
 def _commit_listed_place(city_id: str, **kwargs) -> str:
     if not can_list_place(city_id, label=kwargs.get("label"), query=kwargs.get("query")):
-        raise ValueError("elegí un lugar de las sugerencias")
+        raise ValueError("elegí una ciudad de las sugerencias")
     cid = ensure_place(city_id, **kwargs)
     remember_listed_place(cid)
     return cid
@@ -443,12 +558,12 @@ def place_from_suggestion(
     city_id = (city or "").strip()
     raw = (query or label or city_id).strip()
     if is_cache_artifact_id(slug_place(city_id or raw)):
-        raise ValueError("elegí un lugar de las sugerencias")
+        raise ValueError("elegí una ciudad de las sugerencias")
     if lat is None and lon is None and not city_id and not raw:
-        raise ValueError("elegí un lugar de las sugerencias")
+        raise ValueError("elegí una ciudad de las sugerencias")
     if lat is not None and lon is not None and (city_id or raw):
         if not can_list_place(city_id or raw, label=label, query=raw):
-            raise ValueError("elegí un lugar de las sugerencias")
+            raise ValueError("elegí una ciudad de las sugerencias")
         return _commit_listed_place(
             city_id or raw,
             query=raw,
@@ -463,7 +578,7 @@ def place_from_suggestion(
         if cfg.get("builtin") or resolved in catalog_place_ids():
             return _commit_listed_place(resolved, query=raw or resolved)
     if len(raw) < 2:
-        raise ValueError("elegí un lugar de las sugerencias")
+        raise ValueError("elegí una ciudad de las sugerencias")
     found = search_places(raw, limit=8)
     folded = fold(raw)
     hit = next(
@@ -479,7 +594,7 @@ def place_from_suggestion(
     if hit is None and len(found) == 1:
         hit = found[0]
     if not hit or hit.get("lat") is None or hit.get("lon") is None:
-        raise ValueError("elegí un lugar de las sugerencias")
+        raise ValueError("elegí una ciudad de las sugerencias")
     return _commit_listed_place(
         hit["id"],
         query=hit.get("label") or raw,
@@ -975,20 +1090,27 @@ def _purge_duplicate_labels() -> list[str]:
     return dropped
 
 
+def _unlist_ghost_places() -> list[str]:
+    """Saca del catálogo pueblos que nadie buscó y no tienen masa de avisos. Sin pegarle a la red."""
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return []
+    dropped: list[str] = []
+    for cid in list(listed_place_ids()):
+        if cid == DEFAULT_CITY or cid in CABA_IDS:
+            continue
+        cfg = CITIES.get(cid) or {}
+        if cfg.get("builtin") or _junk_place_row(cid, cfg):
+            continue
+        if _ghost_listed_place(cid, cfg) and unlist_place(cid):
+            dropped.append(cid)
+    return dropped
+
+
 def purge_unofficial_places() -> list[str]:
     """Tira ids inventados, barrios/parajes, y pueblos que nadie buscó ni tienen catálogo."""
     if os.environ.get("PROPMAP_TEST") != "1":
         _drop_artifact_cache_files()
-    dropped: list[str] = []
-    if os.environ.get("PROPMAP_TEST") != "1":
-        for cid in list(listed_place_ids()):
-            if cid == DEFAULT_CITY or cid in CABA_IDS:
-                continue
-            cfg = CITIES.get(cid) or {}
-            if cfg.get("builtin") or _junk_place_row(cid, cfg):
-                continue
-            if _ghost_listed_place(cid, cfg) and unlist_place(cid):
-                dropped.append(cid)
+    dropped = _unlist_ghost_places()
     seen: set[str] = set()
     candidates = list(listed_place_ids())
     for cfg in list(CITIES.values()):
@@ -1042,6 +1164,9 @@ def catalog_place_ids(*, extra_have: set[str] | None = None) -> set[str]:
     for cid in listed_place_ids():
         token = _canonical_listed_id(cid) or cid
         if not token or token in _LISTED_SKIP:
+            continue
+        cfg = CITIES.get(token) or {}
+        if token != DEFAULT_CITY and token not in CABA_IDS and not _listed_row_is_city(token, cfg):
             continue
         if token == DEFAULT_CITY or token in have:
             wanted.add(token)
@@ -1107,13 +1232,16 @@ def listed_cities(listings: list | None = None) -> list[dict]:
             take(cid, cfg)
     unique: dict[str, dict] = {}
     for row in seen.values():
-        key = _norm_place_name(str(row.get("label") or row.get("id") or ""))
+        key = _label_key(str(row.get("id") or ""), row)
         if not key:
             continue
         prev = unique.get(key)
         if prev is None or _prefer_listed_id(str(row["id"]), str(prev["id"])):
             unique[key] = row
-    return sorted(unique.values(), key=lambda row: fold(row["label"]))
+    return sorted(
+        unique.values(),
+        key=lambda row: (fold(row["label"]), fold(row.get("province") or "")),
+    )
 
 
 def ensure_default_city() -> str:
@@ -1225,6 +1353,7 @@ def load_custom_places() -> None:
             if skipped and os.environ.get("PROPMAP_TEST") != "1":
                 _persist()
     ensure_default_city()
+    _unlist_ghost_places()
     _kick_unofficial_purge()
 
 
@@ -1259,11 +1388,16 @@ def _persist() -> None:
 
 
 def _name_hit(folded: str, names: list[str]) -> bool:
+    compact_q = folded.replace("-", " ").replace(" ", "")
     for name in names:
         n = fold(name)
         if not n:
             continue
-        if n == folded or n.replace("-", " ") == folded.replace("-", " "):
+        spaced = n.replace("-", " ")
+        if n == folded or spaced == folded.replace("-", " "):
+            return True
+        compact_n = spaced.replace(" ", "")
+        if len(compact_q) >= 2 and compact_n.startswith(compact_q):
             return True
         if len(folded) >= 4 and (folded in n or (len(n) >= 5 and n in folded)):
             return True
@@ -1283,9 +1417,16 @@ def _canonical_listed_id(cid: str) -> str:
 def _public_city(cfg: dict) -> dict:
     from .geo import same_place_ids
 
+    if not str(cfg.get("province") or "").strip():
+        cached = lookup_place(str(cfg.get("label") or cfg.get("id") or ""), remote=False)
+        if cached and cached.get("province"):
+            apply_city_province(str(cfg.get("id") or ""), str(cached.get("province") or ""))
+    pretty = _province_display(str(cfg.get("province") or ""))
     return {
         "id": cfg["id"],
         "label": cfg["label"],
+        "hint": _place_hint(cfg),
+        "province_label": "" if _is_caba_province(pretty) else pretty,
         "lat": cfg["lat"],
         "lon": cfg["lon"],
         "zoom": cfg.get("zoom") or 13,
@@ -1302,9 +1443,9 @@ def _from_georef_place(place: dict) -> dict | None:
     name = str(place.get("name") or "").strip()
     if not name or place.get("lat") is None or place.get("lon") is None:
         return None
-    city_id = slug_place(name)
     province = province_slug(str(place.get("province") or ""))
-    slug = "capital-federal" if province == "capital-federal" else city_id
+    city_id = _place_id(name, province)
+    slug = "capital-federal" if _is_caba_province(province) else slug_place(name)
     return {
         "id": city_id,
         "label": name,
@@ -1321,6 +1462,7 @@ def _from_georef_place(place: dict) -> dict | None:
         "localidad_censal": str(place.get("localidad_censal") or ""),
         "categoria": str(place.get("categoria") or ""),
         "hint": f"{name}, {place.get('province') or 'Argentina'}",
+        "province_label": str(place.get("province") or "").strip(),
     }
 
 
@@ -1372,10 +1514,10 @@ def _from_nominatim(row: dict) -> dict | None:
     )
     if not name:
         return None
-    city_id = slug_place(name)
     state = fold(addr.get("state") or addr.get("state_district") or "")
     province = province_slug(state) if state else ""
-    if province == "capital-federal" and addresstype not in _SUBURB_TYPES:
+    city_id = _place_id(name, province)
+    if _is_caba_province(province) and addresstype not in _SUBURB_TYPES:
         city_id = "capital-federal"
     try:
         lat, lon = float(row["lat"]), float(row["lon"])
@@ -1389,7 +1531,11 @@ def _from_nominatim(row: dict) -> dict | None:
 
         radius_km = _extent_radius_km(bbox, lat, lon)
         zoom = _zoom_from_bbox(bbox)
-    slug = "capital-federal" if province == "capital-federal" and addresstype not in _SUBURB_TYPES else city_id
+    slug = (
+        "capital-federal"
+        if _is_caba_province(province) and addresstype not in _SUBURB_TYPES
+        else slug_place(name)
+    )
     return {
         "id": city_id,
         "label": str(name).strip(),
@@ -1402,6 +1548,7 @@ def _from_nominatim(row: dict) -> dict | None:
         "radius_km": radius_km,
         "addresstype": addresstype,
         "hint": row.get("display_name") or "",
+        "province_label": _province_display(province) if province else "",
     }
 
 
@@ -1426,16 +1573,22 @@ def _names_overlap(left: set[str], right: set[str]) -> bool:
 
 
 def _adopt_existing_city(parsed: dict) -> str:
-    """Reusa un id ya cargado solo si es el mismo lugar, no un vecino homónimo o un loteo al lado."""
+    """Reusa un id ya cargado solo si es el mismo lugar, no un homónimo de otra provincia."""
+    from .place_api import _same_province
+
     addresstype = parsed.get("addresstype") or ""
     if addresstype in _SUBURB_TYPES:
         return parsed["id"]
     parsed_id = parsed.get("id") or ""
     parsed_names = _place_names(parsed_id, extra=[str(parsed.get("label") or "")])
+    parsed_prov = province_slug(str(parsed.get("province") or ""))
     best = None
     best_d = 1e9
     for city_id, cfg in list(CITIES.items()):
         if not _names_overlap(parsed_names, _place_names(city_id, cfg)):
+            continue
+        cfg_prov = province_slug(str(cfg.get("province") or ""))
+        if parsed_prov and cfg_prov and not _same_province(parsed_prov, cfg_prov):
             continue
         dist = distance_km(parsed["lat"], parsed["lon"], cfg["lat"], cfg["lon"])
         limit = min(float(cfg.get("radius_km") or 15), 14)

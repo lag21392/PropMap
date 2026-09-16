@@ -427,6 +427,64 @@ def test_official_place_rejects_caba_barrio_without_censal():
     assert official_place("villa del parque") is None
 
 
+def test_listed_cities_hides_caba_barrio(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, register_city
+    from app.place_api import remember
+    from app.places import forget_place, listed_cities, reset_listed_places
+
+    remember(
+        "villa del parque",
+        {
+            "name": "Villa del Parque",
+            "kind": "localidad",
+            "province": "Ciudad Autónoma de Buenos Aires",
+            "lat": -34.61,
+            "lon": -58.49,
+        },
+    )
+    reset_listed_places()
+    register_city(
+        "villa-del-parque",
+        label="Villa del Parque",
+        lat=-34.61,
+        lon=-58.49,
+        province="capital-federal",
+        builtin=False,
+    )
+    try:
+        from app import places as places_mod
+
+        with places_mod._listed_lock:
+            places_mod._listed_mem = ["villa-del-parque"]
+        monkeypatch.setattr("app.places._ids_with_saved_listings", lambda: {"villa-del-parque"})
+        ids = {row["id"] for row in listed_cities([])}
+        assert "villa-del-parque" not in ids
+        assert "caba" in ids
+    finally:
+        forget_place("villa-del-parque")
+        CITIES.pop("villa-del-parque", None)
+        for token, owner in list(CITY_ALIASES.items()):
+            if owner == "villa-del-parque" or token == "villa-del-parque":
+                CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
+
+def test_search_places_skips_caba_barrio(monkeypatch):
+    from app.places import search_places
+
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    rows = search_places("Palermo")
+    assert not any("palermo" in str(row.get("id") or "") for row in rows)
+
+
+def test_search_places_keeps_provincial_city(monkeypatch):
+    from app.places import search_places
+
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    rows = search_places("Puerto Madryn")
+    assert any(row.get("id") == "puerto-madryn" for row in rows)
+
+
 def test_listed_cities_hides_barrio_localidad(monkeypatch):
     from app.geo import CITY_ALIASES, CITIES, register_city
     from app.place_api import remember
@@ -492,6 +550,292 @@ def test_listed_cities_dedupe_same_label(monkeypatch):
                 if owner == cid or token == cid:
                     CITY_ALIASES.pop(token, None)
         reset_listed_places()
+
+
+def test_search_city_places_keeps_same_name_in_two_provinces(monkeypatch):
+    from app import place_api
+
+    def fake_georef(path, params):
+        if path == "/municipios":
+            return {
+                "municipios": [
+                    {
+                        "nombre": "Rawson",
+                        "centroide": {"lat": -43.3002, "lon": -65.1023},
+                        "provincia": {"nombre": "Chubut"},
+                    },
+                    {
+                        "nombre": "Rawson",
+                        "centroide": {"lat": -35.847, "lon": -60.735},
+                        "provincia": {"nombre": "Buenos Aires"},
+                    },
+                ]
+            }
+        return {}
+
+    monkeypatch.setattr(place_api, "_georef", fake_georef)
+    rows = place_api.search_city_places("Rawson")
+    by_prov = {place_api.province_slug(r["province"]): r for r in rows}
+    assert "chubut" in by_prov
+    assert "buenos-aires" in by_prov
+
+
+def test_search_places_disambiguates_homonyms(monkeypatch):
+    from app.places import reset_search_cache, search_places
+
+    reset_search_cache()
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.places.search_city_places",
+        lambda q, limit=8, **k: [
+            {
+                "name": "Rawson",
+                "kind": "municipio",
+                "province": "Chubut",
+                "lat": -43.3002,
+                "lon": -65.1023,
+                "municipio": "Rawson",
+            },
+            {
+                "name": "Rawson",
+                "kind": "municipio",
+                "province": "Buenos Aires",
+                "lat": -35.847,
+                "lon": -60.735,
+                "municipio": "Rawson",
+            },
+        ]
+        if "rawson" in q.lower()
+        else [],
+    )
+    rows = [row for row in search_places("Rawson") if row.get("label") == "Rawson"]
+    assert {row["id"] for row in rows} == {"rawson-chubut", "rawson-buenos-aires"}
+    hints = " ".join(str(row.get("hint") or "") for row in rows).lower()
+    assert "chubut" in hints
+    assert "buenos aires" in hints
+    subs = {row.get("province_label") for row in rows}
+    assert "Chubut" in subs
+    assert "Buenos Aires" in subs
+
+
+def test_search_places_skips_nominatim_when_georef_hits(monkeypatch):
+    from app.places import reset_search_cache, search_places
+
+    reset_search_cache()
+    called = {"n": 0}
+
+    def boom(*a, **k):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr("app.places._nominatim", boom)
+    monkeypatch.setattr(
+        "app.places.search_city_places",
+        lambda q, limit=8, **k: [
+            {
+                "name": "Rawson",
+                "kind": "municipio",
+                "province": "Chubut",
+                "lat": -43.3002,
+                "lon": -65.1023,
+                "municipio": "Rawson",
+            }
+        ]
+        if "rawson" in q.lower()
+        else [],
+    )
+    rows = search_places("Rawson")
+    assert called["n"] == 0
+    assert any(row.get("id") == "rawson-chubut" for row in rows)
+
+
+def test_search_places_dedupes_same_city_province(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, fold, register_city
+    from app.places import forget_place, reset_listed_places, reset_search_cache, search_places
+
+    reset_listed_places()
+    reset_search_cache()
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.places.search_city_places",
+        lambda q, limit=8, **k: [
+            {
+                "name": "Rawson",
+                "kind": "municipio",
+                "province": "San Juan",
+                "lat": -31.5503,
+                "lon": -68.5364,
+                "municipio": "Rawson",
+            },
+            {
+                "name": "Rawson",
+                "kind": "municipio",
+                "province": "Chubut",
+                "lat": -43.3002,
+                "lon": -65.1023,
+                "municipio": "Rawson",
+            },
+        ]
+        if "raw" in q.lower()
+        else [],
+    )
+    register_city(
+        "rawson",
+        label="Rawson",
+        lat=-31.5503,
+        lon=-68.5364,
+        province="san-juan",
+        builtin=False,
+    )
+    try:
+        rows = [row for row in search_places("Rawson") if fold(str(row.get("label") or "")) == "rawson"]
+        assert len(rows) == 2
+        ids = {row["id"] for row in rows}
+        assert "rawson-chubut" in ids
+        assert "rawson" not in ids or "rawson-san-juan" not in ids
+        provs = " ".join(
+            f"{row.get('province_label') or ''} {row.get('province') or ''}" for row in rows
+        ).lower()
+        assert "chubut" in provs
+        assert "san juan" in provs or "san-juan" in provs
+    finally:
+        forget_place("rawson")
+        CITIES.pop("rawson", None)
+        CITIES.pop("rawson-san-juan", None)
+        CITIES.pop("rawson-chubut", None)
+        for token, owner in list(CITY_ALIASES.items()):
+            if owner in {"rawson", "rawson-san-juan", "rawson-chubut"} or token in {
+                "rawson",
+                "rawson-san-juan",
+                "rawson-chubut",
+            }:
+                CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
+
+def test_search_places_ignores_fuzzy_georef_name(monkeypatch):
+    from app.places import reset_search_cache, search_places
+
+    reset_search_cache()
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.places.search_city_places",
+        lambda q, limit=8, **k: [
+            {
+                "name": "Esteban Rams",
+                "kind": "localidad",
+                "province": "Santa Fe",
+                "lat": -29.77,
+                "lon": -61.49,
+                "municipio": "Esteban Rams",
+            },
+            {
+                "name": "Rawson",
+                "kind": "municipio",
+                "province": "Chubut",
+                "lat": -43.3002,
+                "lon": -65.1023,
+                "municipio": "Rawson",
+            },
+        ]
+        if q.lower().startswith("raw")
+        else [],
+    )
+    labels = {str(row.get("label") or "") for row in search_places("Raws")}
+    assert "Esteban Rams" not in labels
+    assert "Rawson" in labels
+
+
+def test_search_places_prefix_shows_city_and_province(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, register_city
+    from app.places import forget_place, reset_listed_places, reset_search_cache, search_places
+
+    reset_listed_places()
+    reset_search_cache()
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    monkeypatch.setattr("app.places.search_city_places", lambda *a, **k: [])
+    register_city(
+        "rawson-chubut",
+        label="Rawson",
+        lat=-43.3002,
+        lon=-65.1023,
+        province="chubut",
+        builtin=False,
+    )
+    try:
+        rows = [row for row in search_places("raw") if row.get("id") == "rawson-chubut"]
+        assert rows
+        assert rows[0]["label"] == "Rawson"
+        assert "Chubut" in str(rows[0].get("province_label") or rows[0].get("hint") or "")
+    finally:
+        forget_place("rawson-chubut")
+        CITIES.pop("rawson-chubut", None)
+        for token, owner in list(CITY_ALIASES.items()):
+            if owner == "rawson-chubut" or token == "rawson-chubut":
+                CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
+
+def test_listed_cities_keeps_homonyms(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, register_city
+    from app.place_api import remember
+    from app.places import forget_place, listed_cities, remember_listed_place, reset_listed_places
+
+    remember(
+        "rawson",
+        {
+            "name": "Rawson",
+            "kind": "municipio",
+            "province": "Chubut",
+            "lat": -43.3002,
+            "lon": -65.1023,
+            "municipio": "Rawson",
+        },
+    )
+    reset_listed_places()
+    register_city(
+        "rawson-chubut",
+        label="Rawson",
+        lat=-43.3002,
+        lon=-65.1023,
+        province="chubut",
+        builtin=False,
+    )
+    register_city(
+        "rawson-buenos-aires",
+        label="Rawson",
+        lat=-35.847,
+        lon=-60.735,
+        province="buenos-aires",
+        builtin=False,
+    )
+    try:
+        remember_listed_place("rawson-chubut")
+        remember_listed_place("rawson-buenos-aires")
+        monkeypatch.setattr(
+            "app.places._ids_with_saved_listings",
+            lambda: {"rawson-chubut", "rawson-buenos-aires"},
+        )
+        rows = [row for row in listed_cities([]) if row["label"] == "Rawson"]
+        assert {row["id"] for row in rows} == {"rawson-chubut", "rawson-buenos-aires"}
+        captions = " ".join(str(row.get("hint") or "") for row in rows)
+        assert "Chubut" in captions
+        assert "Buenos Aires" in captions
+    finally:
+        for cid in ("rawson-chubut", "rawson-buenos-aires"):
+            forget_place(cid)
+            CITIES.pop(cid, None)
+            for token, owner in list(CITY_ALIASES.items()):
+                if owner == cid or token == cid:
+                    CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
+
+def test_place_hint_keeps_province_when_name_matches():
+    from app.places import _place_hint
+
+    assert _place_hint({"id": "cordoba", "label": "Córdoba", "province": "cordoba"}) == "Córdoba, Córdoba"
+    assert _place_hint({"id": "caba", "label": "CABA", "province": "capital-federal"}) == "CABA"
 
 
 def test_listed_cities_hide_pin_artifacts():

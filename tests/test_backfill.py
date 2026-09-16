@@ -193,6 +193,22 @@ def test_llm_backlog_does_not_starve_detailed_behind_short_new_ads(tmp_path, mon
     assert n >= 1
 
 
+def test_llm_backlog_prioritizes_missing_province(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    with_prov = _item(
+        "with-prov",
+        details_scraped=True,
+        extra={"llm_place": {"name": "Trelew", "province": "Chubut"}},
+    )
+    no_prov = _item("no-prov", details_scraped=True)
+    store.upsert_many([with_prov, no_prov])
+    ids = [row.id for row in store.fetch_llm_backlog(8, prefer_city="caba", schema=LLM_SCHEMA)]
+    assert ids.index("zonaprop:no-prov") < ids.index("zonaprop:with-prov")
+
+
 def test_llm_backlog_uses_needs_llm_index(tmp_path, monkeypatch):
     from app import store
 

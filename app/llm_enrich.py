@@ -17,7 +17,7 @@ from .text_quality import looks_like_intersection
 
 KNOWN_TYPES = set(TYPE_IDS)
 
-LLM_SCHEMA = 6
+LLM_SCHEMA = 7
 _RUN_META = f"llm_run:{LLM_SCHEMA}"
 _urgent: deque[str] = deque()
 _queue: deque[str] = deque()
@@ -91,7 +91,7 @@ PII_KEYS = {
     "contacto", "asesor",
 }
 KEEP_KEYS = (
-    "city_label", "barrio", "zona", "foreign", "property_type", "rooms",
+    "city_label", "province", "barrio", "zona", "foreign", "property_type", "rooms",
     "bedrooms", "bathrooms", "parking", "covered_m2", "uncovered_m2", "total_m2", "age_years",
     "amenities", "expenses", "floor", "orientation", "condition", "street",
     "street_number", "corner_a", "corner_b", "address_text", "notes",
@@ -717,7 +717,13 @@ def analyze_listing(item: Listing) -> dict[str, Any] | None:
     blob = " ".join(p for p in (title, address, description) if p)
     need_geo = city_is_unassigned(search)
     places = listing_places(item, remote=False)
-    known = [str(place.get("name") or "").strip() for place in places if str(place.get("name") or "").strip()]
+    known = []
+    for place in places:
+        name = str(place.get("name") or "").strip()
+        if not name:
+            continue
+        prov = str(place.get("province") or "").strip()
+        known.append(f"{name}, {prov}" if prov else name)
     prompt = build_extract_prompt(
         city=search,
         city_label=city_label(search) or search,
@@ -740,6 +746,12 @@ def analyze_listing(item: Listing) -> dict[str, Any] | None:
             break
         if need_geo and place.get("name") and not str(data.get("city_label") or "").strip():
             data["city_label"] = place.get("name")
+    if not str(data.get("province") or data.get("provincia") or "").strip():
+        for place in places:
+            prov = str(place.get("province") or "").strip()
+            if prov:
+                data["province"] = prov
+                break
     data["geo_tools"] = {"found": {}, "checked": [], "geo": None}
     return data
 
@@ -1127,22 +1139,34 @@ def _fill_number(item: Listing, field: str, value: Any, allow_float: bool = Fals
 
 def _apply_place_api(item: Listing, data: dict[str, Any]) -> None:
     from .place_api import lookup_place, place_conflicts_city
+    from .places import apply_city_province
 
     extra = dict(item.extra or {})
     search = str(extra.get("search_city") or item.city or "")
     label = str(data.get("city_label") or "").strip()
+    hint = str(data.get("province") or data.get("provincia") or "").strip()
     if not label:
         return
-    place = lookup_place(label, remote=False)
+    place = lookup_place(label, province_hint=hint or None, remote=False)
+    if not place or (hint and not str(place.get("province") or "").strip()):
+        place = lookup_place(label, province_hint=hint or None, remote=os.environ.get("PROPMAP_TEST") != "1") or place
     if not place:
         return
+    province = str(place.get("province") or hint or "").strip()
     extra["llm_place"] = {
         "name": place.get("name") or label,
-        "province": place.get("province") or "",
+        "province": province,
         "lat": place.get("lat"),
         "lon": place.get("lon"),
     }
+    llm = dict(extra.get("llm") or {})
+    if province and not str(llm.get("province") or "").strip():
+        llm["province"] = province
+        extra["llm"] = llm
+        data["province"] = province
     item.extra = extra
+    if item.city:
+        apply_city_province(item.city, province)
     from .llm_fields import city_is_unassigned
 
     if search and not city_is_unassigned(search) and place_conflicts_city(place, search):

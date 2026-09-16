@@ -122,6 +122,23 @@ def test_apply_analysis_keeps_local_listing():
     assert item.barrio == "Sin clasificar"
 
 
+def test_apply_analysis_stores_province_from_place_api():
+    item = Listing(
+        source="zonaprop",
+        source_id="llm-prov",
+        url="https://example.com",
+        title="Casa en Trelew",
+        property_type="casa",
+        city="trelew",
+        extra={"search_city": "trelew"},
+    )
+    apply_analysis(item, {"city_label": "Trelew", "property_type": "casa", "notes": ""})
+    place = item.extra.get("llm_place") or {}
+    llm = item.extra.get("llm") or {}
+    assert "chubut" in str(place.get("province") or "").lower()
+    assert "chubut" in str(llm.get("province") or "").lower()
+
+
 def test_apply_analysis_does_not_keep_a_pin_in_the_river():
     from app.geo import remember_water
 

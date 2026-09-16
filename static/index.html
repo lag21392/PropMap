@@ -11,7 +11,7 @@
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
   <link rel="preload" href="/static/styles.css?v=ui28" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui70" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui79" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -45,10 +45,10 @@
 
       <div class="filters">
         <label class="place-wrap">Lugar
-          <input id="placeQuery" type="search" placeholder="Escribí y elegí un lugar de la lista" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="placeSuggest" />
+          <input id="placeQuery" type="search" placeholder="Escribí una ciudad" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="placeSuggest" />
           <div id="placeSuggest" class="place-suggest" hidden></div>
         </label>
-        <label class="span-2">Lugares cargados
+        <label class="span-2">Ciudades cargadas
           <select id="cityFilter"></select>
         </label>
         <label>Tipo
@@ -335,7 +335,7 @@
     <form method="dialog">
       <h2 id="helpTitle">Cómo usar PropMap</h2>
       <ul class="help-list">
-        <li>Escribí un lugar, filtrá tipo / barrio / precio y ordená la lista.</li>
+        <li>Escribí una ciudad; si hay varias con el mismo nombre, elegí la de la provincia que corresponde. Filtrá tipo / barrio / precio y ordená la lista.</li>
         <li>Tocá un pin o una tarjeta para abrir la ficha a la derecha. Si hay varios avisos en el mismo punto, el mapa solo sirve para elegir cuál.</li>
         <li>El color compara el USD/m² con el mismo tipo en esa zona. No es una tasación.</li>
         <li>El punto redondo es ubicación real (calle y altura o esquina). El cuadrado es la manzana aproximada del aviso. Lo que no tiene ni eso queda marcado como sin ubicación; podés ocultarlos con el filtro del mapa.</li>
@@ -420,6 +420,6 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
-  <script defer src="/static/app.js?v=ui70"></script>
+  <script defer src="/static/app.js?v=ui79"></script>
 </body>
 </html>

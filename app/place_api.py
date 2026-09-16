@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -216,23 +217,53 @@ def place_conflicts_city(place: dict[str, Any], city: str) -> bool:
 
 
 def search_localidades(query: str, limit: int = 8) -> list[dict[str, Any]]:
+    return search_city_places(query, limit=limit, kinds=("localidad",))
+
+
+def search_city_places(
+    query: str,
+    limit: int = 8,
+    *,
+    kinds: tuple[str, ...] = ("municipio", "localidad"),
+) -> list[dict[str, Any]]:
+    """Municipios y localidades de provincia. No barrios ni asentamientos."""
     q = (query or "").strip()
     if len(q) < 2:
         return []
+    paths = {
+        "municipio": ("/municipios", "municipios"),
+        "localidad": ("/localidades", "localidades"),
+    }
+
+    def fetch_kind(kind: str) -> list[dict[str, Any]]:
+        path, key = paths.get(kind, (None, None))
+        if not path:
+            return []
+        data = _georef(path, {"nombre": q, "max": max(limit, 12), "campos": "completo"})
+        rows: list[dict[str, Any]] = []
+        for row in data.get(key) or []:
+            place = _from_georef(row, kind)
+            if not place or place.get("lat") is None or place.get("lon") is None:
+                continue
+            rows.append(place)
+        return rows
+
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    data = _georef("/localidades", {"nombre": q, "max": limit, "campos": "completo"})
-    for row in data.get("localidades") or []:
-        place = _from_georef(row, "localidad")
-        if not place or place.get("lat") is None or place.get("lon") is None:
-            continue
-        token = _fold(str(place.get("name") or ""))
-        if not token or token in seen:
-            continue
-        seen.add(token)
-        out.append(place)
-        if len(out) >= limit:
-            return out
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        chunks = list(pool.map(fetch_kind, kinds))
+    for chunk in chunks:
+        for place in chunk:
+            token = (
+                f"{_fold(str(place.get('name') or ''))}"
+                f"|{_province_slug(str(place.get('province') or ''))}"
+            )
+            if not token or token in seen or token.startswith("|"):
+                continue
+            seen.add(token)
+            out.append(place)
+            if len(out) >= limit:
+                return out
     return out
 
 

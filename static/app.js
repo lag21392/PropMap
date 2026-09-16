@@ -362,10 +362,9 @@ function applyListingsPayload(data, city, seq, opts = {}) {
   facebook = data.facebook || [];
   if (data.usd_ars) usdArs = Number(data.usd_ars) || usdArs;
   window.lastStats = data.stats || {};
-  window.lastCities = data.cities || [];
   hideListingsWait();
   renderKpis(data.stats || {});
-  fillCities(data.cities || []);
+  fillCities(data.cities || [], { source: "listings" });
   if (currentCity() !== city) {
     listingsRev = 0;
     lastListingsFp = "";
@@ -487,40 +486,148 @@ function rememberCityView(place) {
   };
 }
 
+function isCabaPlace(c) {
+  const id = String(c?.id || "");
+  return id === "caba" || id === "capital-federal";
+}
+
+function foldPlaceToken(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/-/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isLocatableCity(c) {
+  if (!c || !c.id) return false;
+  if (isCabaPlace(c)) return true;
+  const label = String(c.label || "").toLowerCase().trim();
+  if (label.startsWith("barrio ") || label.startsWith("departamento ")) return false;
+  return true;
+}
+
+function placeCaption(c) {
+  if (!c) return "";
+  const hint = String(c.hint || "").trim();
+  if (hint) return hint;
+  return String(c.label || c.id || "");
+}
+
+function placeSuggestSub(p) {
+  const label = String(p?.label || "").trim();
+  const named = String(p?.province_label || "").trim();
+  if (named) return named;
+  const hint = String(p?.hint || "").trim();
+  if (hint && label && hint.toLowerCase().startsWith(label.toLowerCase() + ",")) {
+    return hint.slice(label.length + 1).trim();
+  }
+  if (hint && hint !== label) return hint;
+  return String(p?.province || "").replace(/-/g, " ").trim();
+}
+
+function placeMatchesQuery(p, q) {
+  const needle = foldPlaceToken(q);
+  if (needle.length < 2 || !p) return false;
+  const label = foldPlaceToken(p.label || "");
+  const prov = foldPlaceToken(p.province_label || p.province || "");
+  if (label.startsWith(needle)) return true;
+  if (needle.length >= 3 && label.includes(needle)) return true;
+  if (prov && `${label} ${prov}`.startsWith(needle)) return true;
+  return false;
+}
+
+function placeSuggestKey(p) {
+  const label = foldPlaceToken(p?.label || p?.id || "");
+  const prov = foldPlaceToken(p?.province_label || p?.province || "");
+  return prov ? `${label}|${prov}` : label;
+}
+
+function mergePlaceHits(...lists) {
+  const byKey = new Map();
+  lists.flat().forEach((p) => {
+    if (!p || !p.id) return;
+    const key = placeSuggestKey(p);
+    const prev = byKey.get(key);
+    if (!prev || String(p.id).length > String(prev.id).length) byKey.set(key, p);
+  });
+  return [...byKey.values()].slice(0, 8);
+}
+
+function localPlaceHits(q) {
+  const needle = foldPlaceToken(q);
+  if (needle.length < 2) return [];
+  const rows = [];
+  const seen = new Set();
+  for (const c of [...(window.lastCities || []), ...(window.knownCities || [])]) {
+    if (!c || !c.id || seen.has(c.id) || !isLocatableCity(c)) continue;
+    const label = foldPlaceToken(c.label || "");
+    const id = foldPlaceToken(c.id);
+    const hint = foldPlaceToken(c.hint || "");
+    const prov = foldPlaceToken(c.province_label || c.province || "");
+    if (
+      label.startsWith(needle)
+      || id.startsWith(needle)
+      || hint.startsWith(needle)
+      || (prov && `${label} ${prov}`.startsWith(needle))
+      || (label && needle.length >= 3 && label.includes(needle))
+    ) {
+      seen.add(c.id);
+      rows.push(c);
+    }
+  }
+  return rows.slice(0, 8);
+}
+
+function placeCatalogKey(c) {
+  const label = foldPlaceToken(c.label || c.id);
+  const prov = foldPlaceToken(c.province);
+  if (isCabaPlace(c) || !prov) return label;
+  return `${label}|${prov}`;
+}
+
 function cityReadyForCatalog(c) {
   if (!c || !c.id) return false;
   const id = String(c.id);
+  if (id.endsWith("-pins") || id.includes("-pins-") || id.includes(".pins")) return false;
+  if (!isLocatableCity(c)) return false;
   if (id === "caba") return true;
   const n = Number(c.n);
   if (Number.isFinite(n)) return n >= 8;
   return true;
 }
 
-function fillCities(cities) {
+function fillCities(cities, opts = {}) {
   const select = $("cityFilter");
   const manual = document.querySelector("#manualForm [name=city]");
   if (!select) return;
   const saved = localStorage.getItem("propmap.city") || "";
   const current = select.value || saved || "caba";
   const byId = new Map();
-  const byLabel = new Map();
-  (cities || []).forEach((c) => {
-    if (!cityReadyForCatalog(c)) return;
+  const previous = window.lastCities || window.knownCities || [];
+  const incoming = cities || [];
+  const source = opts.source || "listings";
+  const take = (c, { keep = false } = {}) => {
     if (!c || !c.id) return;
     const id = String(c.id);
     if (id.endsWith("-pins") || id.includes("-pins-") || id.includes(".pins")) return;
     const label = String(c.label || "").toLowerCase().trim();
     if (label.startsWith("barrio ") || label.startsWith("departamento ")) return;
-    const key = label.normalize("NFD").replace(/\p{M}/gu, "").replace(/-/g, " ").replace(/\s+/g, " ");
-    const prevId = byLabel.get(key);
-    if (prevId && prevId !== id) {
-      const keep = id === "caba" || (prevId !== "caba" && id.length < prevId.length) ? id : prevId;
-      if (keep !== id) return;
-      byId.delete(prevId);
-    }
-    byLabel.set(key, id);
-    byId.set(c.id, { ...(byId.get(c.id) || {}), ...c });
-  });
+    if (!keep && !cityReadyForCatalog(c)) return;
+    byId.set(id, { ...(byId.get(id) || {}), ...c });
+  };
+  if (source === "catalog" && incoming.length) {
+    incoming.forEach((c) => take(c));
+  } else if (!previous.length) {
+    incoming.forEach((c) => take(c));
+  } else {
+    previous.forEach((c) => take(c, { keep: true }));
+    incoming.forEach((c) => {
+      if (byId.has(String(c.id))) take(c, { keep: true });
+    });
+  }
   if (
     pickedPlace?.id
     && pickedPlace.lat != null
@@ -530,11 +637,15 @@ function fillCities(cities) {
   ) {
     byId.set(pickedPlace.id, { ...(byId.get(pickedPlace.id) || {}), ...pickedPlace });
   }
-  const rows = [...byId.values()].sort((a, b) => String(a.label || a.id).localeCompare(String(b.label || b.id), "es"));
+  const rows = [...byId.values()].sort((a, b) => {
+    const byLabel = String(a.label || a.id).localeCompare(String(b.label || b.id), "es");
+    if (byLabel) return byLabel;
+    return String(a.province || "").localeCompare(String(b.province || ""), "es");
+  });
   window.knownCities = rows;
   window.lastCities = rows;
   if (!rows.length) return;
-  const options = rows.map((c) => `<option value="${c.id}">${c.label}</option>`).join("");
+  const options = rows.map((c) => `<option value="${c.id}">${placeCaption(c)}</option>`).join("");
   select.innerHTML = options;
   if (manual) manual.innerHTML = options;
   const ids = rows.map((c) => c.id);
@@ -2139,7 +2250,7 @@ $("refreshBtn").onclick = async () => {
   }
   const query = ($("placeQuery")?.value || "").trim();
   if (query && !placeIsPicked()) {
-    $("statusLine").textContent = "Elegí un lugar de las sugerencias. No se busca texto libre.";
+    $("statusLine").textContent = "Elegí una ciudad de las sugerencias. No se busca texto libre.";
     if (placeHits.length) showSuggest(placeHits);
     else $("placeQuery")?.focus();
     return;
@@ -2177,7 +2288,7 @@ $("refreshBtn").onclick = async () => {
   sessionStorage.setItem(SEARCH_PW_KEY, password);
   if (res.status === 400) {
     $("refreshBtn").disabled = false;
-    const detail = typeof data.detail === "string" ? data.detail : "Elegí un lugar de las sugerencias.";
+    const detail = typeof data.detail === "string" ? data.detail : "Elegí una ciudad de las sugerencias.";
     $("statusLine").textContent = detail.charAt(0).toUpperCase() + detail.slice(1);
     return;
   }
@@ -2369,7 +2480,7 @@ async function pollStatus(force) {
     return;
   }
   lastStatus = s;
-  if (s.city_catalog && s.city_catalog.length) fillCities(s.city_catalog);
+  if (s.city_catalog && s.city_catalog.length) fillCities(s.city_catalog, { source: "catalog" });
   const city = currentCity();
   const fastJobs = fastJobIds(s);
   const running = s.running_cities || [];
@@ -2498,14 +2609,14 @@ function ensureCityView(cityId) {
 }
 
 function rememberPlace(place) {
-  if (!place || !place.id) return;
+  if (!place || !place.id || !isLocatableCity(place)) return;
   rememberCityView(place);
   const select = $("cityFilter");
   if (!select || [...select.options].some((o) => o.value === place.id)) return;
   if (!cityReadyForCatalog(place)) return;
   const opt = document.createElement("option");
   opt.value = place.id;
-  opt.textContent = place.label || place.id;
+  opt.textContent = placeCaption(place);
   select.appendChild(opt);
   window.placeBarrios = window.placeBarrios || {};
   if (place.barrios && place.barrios.length) {
@@ -2514,7 +2625,7 @@ function rememberPlace(place) {
 }
 
 function applyPlace(place) {
-  if (!place || !place.id) return;
+  if (!place || !place.id || !isLocatableCity(place)) return;
   pickedPlace = { ...(pickedPlace || {}), ...place };
   rememberPlace(place);
   const select = $("cityFilter");
@@ -2527,7 +2638,7 @@ function applyPlace(place) {
     localStorage.setItem("propmap.city", place.id);
   }
   focusedCity = place.id;
-  if ($("placeQuery")) $("placeQuery").value = place.label || "";
+  if ($("placeQuery")) $("placeQuery").value = placeCaption(place);
   focusCity(place.id);
   fillZonas(cityItems());
   fillBarrios();
@@ -2539,6 +2650,8 @@ let placeTimer = null;
 let placeHits = [];
 let placeActive = -1;
 let pickedPlace = null;
+let placeFetchCtrl = null;
+let lastRemotePlaces = [];
 
 function placeFromCityFilter() {
   const select = $("cityFilter");
@@ -2561,13 +2674,14 @@ function placeIsPicked() {
   if (!pickedPlace) return false;
   const label = String(pickedPlace.label || "").trim();
   const id = String(pickedPlace.id || "").trim();
-  return q === label || q === id;
+  const hint = String(pickedPlace.hint || placeCaption(pickedPlace)).trim();
+  return q === label || q === id || q === hint;
 }
 
 function revertPlaceQuery() {
   const place = pickedPlace || placeFromCityFilter();
   pickedPlace = place;
-  if ($("placeQuery") && place) $("placeQuery").value = place.label || place.id || "";
+  if ($("placeQuery") && place) $("placeQuery").value = placeCaption(place) || place.label || place.id || "";
   hideSuggest();
 }
 
@@ -2581,20 +2695,24 @@ function hideSuggest() {
   placeActive = -1;
 }
 
-function showSuggest(places) {
+function showSuggest(places, opts = {}) {
   const box = $("placeSuggest");
   if (!box) return;
   placeHits = places || [];
   placeActive = placeHits.length ? 0 : -1;
   box.hidden = false;
   if (!placeHits.length) {
-    box.innerHTML = `<div class="place-suggest-empty">No hay un lugar con ese nombre. Elegí una sugerencia.</div>`;
+    const typed = ($("placeQuery")?.value || "").trim();
+    const msg = opts.waiting || typed.length < 4
+      ? "Seguí escribiendo para ver ciudad y provincia."
+      : "No hay una ciudad con ese nombre. Elegí una sugerencia.";
+    box.innerHTML = `<div class="place-suggest-empty">${msg}</div>`;
     return;
   }
   box.innerHTML = placeHits.map((p, i) => `
     <button type="button" data-idx="${i}" class="${i === placeActive ? "is-active" : ""}">
       ${escapeHtml(p.label || p.id)}
-      <small>${escapeHtml(p.hint || p.province || "")}</small>
+      <small>${escapeHtml(placeSuggestSub(p) || placeCaption(p))}</small>
     </button>
   `).join("");
   box.querySelectorAll("button").forEach((btn) => {
@@ -2647,7 +2765,12 @@ async function choosePlace(place) {
 
 $("placeQuery")?.addEventListener("input", () => {
   const q = ($("placeQuery").value || "").trim();
-  if (pickedPlace && q !== String(pickedPlace.label || "").trim() && q !== String(pickedPlace.id || "").trim()) {
+  if (
+    pickedPlace
+    && q !== String(pickedPlace.label || "").trim()
+    && q !== String(pickedPlace.id || "").trim()
+    && q !== String(pickedPlace.hint || placeCaption(pickedPlace)).trim()
+  ) {
     pickedPlace = null;
   }
   clearTimeout(placeTimer);
@@ -2655,11 +2778,29 @@ $("placeQuery")?.addEventListener("input", () => {
     hideSuggest();
     return;
   }
+  const local = localPlaceHits(q);
+  const remembered = (lastRemotePlaces || []).filter((p) => placeMatchesQuery(p, q));
+  const instant = mergePlaceHits(local, remembered);
+  if (instant.length) showSuggest(instant);
+  else showSuggest([], { waiting: true });
   placeTimer = setTimeout(async () => {
-    const data = await (await fetch(`/api/places?q=${encodeURIComponent(q)}`)).json();
-    if (($("placeQuery").value || "").trim() !== q) return;
-    showSuggest(data.places || []);
-  }, 280);
+    placeFetchCtrl?.abort();
+    const ac = new AbortController();
+    placeFetchCtrl = ac;
+    try {
+      const res = await fetch(`/api/places?q=${encodeURIComponent(q)}`, { signal: ac.signal });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (($("placeQuery").value || "").trim() !== q) return;
+      const remote = data.places || [];
+      if (remote.length) lastRemotePlaces = mergePlaceHits(remote, lastRemotePlaces);
+      showSuggest(mergePlaceHits(remote, localPlaceHits(q), lastRemotePlaces.filter((p) => placeMatchesQuery(p, q))));
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
+      const fallback = mergePlaceHits(localPlaceHits(q), (lastRemotePlaces || []).filter((p) => placeMatchesQuery(p, q)));
+      if (fallback.length) showSuggest(fallback);
+    }
+  }, 140);
 });
 
 $("placeQuery")?.addEventListener("keydown", (ev) => {
@@ -2684,7 +2825,7 @@ $("placeQuery")?.addEventListener("keydown", (ev) => {
       return;
     }
     if (!placeIsPicked()) {
-      $("statusLine").textContent = "Elegí un lugar de las sugerencias.";
+      $("statusLine").textContent = "Elegí una ciudad de las sugerencias.";
     }
   }
 });

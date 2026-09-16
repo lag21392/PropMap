@@ -51,10 +51,12 @@ CITY_PROMPT_MAX = 12
 EXTRACT_SYSTEM = (
     "Extractor inmobiliario de Argentina. JSON de UNA línea, compacto. "
     "Sin markdown, sin notes, sin copiar el texto. /no_think\n"
-    "Claves: city_label, barrio, zona, foreign, property_type, rooms, bedrooms, bathrooms, "
+    "Claves: city_label, province, barrio, zona, foreign, property_type, rooms, bedrooms, bathrooms, "
     "parking, covered_m2, uncovered_m2, total_m2, street, street_number, corner_a, corner_b, "
     "mortgage_credit, address_text. Omití vacíos.\n"
     f"property_type: {'|'.join(KNOWN_TYPES)}. lote/fracción=terreno; depto/apartamento=departamento; dúplex=ph.\n"
+    "city_label = ciudad/localidad del aviso, nunca un barrio. province = provincia argentina; "
+    "no la omitas (homónimos: Rawson Chubut ≠ Rawson San Juan).\n"
     "mortgage_credit true solo si dice apto crédito/UVA/Procrear; false si no apto; null si no lo menciona.\n"
     "barrio SOLO del catálogo OSM; si no, omitir. Sin teléfono ni vendedor.\n"
     "foreign=true si el aviso es de OTRO lugar, no del lugar_buscado.\n"
@@ -63,8 +65,9 @@ EXTRACT_SYSTEM = (
     "depto sin patio: total=cubiertos. 'más de 200 m²' → 200.\n"
     "rooms=ambientes; bedrooms=dormitorios. Si hay N habitaciones y no dice ambientes: rooms=N+1 "
     "(2 habitaciones → 3 ambientes). Monoambiente: rooms=1 bedrooms=0. No copies bedrooms a rooms.\n"
-    "Ejemplo: {\"property_type\":\"departamento\",\"rooms\":3,\"bedrooms\":2,\"foreign\":false,"
-    "\"street\":\"Mitre\",\"street_number\":100,\"mortgage_credit\":null}"
+    "Ejemplo: {\"city_label\":\"Trelew\",\"province\":\"Chubut\",\"property_type\":\"departamento\","
+    "\"rooms\":3,\"bedrooms\":2,\"foreign\":false,\"street\":\"Mitre\",\"street_number\":100,"
+    "\"mortgage_credit\":null}"
 )
 
 
@@ -390,16 +393,20 @@ def build_extract_prompt(
     place_line = (
         f"lugares detectados: {place_txt}\n"
         if place_txt
-        else "city_label = localidad del texto, no un barrio.\n"
+        else "city_label y province salen del texto (localidad + provincia), no de un barrio.\n"
     )
     if unknown:
         lugar = "desconocido (el aviso no está asignado a una ciudad)"
         foreign_rule = (
-            "city_label = localidad real, nunca un barrio. foreign=true solo si es de otro país.\n"
+            "city_label = localidad real y province = su provincia. Nunca un barrio. "
+            "foreign=true solo si es de otro país.\n"
         )
     else:
         lugar = city_label or city
-        foreign_rule = "foreign=true si el aviso es de OTRO lugar, no del lugar_buscado.\n"
+        foreign_rule = (
+            "foreign=true si el aviso es de OTRO lugar, no del lugar_buscado. "
+            "province = provincia de city_label.\n"
+        )
     fix_txt = ""
     if fixes:
         fix_txt = f"errores a corregir: {'; '.join(str(x) for x in fixes if x)[:280]}\n"

@@ -549,10 +549,9 @@ def public_meta() -> dict[str, Any]:
 def catalog_cities(view_city: str | None = None) -> list[dict]:
     got = _lock.acquire(timeout=0.15)
     if not got:
-        rows = list(_cities)
-        return _with_view_city(rows, view_city)
+        return _catalog_cities()
     try:
-        return _catalog_cities(view_city)
+        return _catalog_cities()
     finally:
         _lock.release()
 
@@ -2158,8 +2157,11 @@ def _refresh_meta_locked() -> None:
 def _catalog_cities(view_city: str | None = None) -> list[dict]:
     from .places import is_cache_artifact_id
 
-    rows = _with_view_city(list(_cities), view_city)
-    return [row for row in rows if row.get("id") and not is_cache_artifact_id(str(row.get("id")))]
+    return [
+        row
+        for row in list(_cities)
+        if row.get("id") and not is_cache_artifact_id(str(row.get("id")))
+    ]
 
 
 def rewrite_snap_cities() -> None:
@@ -2328,12 +2330,16 @@ def keep_catalog_cached() -> None:
 
 
 def _with_view_city(cities: list[dict], view_city: str | None) -> list[dict]:
-    from .places import is_cache_artifact_id, public_place
+    from .geo import CABA_IDS, CITIES, DEFAULT_CITY
+    from .places import _listed_row_is_city, is_cache_artifact_id, public_place
 
     rows = list(cities or [])
     if view_city and is_cache_artifact_id(view_city):
         return rows
     if view_city and not any(row.get("id") == view_city for row in rows):
+        cfg = CITIES.get(view_city) or {}
+        if view_city not in CABA_IDS and view_city != DEFAULT_CITY and not _listed_row_is_city(view_city, cfg):
+            return rows
         try:
             extra = public_place(view_city)
         except Exception:

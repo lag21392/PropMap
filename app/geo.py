@@ -1082,6 +1082,16 @@ def register_city(
     radius_km: float | None = None,
 ) -> dict:
     names = [fold(city_id), fold(label), *[fold(a) for a in (aliases or []) if a]]
+    scrape_slug = slug
+    if not scrape_slug:
+        if city_id in CABA_IDS or fold(province or "") in {
+            "capital-federal",
+            "caba",
+            "ciudad-autonoma-de-buenos-aires",
+        }:
+            scrape_slug = "capital-federal"
+        else:
+            scrape_slug = slug_place(label) or city_id
     CITIES[city_id] = {
         "id": city_id,
         "label": label,
@@ -1089,7 +1099,7 @@ def register_city(
         "lon": float(lon),
         "zoom": int(zoom or 13),
         "province": province or "",
-        "slug": slug or city_id,
+        "slug": scrape_slug,
         "builtin": builtin,
         "aliases": [n for n in dict.fromkeys(names) if n],
         "barrios": barrios or [],
@@ -1104,8 +1114,13 @@ def register_city(
         if not token:
             return
         owner = CITY_ALIASES.get(token)
-        if owner and (CITIES.get(owner) or {}).get("builtin") and not builtin:
-            return
+        if owner and owner != city_id:
+            if (CITIES.get(owner) or {}).get("builtin") and not builtin:
+                return
+            owner_prov = fold(str((CITIES.get(owner) or {}).get("province") or ""))
+            new_prov = fold(str(province or ""))
+            if owner_prov and new_prov and owner_prov != new_prov:
+                return
         CITY_ALIASES[token] = city_id
 
     CITY_ALIASES[city_id] = city_id

@@ -709,8 +709,8 @@ def fetch_for_city(city_id: str) -> list[Listing]:
     return fitted
 
 
-def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 6) -> list[Listing]:
-    """Avisos a enriquecer: primero lo nuevo, errores y sin ciudad/ubicación."""
+def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 7) -> list[Listing]:
+    """Avisos a enriquecer: primero lo nuevo, sin provincia, errores y sin ciudad/ubicación."""
     n = max(1, min(160, int(limit or 1)))
     prefer = (prefer_city or "").strip()
     sql = """
@@ -726,6 +726,9 @@ def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 6) -> lis
                WHEN llm_await = 1 THEN 1
                WHEN lat IS NULL THEN 2
                ELSE 3 END,
+          CASE WHEN IFNULL(json_extract(extra_json, '$.llm_place.province'), '') = ''
+                AND IFNULL(json_extract(extra_json, '$.llm.province'), '') = ''
+               THEN 0 ELSE 1 END,
           CASE WHEN city = ? THEN 0 ELSE 1 END,
           CASE WHEN details_scraped = 1 THEN 0 ELSE 1 END,
           scraped_at DESC

@@ -714,8 +714,6 @@ def near(
 
 @app.get("/api/places")
 def places(q: str = Query("", min_length=0)) -> dict:
-    store.init()
-    load_custom_places()
     return {"places": search_places(q)}
 
 
