@@ -1,6 +1,18 @@
 {
   "version": 1,
   "skills": {
+    "codebase-design": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/codebase-design/SKILL.md",
+      "computedHash": "5a17552cc1482f1a40124bf4e6c9dbd90ac0dbb47e71c07d47369f9e5f2ae3b5"
+    },
+    "data-pipeline": {
+      "source": "claude-office-skills/skills",
+      "sourceType": "github",
+      "skillPath": "data-pipeline/SKILL.md",
+      "computedHash": "4b8676f77ee0a054f4e39c356f273eabd74fe23db86177d8a48c1af78400b4f3"
+    },
     "find-skills": {
       "source": "vercel-labs/skills",
       "sourceType": "github",
@@ -13,6 +25,12 @@
       "skillPath": "skills/frontend-design/SKILL.md",
       "computedHash": "93f53fd1c0352d3d7ec17b8f73d7351bf76f4821e55d123c9d2abc2c53ba48e4"
     },
+    "geospatial-data-pipeline": {
+      "source": "curiositech/some_claude_skills",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/geospatial-data-pipeline/SKILL.md",
+      "computedHash": "09bb65c311cfd020680b6a162786db70bf3aaa27e991b44e0f39e095f4a6d5a8"
+    },
     "just-scrape": {
       "source": "makerjackie/jackie-skills-starter",
       "sourceType": "github",
@@ -24,6 +42,12 @@
       "sourceType": "github",
       "skillPath": "skills/web-design-guidelines/SKILL.md",
       "computedHash": "f3bc47f890f42a44db1007ab390709ec368e4b8c089baee6b0007182236ac474"
+    },
+    "web-performance-optimization": {
+      "source": "sickn33/agentic-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/web-performance-optimization/SKILL.md",
+      "computedHash": "196cdae4d572c88ee4575c5ab8068f2d6d5f7ef641bbdf2e1e64c26623a84cf8"
     },
     "webapp-testing": {
       "source": "anthropics/skills",

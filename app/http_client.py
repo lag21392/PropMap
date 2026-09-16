@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -35,61 +36,155 @@ PROXY_HOSTS = ("properati.com",)
 TRANSLATE_PROXY = "https://translate.yandex.com/translate"
 TRANSLATE_LANGS = ("es-en", "es-es")
 SGAI_SCRAPE = "https://v2-api.scrapegraphai.com/api/scrape"
-_DETAIL_URL = re.compile(r"/detalle/|/propiedades/clasificado/|/MLA-|/inmueble/", re.I)
+_DETAIL_URL = re.compile(
+    r"/detalle/|/propiedades/clasificado/|/MLA-|/inmueble/|--\d{5,}(?:[/?#]|$)",
+    re.I,
+)
 _blocked_until: dict[str, float] = {}
+_tls = threading.local()
 PAGE_CACHE_TTL = 12 * 3600
 
 
 def reset_fetch_state() -> None:
     _blocked_until.clear()
+    from .egress import reset as reset_egress
+    from .ops import reset as reset_ops
+
+    reset_egress()
+    reset_ops()
+
+
+def host_is_blocked(host: str) -> bool:
+    return _host_is_blocked(host)
+
+
+def _observe(host: str, lane: str, status: int) -> None:
+    try:
+        from .ops import note
+
+        note("http", lane=lane or "direct", host=(host or "")[:60], status=int(status or 0))
+    except Exception:
+        return
+
+
+def _client_kwargs(timeout: float, headers: dict[str, str], proxy: str | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "headers": headers,
+        "follow_redirects": True,
+        "timeout": timeout,
+    }
+    if proxy:
+        kwargs["proxy"] = proxy
+    return kwargs
+
+
+def _httpx_get(
+    url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    proxy: str | None = None,
+) -> httpx.Response:
+    hdrs = headers or HEADERS
+    wait_s = max(timeout, 55.0 if proxy else 35.0)
+    if os.environ.get("PROPMAP_TEST") == "1":
+        with httpx.Client(**_client_kwargs(timeout, hdrs, proxy)) as client:
+            return client.get(url)
+    clients = getattr(_tls, "clients", None)
+    if not isinstance(clients, dict):
+        clients = {}
+        _tls.clients = clients
+    key = f"{id(hdrs) if hdrs is HEADERS else 'custom'}|{proxy or ''}"
+    client = clients.get(key)
+    if client is None:
+        client = httpx.Client(
+            **_client_kwargs(wait_s, hdrs, proxy),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+        clients[key] = client
+    return client.get(url)
 
 
 def fetch_text(url: str, timeout: float = 35.0, retries: int = 3, paced: bool = True) -> str:
+    from .egress import can_fetch, lanes, note_error, pick, use_local
+
     cached = _read_page_cache(url)
     if cached:
         return cached
     last_error: Exception | None = None
     host = urlparse(url).netloc
-    tries = 1 if _host_needs_proxy(url) else retries
-    skip_direct = _host_is_blocked(host) and _host_needs_proxy(url)
+    listing = _looks_like_listing(url)
+    if (
+        _host_is_blocked(host)
+        and not listing
+        and not _host_needs_proxy(url)
+        and (len(lanes()) <= 1 or not can_fetch(host))
+    ):
+        raise RuntimeError(f"{host} en pausa (403)")
+    n_lanes = max(1, len(lanes()))
+    tries = n_lanes if n_lanes > 1 else (1 if _host_needs_proxy(url) else retries)
+    skip_direct = _host_is_blocked(host) and _host_needs_proxy(url) and not can_fetch(host)
+    tried: set[str] = set()
     if not skip_direct:
         for attempt in range(tries):
+            lane = pick(host, exclude=tried)
+            if lane is None:
+                break
             if paced:
-                crawl.wait(host=host)
+                crawl.wait(host=host, lane=lane.id)
                 if crawl.aborted():
                     raise RuntimeError("búsqueda pausada")
             try:
-                with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
-                    response = client.get(url)
-                    crawl.note_http(response.status_code, host)
-                    if response.status_code in {429, 503}:
-                        last_error = RuntimeError(f"HTTP {response.status_code}")
-                        continue
-                    if response.status_code in {401, 403}:
+                response = _httpx_get(url, timeout, proxy=lane.proxy)
+                crawl.note_http(response.status_code, host, lane=lane.id)
+                _observe(host, lane.id, response.status_code)
+                if response.status_code in {429, 503}:
+                    last_error = RuntimeError(f"HTTP {response.status_code}")
+                    tried.add(lane.id)
+                    continue
+                if response.status_code in {401, 403}:
+                    tried.add(lane.id)
+                    if not pick(host, exclude=tried):
                         _mark_blocked(host)
-                        if response.status_code == 403:
-                            try:
-                                text = _fetch_urllib(url, timeout)
-                                return _remember_page(url, text)
-                            except Exception as exc:
-                                last_error = exc
-                        break
-                    response.raise_for_status()
-                    return _remember_page(url, response.text)
+                    if response.status_code == 403 and listing and use_local():
+                        try:
+                            text = _fetch_urllib(url, timeout)
+                            _observe(host, "urllib", 200)
+                            return _remember_page(url, text)
+                        except Exception as exc:
+                            last_error = exc
+                    if pick(host, exclude=tried):
+                        continue
+                    break
+                response.raise_for_status()
+                text = response.text
+                if listing and not _listing_html_ok(url, text):
+                    last_error = RuntimeError("ficha incompleta")
+                    tried.add(lane.id)
+                    continue
+                return _remember_page(url, text)
             except Exception as exc:
                 last_error = exc
+                note_error(lane.id)
+                tried.add(lane.id)
                 time.sleep(1.2 * (attempt + 1))
-        try:
-            if paced:
-                crawl.wait(host=host)
-            return _remember_page(url, _fetch_urllib(url, timeout))
-        except Exception as exc:
-            last_error = exc
+        if use_local() and (listing or not _host_is_blocked(host) or _host_needs_proxy(url)):
+            try:
+                if paced:
+                    crawl.wait(host=host, lane="direct")
+                text = _fetch_urllib(url, timeout)
+                if not listing or _listing_html_ok(url, text):
+                    _observe(host, "urllib", 200)
+                    return _remember_page(url, text)
+                last_error = RuntimeError("ficha incompleta")
+            except Exception as exc:
+                last_error = exc
     proxied = _try_blocked_fallback(url, timeout, paced)
-    if proxied is not None:
+    if proxied is not None and (not listing or _listing_html_ok(url, proxied)):
+        _observe(host, "translate", 200)
         return _remember_page(url, proxied)
     stealth = _try_stealth_fetch(url, timeout)
-    if stealth:
+    if stealth and (not listing or _listing_html_ok(url, stealth)):
+        _observe(host, "stealth", 200)
         return _remember_page(url, stealth)
     raise RuntimeError(f"No se pudo leer {url}: {last_error}")
 
@@ -133,6 +228,19 @@ def _looks_like_listing(url: str) -> bool:
     return bool(_DETAIL_URL.search(url or ""))
 
 
+def _listing_html_ok(url: str, text: str) -> bool:
+    """No cachear ni dar por buena una ficha recortada (403/captcha de 2 KB)."""
+    if not text:
+        return False
+    host = urlparse(url).netloc.lower()
+    lowered = text.lower()
+    if "argenprop" in host:
+        return len(text) >= 8000 and (
+            "data-location-map" in lowered or "data-latitude" in lowered
+        )
+    return len(text) > 800
+
+
 def _page_cache_dir() -> Path | None:
     if os.environ.get("PROPMAP_TEST") == "1":
         return None
@@ -154,12 +262,14 @@ def _read_page_cache(url: str) -> str | None:
     if age > PAGE_CACHE_TTL:
         return None
     text = path.read_text(encoding="utf-8", errors="replace")
-    return text if len(text) > 800 else None
+    if not _listing_html_ok(url, text):
+        return None
+    return text
 
 
 def _remember_page(url: str, text: str) -> str:
     folder = _page_cache_dir()
-    if folder is not None and _looks_like_listing(url) and text and len(text) > 800:
+    if folder is not None and _looks_like_listing(url) and _listing_html_ok(url, text):
         path = folder / f"{hashlib.sha1(url.encode()).hexdigest()}.html"
         try:
             path.write_text(text, encoding="utf-8")
@@ -292,15 +402,19 @@ def _fetch_urllib(url: str, timeout: float) -> str:
 
 
 def fetch_bytes(url: str, timeout: float = 35.0, paced: bool = True) -> bytes:
+    from .egress import pick
+
+    host = urlparse(url).netloc
+    lane = pick(host)
     if paced:
-        crawl.wait(host=urlparse(url).netloc)
+        crawl.wait(host=host, lane=(lane.id if lane else "direct"))
         if crawl.aborted():
             raise RuntimeError("búsqueda pausada")
-    with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=timeout) as client:
-        response = client.get(url)
-        crawl.note_http(response.status_code, urlparse(url).netloc)
-        response.raise_for_status()
-        return response.content
+    response = _httpx_get(url, timeout, proxy=lane.proxy if lane else None)
+    crawl.note_http(response.status_code, host, lane=(lane.id if lane else "direct"))
+    _observe(host, lane.id if lane else "direct", response.status_code)
+    response.raise_for_status()
+    return response.content
 
 
 def fetch_json(url: str, timeout: float = 20.0) -> Any:

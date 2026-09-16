@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import unicodedata
 
-GEO_VERSION = "25"
+GEO_VERSION = "36"
 
 # CABA es la ciudad principal. Las coordenadas se pisan con Georef al arrancar.
 DEFAULT_CITY = "caba"
@@ -73,6 +74,14 @@ def _index_barrio(by: dict[str, dict], row: dict, *, overwrite: bool = True) -> 
 
 
 _POLY_CACHE: dict[str, list[dict]] = {}
+_OUTLINE_CACHE: dict[str, list[list[list[float]]]] = {}
+_OUTLINE_MISS: set[str] = set()
+_POINT_BOXES: list[tuple[str, float, float, float, float, float, float]] | None = None
+_POINT_BOXES_N = -1
+_SAME_PLACE: dict[str, frozenset[str]] = {}
+_WATER_RINGS: dict[str, list[list[list[float]]]] = {}
+_WATER_MISS: set[str] = set()
+_WATER_POINTS: dict[tuple[float, float], bool] = {}
 _LEARNED: dict[str, list[dict]] = {}
 _GENERIC_BARRIO = {
     "sin clasificar",
@@ -86,10 +95,58 @@ _GENERIC_BARRIO = {
     "este",
     "oeste",
 }
+_WEAK_CITY_ALIAS = {
+    "centro",
+    "norte",
+    "sur",
+    "este",
+    "oeste",
+    "microcentro",
+    "micro centro",
+}
 
 
 def remember_city_polygons(city: str, rows: list[dict]) -> None:
     _POLY_CACHE[city] = rows
+
+
+def outline_matches_city(city: str | None, rings: list[list[list[float]]]) -> bool:
+    """False si el polígono es de otro lugar homónimo (el centro de la ciudad queda afuera)."""
+    if not rings:
+        return False
+    cfg = CITIES.get(city or "") or {}
+    if not cfg:
+        for alias in (city or "",):
+            cfg = CITIES.get(alias) or {}
+            if cfg:
+                break
+    try:
+        lat, lon = float(cfg["lat"]), float(cfg["lon"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return _point_in_rings(lat, lon, rings)
+
+
+def remember_city_outline(city: str, rings: list[list[list[float]]]) -> None:
+    """Contorno administrativo de la ciudad (no la unión de barrios)."""
+    cleaned = [ring for ring in rings if isinstance(ring, list) and len(ring) >= 4]
+    if city and cleaned and outline_matches_city(city, cleaned):
+        _OUTLINE_CACHE[city] = cleaned
+        _OUTLINE_MISS.discard(city)
+        _invalidate_point_boxes()
+
+
+def clear_city_polygons(city: str | None = None) -> None:
+    if city:
+        _POLY_CACHE.pop(city, None)
+        _OUTLINE_CACHE.pop(city, None)
+        _OUTLINE_MISS.discard(city)
+        _invalidate_point_boxes()
+        return
+    _POLY_CACHE.clear()
+    _OUTLINE_CACHE.clear()
+    _OUTLINE_MISS.clear()
+    _invalidate_point_boxes()
 
 
 def city_polygons(city: str) -> list[dict]:
@@ -155,6 +212,124 @@ def barrio_containing(lat: float, lon: float, city: str = DEFAULT_CITY) -> tuple
         return None
     best = min(hits, key=lambda row: _ring_area(row["ring"]))
     return best["name"], best["zona"], best["lat"], best["lon"]
+
+
+def _point_in_rings(lat: float, lon: float, rings: list[list[list[float]]]) -> bool:
+    return any(len(ring) >= 4 and _point_in_ring(lat, lon, ring) for ring in rings)
+
+
+def city_outline_rings(city: str | None) -> list[list[list[float]]]:
+    """Polígono de la ciudad (CABA = Capital Federal, no el GBA)."""
+    seen: set[str] = set()
+    ids = [city or ""]
+    resolved = CITY_ALIASES.get(fold(city or ""), city or "")
+    if resolved:
+        ids.append(resolved)
+    if (city or "") in CABA_IDS or resolved in CABA_IDS:
+        ids.extend(CABA_IDS)
+    for cid in ids:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        cached = _OUTLINE_CACHE.get(cid)
+        if cached:
+            if outline_matches_city(cid, cached):
+                return cached
+            _OUTLINE_CACHE.pop(cid, None)
+        if cid in _OUTLINE_MISS:
+            continue
+        if os.environ.get("PROPMAP_TEST") == "1":
+            _OUTLINE_MISS.add(cid)
+            continue
+        from . import store
+
+        store.init()
+        raw = store.get_meta(f"osm_outline:{cid}")
+        if not raw:
+            _OUTLINE_MISS.add(cid)
+            continue
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        rings: list[list[list[float]]] = []
+        if isinstance(loaded, dict):
+            if isinstance(loaded.get("rings"), list):
+                rings = loaded["rings"]
+            elif isinstance(loaded.get("ring"), list):
+                rings = [loaded["ring"]]
+        elif isinstance(loaded, list):
+            rings = loaded if loaded and isinstance(loaded[0], list) and loaded and isinstance(loaded[0][0], list) else [loaded]
+        cleaned = [ring for ring in rings if isinstance(ring, list) and len(ring) >= 4]
+        if cleaned and outline_matches_city(cid, cleaned):
+            _OUTLINE_CACHE[cid] = cleaned
+            return cleaned
+        if cleaned:
+            _OUTLINE_CACHE.pop(cid, None)
+            try:
+                store.set_meta(f"osm_outline:{cid}", "")
+            except Exception:
+                pass
+            try:
+                from .listings_cache import invalidate_city_geo
+
+                invalidate_city_geo(cid)
+            except Exception:
+                pass
+    return []
+
+
+def city_outline_bbox(city: str | None):
+    rings = city_outline_rings(city)
+    lats: list[float] = []
+    lons: list[float] = []
+    for ring in rings:
+        for point in ring:
+            if len(point) >= 2:
+                lats.append(float(point[0]))
+                lons.append(float(point[1]))
+    if len(lats) < 4:
+        return None
+    return (min(lats), min(lons), max(lats), max(lons))
+
+
+def barrio_from_pin(lat: float | None, lon: float | None, city: str | None) -> tuple[str, str]:
+    """Barrio del pin: polígono OSM, centroide OSM o el más cercano ya geocodificado. Nunca el texto del aviso."""
+    if lat is None or lon is None:
+        return "Sin clasificar", "Sin clasificar"
+    place = city or default_city()
+    if place in _LOOSE_CITIES:
+        return "Sin clasificar", "Sin clasificar"
+    own = own_place_names(place)
+    hit = barrio_containing(float(lat), float(lon), place)
+    if hit and fold(hit[0]) not in own:
+        return hit[0], hit[1]
+    osm = [
+        row
+        for row in city_polygons(place)
+        if row.get("lat") is not None
+        and row.get("lon") is not None
+        and fold(row.get("name") or "") not in own
+    ]
+    if osm:
+        best = min(osm, key=lambda row: (float(row["lat"]) - lat) ** 2 + (float(row["lon"]) - lon) ** 2)
+        return best["name"], best.get("zona") or best["name"]
+    name, zona, _clat, _clon = nearest_barrio(float(lat), float(lon), place)
+    if fold(name) in own or fold(name) in _GENERIC_BARRIO:
+        return "Sin clasificar", zona_from_bearing(float(lat), float(lon), city=place)
+    return name, zona
+
+
+def apply_barrio_from_pin(item) -> bool:
+    city = getattr(item, "city", None) or default_city()
+    if city in _LOOSE_CITIES:
+        return False
+    lat, lon = getattr(item, "lat", None), getattr(item, "lon", None)
+    name, zona = barrio_from_pin(lat, lon, city)
+    changed = (item.barrio or "") != name or (item.zona or "") != zona
+    item.barrio = name
+    item.zona = zona
+    return changed
 
 
 def city_center(city: str | None) -> tuple[float, float]:
@@ -229,41 +404,92 @@ def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def in_city_radius(lat: float | None, lon: float | None, city: str | None) -> bool:
     if lat is None or lon is None:
         return False
+    rings = city_outline_rings(city)
     cfg = CITIES.get(city or "") or {}
     if not cfg:
         for alias in same_place_ids(city):
             cfg = CITIES.get(alias) or {}
             if cfg:
                 break
-    if not cfg:
-        return False
-    clat, clon = cfg["lat"], cfg["lon"]
-    radius = float(cfg.get("radius_km") or 25)
-    if cfg.get("bbox"):
-        radius = _extent_radius_km(cfg["bbox"], clat, clon)
-    in_radius = distance_km(lat, lon, clat, clon) <= radius
-    box = cfg.get("bbox")
-    if box:
-        south, west, north, east = box
-        in_box = south <= lat <= north and west <= lon <= east
-        return in_box or in_radius
-    return in_radius
+    in_rings = bool(rings) and _point_in_rings(float(lat), float(lon), rings)
+    in_rad = False
+    if cfg:
+        clat, clon = cfg["lat"], cfg["lon"]
+        radius = float(cfg.get("radius_km") or 25)
+        if cfg.get("bbox"):
+            radius = _extent_radius_km(cfg["bbox"], clat, clon)
+        in_rad = distance_km(lat, lon, clat, clon) <= radius
+        box = cfg.get("bbox")
+        if box:
+            south, west, north, east = box
+            in_rad = in_rad or (south <= lat <= north and west <= lon <= east)
+    if rings:
+        return in_rings
+    return in_rad
+
+
+def _invalidate_point_boxes() -> None:
+    global _POINT_BOXES, _POINT_BOXES_N
+    _POINT_BOXES = None
+    _POINT_BOXES_N = -1
+    _SAME_PLACE.clear()
+
+
+def _rings_bbox(rings: list[list[list[float]]]) -> tuple[float, float, float, float] | None:
+    lats: list[float] = []
+    lons: list[float] = []
+    for ring in rings:
+        for point in ring:
+            if len(point) >= 2:
+                lats.append(float(point[0]))
+                lons.append(float(point[1]))
+    if len(lats) < 4:
+        return None
+    return (min(lats), min(lons), max(lats), max(lons))
+
+
+def _point_boxes() -> list[tuple[str, float, float, float, float, float, float]]:
+    """Cajas en RAM. No pega a SQLite: el armado de CABA no puede releer 600 contornos."""
+    global _POINT_BOXES, _POINT_BOXES_N
+    n = len(CITIES)
+    if _POINT_BOXES is not None and n == _POINT_BOXES_N:
+        return _POINT_BOXES
+    boxes: list[tuple[str, float, float, float, float, float, float]] = []
+    for city_id, cfg in list(CITIES.items()):
+        try:
+            clat, clon = float(cfg["lat"]), float(cfg["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        box = cfg.get("bbox")
+        rings = _OUTLINE_CACHE.get(city_id)
+        if rings:
+            ring_box = _rings_bbox(rings)
+            if ring_box:
+                box = ring_box
+        if box and len(box) >= 4:
+            south, west, north, east = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        else:
+            radius = float(cfg.get("radius_km") or 25)
+            dlat = radius / 111.0
+            cos_lat = max(0.2, math.cos(math.radians(clat)))
+            dlon = radius / (111.0 * cos_lat)
+            south, west, north, east = clat - dlat, clon - dlon, clat + dlat, clon + dlon
+        boxes.append((city_id, south, west, north, east, clat, clon))
+    _POINT_BOXES = boxes
+    _POINT_BOXES_N = n
+    return boxes
 
 
 def city_for_point(lat: float, lon: float) -> str | None:
     best_id = None
     best_d = 1e9
-    for city_id, cfg in CITIES.items():
-        box = cfg.get("bbox")
-        if box:
-            south, west, north, east = box
-            if not (south <= lat <= north and west <= lon <= east):
-                continue
-            dist = distance_km(lat, lon, cfg["lat"], cfg["lon"])
-        else:
-            dist = distance_km(lat, lon, cfg["lat"], cfg["lon"])
-            if dist > float(cfg.get("radius_km") or 25):
-                continue
+    for city_id, south, west, north, east, clat, clon in _point_boxes():
+        if not (south <= lat <= north and west <= lon <= east):
+            continue
+        rings = _OUTLINE_CACHE.get(city_id)
+        if rings and not _point_in_rings(lat, lon, rings):
+            continue
+        dist = distance_km(lat, lon, clat, clon)
         if dist < best_d:
             best_id, best_d = city_id, dist
     return best_id
@@ -287,7 +513,36 @@ def portal_pin_in_city(item, city: str) -> bool:
         return False
 
 
+def portal_outside_city(item, city: str) -> bool:
+    if not city or city in _LOOSE_CITIES:
+        return False
+    extra = getattr(item, "extra", None) or {}
+    try:
+        lat = extra.get("portal_lat")
+        lon = extra.get("portal_lon")
+        if lat is None or lon is None:
+            return False
+        cfg = CITIES.get(city) or {}
+        if not cfg:
+            for alias in same_place_ids(city):
+                cfg = CITIES.get(alias) or {}
+                if cfg:
+                    break
+        if not cfg:
+            return False
+        return not in_city_radius(float(lat), float(lon), city)
+    except (TypeError, ValueError):
+        return False
+
+
 def barrio_belongs_to_city(item, city: str) -> bool:
+    extra = getattr(item, "extra", None) or {}
+    raw = extra.get("portal_barrio") or extra.get("barrio")
+    if raw:
+        token = fold(raw)
+        if not token or token in _GENERIC_BARRIO:
+            return False
+        return token in own_barrio_names(city) or token in own_place_names(city)
     token = fold(getattr(item, "barrio", None) or "")
     if not token or token in _GENERIC_BARRIO:
         return False
@@ -318,11 +573,48 @@ def _snap_city_alias_barrio(item, city: str) -> bool:
     return True
 
 
-def pin_listing_city(item) -> bool:
+def pin_listing_city(item, *, remote: bool = True) -> bool:
+    changed = _pin_listing_city(item, remote=remote)
+    if apply_barrio_from_pin(item):
+        changed = True
+    from .place_tags import apply_place_tags
+
+    apply_place_tags(item, remote=remote)
+    return changed
+
+
+def _pin_listing_city(item, *, remote: bool = True) -> bool:
     extra = getattr(item, "extra", None) or {}
     search = str(extra.get("search_city") or "").strip()
     tagged = item.city or default_city()
     home = search if search and search not in _LOOSE_CITIES else tagged
+    if home not in _LOOSE_CITIES and portal_outside_city(item, home):
+        try:
+            plat, plon = float(extra["portal_lat"]), float(extra["portal_lon"])
+        except (KeyError, TypeError, ValueError):
+            plat = plon = None
+        if plat is not None:
+            item.lat, item.lon = plat, plon
+            extra = dict(extra)
+            extra["pin_kind"] = "saved"
+            if extra.get("portal_exact") and not extra.get("portal_approx"):
+                extra["location_kind"] = "exact"
+                item.has_exact_location = True
+            else:
+                extra["location_kind"] = "approx"
+                item.has_exact_location = False
+            item.extra = extra
+            sit = city_for_point(plat, plon)
+            if sit and sit not in same_place_ids(home) and sit != home:
+                item.city = sit
+            else:
+                item.city = "fuera"
+            if item.city not in _LOOSE_CITIES:
+                _snap_city_alias_barrio(item, item.city)
+            from .scrapers import attach_location_facts
+
+            attach_location_facts(item)
+            return True
     if home not in _LOOSE_CITIES and portal_pin_in_city(item, home):
         changed = item.city != home
         item.city = home
@@ -346,7 +638,7 @@ def pin_listing_city(item) -> bool:
         and item.lat is not None
         and item.lon is not None
         and in_city_radius(item.lat, item.lon, home)
-        and (barrio_belongs_to_city(item, home) or not foreign_locality(item, home))
+        and (barrio_belongs_to_city(item, home) or not foreign_locality(item, home, remote=remote))
     ):
         changed = item.city != home
         item.city = home
@@ -358,9 +650,17 @@ def pin_listing_city(item) -> bool:
     if tagged not in _LOOSE_CITIES and tagged not in CITIES:
         return False
     if tagged in _LOOSE_CITIES:
-        guessed = city_from_text(item)
+        guessed = city_from_text(item, remote=remote)
         if guessed and guessed not in _LOOSE_CITIES:
-            if listing_mentions_city(item, guessed) and not foreign_locality(item, guessed):
+            if listing_mentions_city(item, guessed) and not foreign_locality(item, guessed, remote=remote):
+                sit = (
+                    city_for_point(item.lat, item.lon)
+                    if item.lat is not None and item.lon is not None
+                    else None
+                )
+                if sit and sit != guessed and not in_city_radius(item.lat, item.lon, guessed):
+                    _clear_pin(item)
+                    return True
                 item.city = guessed
                 if item.lat is not None and item.lon is not None and not in_city_radius(
                     item.lat, item.lon, guessed
@@ -368,7 +668,7 @@ def pin_listing_city(item) -> bool:
                     _clear_pin(item)
                 _snap_city_alias_barrio(item, guessed)
                 return True
-        if home not in _LOOSE_CITIES and listing_mentions_city(item, home) and not foreign_locality(item, home):
+        if home not in _LOOSE_CITIES and listing_mentions_city(item, home) and not foreign_locality(item, home, remote=remote):
             item.city = home
             if item.lat is not None and item.lon is not None and not in_city_radius(item.lat, item.lon, home):
                 _clear_pin(item)
@@ -379,19 +679,43 @@ def pin_listing_city(item) -> bool:
         sit = city_for_point(item.lat, item.lon)
         if not sit:
             return False
-        if foreign_locality(item, sit) and not barrio_belongs_to_city(item, sit):
+        if foreign_locality(item, sit, remote=remote) and not barrio_belongs_to_city(item, sit):
             _clear_pin(item)
             return True
         item.city = sit
         _snap_city_alias_barrio(item, sit)
         return True
-    if foreign_locality(item, tagged) and not barrio_belongs_to_city(item, tagged):
-        guessed = city_from_text(item)
+    if foreign_locality(item, tagged, remote=remote) and not barrio_belongs_to_city(item, tagged):
+        guessed = city_from_text(item, remote=remote)
         if guessed == tagged:
             guessed = None
+        if not guessed:
+            from .place_api import listing_places, place_conflicts_city as _place_conflicts
+            from .places import ensure_place
+
+            for place in listing_places(item, remote=remote):
+                if str(place.get("kind") or "") not in {"localidad", "municipio"}:
+                    continue
+                if place.get("lat") is None or place.get("lon") is None:
+                    continue
+                if not _place_conflicts(place, tagged):
+                    continue
+                name = str(place.get("name") or "").strip()
+                if not name:
+                    continue
+                guessed = ensure_place(
+                    name,
+                    label=name,
+                    lat=float(place["lat"]),
+                    lon=float(place["lon"]),
+                    province=str(place.get("province") or "") or None,
+                )
+                if guessed == tagged:
+                    guessed = None
+                break
         if not guessed and item.lat is not None and item.lon is not None:
             guessed = city_for_point(item.lat, item.lon)
-            if guessed == tagged or (guessed and foreign_locality(item, guessed) and not barrio_belongs_to_city(item, guessed)):
+            if guessed == tagged or (guessed and foreign_locality(item, guessed, remote=remote) and not barrio_belongs_to_city(item, guessed)):
                 guessed = None
         item.city = guessed or "fuera"
         if item.lat is not None and item.lon is not None and (
@@ -406,7 +730,7 @@ def pin_listing_city(item) -> bool:
         if guessed and guessed != tagged:
             keep_tagged = (
                 listing_mentions_city(item, tagged)
-                and not foreign_locality(item, tagged)
+                and not foreign_locality(item, tagged, remote=remote)
                 and not listing_mentions_city(item, guessed)
                 and not barrio_belongs_to_city(item, guessed)
                 and search != guessed
@@ -419,7 +743,7 @@ def pin_listing_city(item) -> bool:
             changed = True
             _snap_city_alias_barrio(item, guessed)
         elif not guessed and not in_city_radius(item.lat, item.lon, tagged):
-            if listing_mentions_city(item, tagged) and not foreign_locality(item, tagged):
+            if listing_mentions_city(item, tagged) and not foreign_locality(item, tagged, remote=remote):
                 if _dummy_coords(item.lat, item.lon, tagged):
                     _clear_pin(item)
                     return True
@@ -450,9 +774,9 @@ def own_place_names(city: str) -> set[str]:
     return {fold(n) for n in names if n and fold(n)}
 
 
-def own_barrio_names(city: str) -> set[str]:
+def _barrio_name_tokens(rows: list[dict]) -> set[str]:
     names: set[str] = set()
-    for barrio in barrios_for(city):
+    for barrio in rows:
         token = fold(barrio.get("name") or "")
         if token and token not in _GENERIC_BARRIO:
             names.add(token)
@@ -461,6 +785,15 @@ def own_barrio_names(city: str) -> set[str]:
             if token and token not in _GENERIC_BARRIO:
                 names.add(token)
     return names
+
+
+def official_barrio_names(city: str) -> set[str]:
+    cfg = CITIES.get(city) or {}
+    return _barrio_name_tokens(list(city_polygons(city)) + list(cfg.get("barrios") or []))
+
+
+def own_barrio_names(city: str) -> set[str]:
+    return _barrio_name_tokens(barrios_for(city))
 
 
 def _is_own_phrase(phrase: str, own: set[str]) -> bool:
@@ -472,29 +805,50 @@ def _is_own_phrase(phrase: str, own: set[str]) -> bool:
     return any(len(token) >= 5 and len(name) >= 5 and (token in name or name in token) for name in own)
 
 
+_STREET_USE = (
+    r"(?:av(?:da|\.|enida)?|calle|pasaje|pje\.?|ruta|diag(?:onal)?)\s+{name}"
+    r"(?:\s+(?:al\s+)?\d{{2,5}})?"
+    r"|{name}\s+(?:al\s+)?\d{{2,5}}\b"
+)
+
+
+def _mentions_as_place(blob: str, name: str) -> bool:
+    if not name:
+        return False
+    cleaned = re.sub(_STREET_USE.format(name=re.escape(name)), " ", blob)
+    padded = f" {cleaned} "
+    if len(name) >= 5 and name in cleaned:
+        return True
+    return len(name) >= 4 and f" {name} " in padded
+
+
 def listing_mentions_city(item, city: str) -> bool:
     blob = _listing_blob(item)
-    padded = f" {blob} "
-    for name in own_place_names(city):
-        if not name:
-            continue
-        if len(name) >= 5 and name in blob:
-            return True
-        if len(name) >= 4 and f" {name} " in padded:
-            return True
-    return False
+    names = {
+        name
+        for name in own_place_names(city)
+        if name and name not in _GENERIC_BARRIO and name not in _WEAK_CITY_ALIAS and len(name) >= 4
+    }
+    return any(_mentions_as_place(blob, name) for name in names)
 
 
 def same_place_ids(city: str | None) -> set[str]:
     city = city or ""
     if not city:
         return set()
+    hit = _SAME_PLACE.get(city)
+    if hit is not None:
+        return set(hit)
     resolved = CITY_ALIASES.get(fold(city), city)
+    hit = _SAME_PLACE.get(resolved)
+    if hit is not None:
+        _SAME_PLACE[city] = hit
+        return set(hit)
     cfg = CITIES.get(resolved) or CITIES.get(city) or {}
     ids = {city, resolved}
     slug = cfg.get("slug") or city
     province = cfg.get("province") or ""
-    for other_id, other in CITIES.items():
+    for other_id, other in list(CITIES.items()):
         if (other.get("slug") or other_id) == slug:
             ids.add(other_id)
         if province and other.get("province") == province and province == "capital-federal":
@@ -503,11 +857,31 @@ def same_place_ids(city: str | None) -> set[str]:
         ids.update(CABA_IDS)
         if DEFAULT_CITY in CITIES:
             ids.add(DEFAULT_CITY)
-    return {item for item in ids if item}
+    else:
+        try:
+            clat, clon = float(cfg["lat"]), float(cfg["lon"])
+            radius = float(cfg.get("radius_km") or 25)
+        except (KeyError, TypeError, ValueError):
+            clat = None
+        if clat is not None:
+            for other_id, other in list(CITIES.items()):
+                if other_id in ids:
+                    continue
+                try:
+                    olat, olon = float(other["lat"]), float(other["lon"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if distance_km(clat, clon, olat, olon) <= radius:
+                    ids.add(other_id)
+    frozen = frozenset(item for item in ids if item)
+    _SAME_PLACE[city] = frozen
+    if resolved != city:
+        _SAME_PLACE[resolved] = frozen
+    return set(frozen)
 
 
 def city_from_text(item, *, remote: bool = True) -> str | None:
-    from .place_api import listing_places, place_conflicts_city
+    from .place_api import listing_places
 
     extra = getattr(item, "extra", None) or {}
     search = str(extra.get("search_city") or "").strip()
@@ -537,29 +911,20 @@ def city_from_text(item, *, remote: bool = True) -> str | None:
             return guessed
     if guesses:
         return guesses[0]
-    hits: list[str] = []
-    seen: set[str] = set()
-    for city_id in CITIES:
-        if city_id in _LOOSE_CITIES or city_id in seen:
+    blob = fold(_listing_blob(item))
+    if not blob:
+        return None
+    best = None
+    best_n = 0
+    for city_id, cfg in list(CITIES.items()):
+        if city_id in _LOOSE_CITIES:
             continue
-        if not listing_mentions_city(item, city_id):
+        label = fold(str(cfg.get("label") or ""))
+        if len(label) < 5 or label not in blob:
             continue
-        if any(place_conflicts_city(place, city_id) for place in places):
-            continue
-        for alias in same_place_ids(city_id):
-            seen.add(alias)
-        hits.append(city_id)
-    if len(hits) == 1:
-        return hits[0]
-    blob = _listing_blob(item)
-    hit = None
-    for city_id, cfg in CITIES.items():
-        label = fold(cfg.get("label") or "")
-        if len(label) >= 5 and (f"en {label}" in blob or f"{label}," in blob):
-            if any(place_conflicts_city(place, city_id) for place in places):
-                continue
-            hit = city_id
-    return hit
+        if len(label) > best_n:
+            best, best_n = city_id, len(label)
+    return best
 
 
 def foreign_locality(item, city: str, *, remote: bool = True) -> bool:
@@ -580,18 +945,51 @@ def foreign_locality(item, city: str, *, remote: bool = True) -> bool:
     return False
 
 
-def listing_fits_city(item, city: str, *, remote: bool = True) -> bool:
+def listing_fits_city(item, city: str, *, remote: bool = True, require_radius: bool = True) -> bool:
     city = city or default_city()
+    wanted = same_place_ids(city)
     item_city = getattr(item, "city", None) or ""
-    if item_city not in same_place_ids(city) and item_city != city:
-        return False
-    if foreign_locality(item, city, remote=remote) and not portal_pin_in_city(item, city):
-        return False
+    extra = getattr(item, "extra", None) or {}
+    search = str(extra.get("search_city") or "").strip()
+    tagged = item_city in wanted or item_city == city or search in wanted or search == city
     lat = getattr(item, "lat", None)
     lon = getattr(item, "lon", None)
-    if lat is not None and lon is not None and not in_city_radius(lat, lon, city):
+    in_radius = lat is not None and lon is not None and in_city_radius(lat, lon, city)
+    mentioned = listing_mentions_city(item, city)
+    portal_here = portal_pin_in_city(item, city)
+    searched_here = bool(search) and (search == city or search in wanted)
+    if portal_outside_city(item, city):
         return False
-    return True
+    from .place_tags import is_narrower_place_query, listing_matches_city, listing_place_tags
+
+    place_tags = listing_place_tags(item, remote=False)
+    tags_hit = listing_matches_city(item, city)
+    if place_tags and not tags_hit and is_narrower_place_query(place_tags, city):
+        return False
+    if tags_hit:
+        tagged = True
+    if not tagged and not in_radius and not mentioned:
+        return False
+    if lat is not None and lon is not None and not in_radius:
+        if city_outline_rings(city) and not portal_here:
+            return False
+        sit = city_for_point(float(lat), float(lon))
+        if sit and sit not in wanted and sit != city and not portal_here:
+            return False
+    # Pin adentro de la ciudad buscada: un topónimo homónimo (Hudson, Córdoba) no lo esconde.
+    if foreign_locality(item, city, remote=remote) and not portal_here and not (in_radius and searched_here):
+        return False
+    if in_radius and mentioned:
+        return True
+    if in_radius or portal_here:
+        return True
+    if city_outline_rings(city):
+        return False
+    if lat is not None and lon is not None and require_radius:
+        has_cfg = any(CITIES.get(alias) for alias in (wanted or {city}))
+        if has_cfg:
+            return False
+    return tagged or mentioned
 
 
 def public_row_fits_city(row: dict, city: str) -> bool:
@@ -601,16 +999,23 @@ def public_row_fits_city(row: dict, city: str) -> bool:
             self.title = data.get("title") or ""
             self.address = data.get("address") or ""
             self.description = data.get("description") or ""
-            self.barrio = data.get("barrio") or ""
+            self.barrio = data.get("portal_barrio") or data.get("barrio") or ""
             self.lat = data.get("lat")
             self.lon = data.get("lon")
             extra = dict(data.get("extra") or {})
+            if data.get("portal_barrio"):
+                extra.setdefault("portal_barrio", data.get("portal_barrio"))
+                extra.setdefault("barrio", data.get("portal_barrio"))
+            if data.get("search_city"):
+                extra.setdefault("search_city", data.get("search_city"))
+            if data.get("place_tags"):
+                extra["place_tags"] = list(data.get("place_tags") or [])
             if data.get("portal_lat") is not None:
                 extra["portal_lat"] = data.get("portal_lat")
                 extra["portal_lon"] = data.get("portal_lon")
             self.extra = extra
 
-    return listing_fits_city(_Row(row), city, remote=False)
+    return listing_fits_city(_Row(row), city, remote=False, require_radius=True)
 
 
 def fold(text: str) -> str:
@@ -624,7 +1029,7 @@ CITY_ALIASES: dict[str, str] = {}
 
 def _seed_city_aliases() -> None:
     CITY_ALIASES.clear()
-    for city_id, cfg in CITIES.items():
+    for city_id, cfg in list(CITIES.items()):
         CITY_ALIASES[city_id] = city_id
         CITY_ALIASES.setdefault(fold(cfg.get("label") or ""), city_id)
         for alias in cfg.get("aliases") or []:
@@ -693,6 +1098,7 @@ def register_city(
     if bbox and len(bbox) >= 4:
         CITIES[city_id]["bbox"] = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
         CITIES[city_id]["radius_km"] = float(radius_km or _extent_radius_km(CITIES[city_id]["bbox"], lat, lon))
+    _invalidate_point_boxes()
     def _alias(name: str) -> None:
         token = fold(name)
         if not token:
@@ -724,7 +1130,7 @@ def resolve_city(value: str | None) -> str:
         return raw
     best = ""
     best_len = 0
-    for cfg in CITIES.values():
+    for cfg in list(CITIES.values()):
         names = [fold(cfg["id"]), fold(cfg["label"]), *[fold(a) for a in cfg.get("aliases") or []]]
         for name in names:
             if name and (name == raw or name == slug):
@@ -805,11 +1211,31 @@ def learned_barrios(city: str) -> list[dict]:
         if raw:
             loaded = json.loads(raw)
             if isinstance(loaded, list):
-                rows = [row for row in loaded if isinstance(row, dict) and row.get("name")]
+                rows = [
+                    row
+                    for row in loaded
+                    if isinstance(row, dict) and row.get("name") and not _learned_name_is_foreign_city(city, row.get("name"))
+                ]
     except Exception:
         rows = []
     _LEARNED[city] = rows
     return rows
+
+
+def _learned_name_is_foreign_city(city: str, name: str | None) -> bool:
+    if not name:
+        return False
+    try:
+        from .place_api import lookup_place, place_conflicts_city
+
+        place = lookup_place(name, remote=False)
+        if not place:
+            return False
+        if str(place.get("kind") or "") not in {"localidad", "municipio", "asentamiento"}:
+            return False
+        return place_conflicts_city(place, city)
+    except Exception:
+        return False
 
 
 def remember_barrio(city: str | None, name: str | None, lat: float | None = None, lon: float | None = None) -> None:
@@ -821,6 +1247,18 @@ def remember_barrio(city: str | None, name: str | None, lat: float | None = None
         return
     if token.startswith("zona ") or token in {"centro", "norte", "sur", "este", "oeste"}:
         return
+    try:
+        from .place_api import lookup_place, place_conflicts_city
+
+        known = lookup_place(pretty, remote=False)
+        if (
+            known
+            and str(known.get("kind") or "") in {"localidad", "municipio", "asentamiento"}
+            and place_conflicts_city(known, city)
+        ):
+            return
+    except Exception:
+        pass
     rows = list(learned_barrios(city))
     found = next((row for row in rows if fold(row["name"]) == token), None)
     if found:
@@ -840,6 +1278,12 @@ def remember_barrio(city: str | None, name: str | None, lat: float | None = None
             }
         )
     _LEARNED[city] = rows
+    try:
+        from .place_api import forget_barrio_index
+
+        forget_barrio_index(city)
+    except Exception:
+        pass
     try:
         from . import store
 
@@ -924,7 +1368,7 @@ def infer_barrio(*parts: str, city: str = DEFAULT_CITY, barrio_hint: str | None 
                     break
         if hit:
             _name, lat, lon, barrio_name = hit
-            lat2, lon2 = offset_by_number(lat, lon, number)
+            lat2, lon2 = offset_by_number(lat, lon, number, city)
             zona = zona_from_bearing(lat2, lon2, clat, clon)
             name_out = hinted or barrio_name
             if name_out == "Oeste residencial":
@@ -962,6 +1406,7 @@ _STREET_SKIP = {
     "oportunidad", "lindo", "unico", "hermoso",
     "monoambiente", "duplex", "triplex", "piso", "planta", "unidad", "edificio",
     "aprox", "aproximadamente",
+    "lote", "lotes", "parcela", "manzana", "fraccion", "loteo", "mz",
 }
 
 
@@ -990,6 +1435,11 @@ def parse_street(text: str) -> tuple[str, int | None]:
         if not name:
             pos = match.start("name") + 1
             continue
+        from .text_quality import is_plot_street_name
+
+        if is_plot_street_name(name) or is_plot_street_name(name.split()[0]):
+            pos = match.end()
+            continue
         number = int(match.group("num"))
         words = name.split()
         suffixes = [" ".join(words[i:]) for i in range(len(words))]
@@ -999,7 +1449,7 @@ def parse_street(text: str) -> tuple[str, int | None]:
             if len(candidate) < 3 or any(word in _STREET_SKIP for word in cwords):
                 continue
             picked = True
-            score = (0 if _street_is_known(candidate) else 1, abs(len(cwords) - 2), len(cwords))
+            score = (0 if _street_is_known(candidate) else 1, -len(cwords), -len(candidate))
             if _street_is_known(candidate):
                 known_hits.append((score, candidate, number))
             else:
@@ -1103,12 +1553,20 @@ def can_place_on_map(item) -> bool:
     return lat is not None and lon is not None
 
 
-def offset_by_number(lat: float, lon: float, number: int | None) -> tuple[float, float]:
+def offset_by_number(
+    lat: float, lon: float, number: int | None, city: str | None = None
+) -> tuple[float, float]:
     if not number:
         return lat, lon
-    # ~8 m por número de puerta, hacia el sur (crecimiento típico de Madryn).
+    # ~0.55 m por número de puerta; en Madryn las calles crecen al sur, en CABA eso cae al Riachuelo.
     meters = min(number, 4000) * 0.55
-    return offset_meters(lat, lon, south=meters, east=0)
+    south = offset_meters(lat, lon, south=meters)
+    if not in_water(south[0], south[1], city):
+        return south
+    north = offset_meters(lat, lon, south=-meters)
+    if not in_water(north[0], north[1], city):
+        return north
+    return lat, lon
 
 
 def offset_meters(lat: float, lon: float, south: float = 0.0, east: float = 0.0) -> tuple[float, float]:
@@ -1140,6 +1598,282 @@ def listing_coords_are_exact(
     return bool(has_exact)
 
 
+def has_direccion_fields(data: dict) -> bool:
+    """Calle y altura (scrape o LLM), no un barrio suelto ni 'lote 12'."""
+    from .text_quality import address_quality, is_plot_label, is_plot_street_name
+
+    street = str(data.get("street") or "").strip()
+    number = data.get("street_number")
+    if is_plot_street_name(street) or is_plot_label(street, str(number or ""), str(data.get("address") or "")):
+        return False
+    if street and number not in {None, "", 0, "0"}:
+        return True
+    return address_quality(str(data.get("address") or "")) >= 5
+
+
+def has_interseccion_fields(data: dict) -> bool:
+    inter = str(data.get("intersection") or "").strip()
+    if not inter:
+        return False
+    if " y " not in inter.lower():
+        return True
+    left, right = re.split(r"\s+y\s+", inter, maxsplit=1, flags=re.I)
+    return not street_names_match(left, right)
+
+
+def has_scraped_approx_fields(data: dict) -> bool:
+    """Pin de manzana que vino del aviso, no una grilla inventada."""
+    if data.get("portal_lat") is not None and data.get("portal_lon") is not None:
+        return True
+    if str(data.get("approx_address") or "").strip():
+        return True
+    source = str(data.get("source") or "").lower()
+    if source in APPROX_PORTALS and data.get("lat") is not None and data.get("lon") is not None:
+        return True
+    return False
+
+
+def listing_location_data(item) -> dict:
+    extra = getattr(item, "extra", None) or {}
+    return {
+        "source": getattr(item, "source", None) or "",
+        "street": extra.get("street") or "",
+        "street_number": extra.get("street_number"),
+        "address": getattr(item, "address", None) or "",
+        "intersection": extra.get("intersection") or extra.get("between") or "",
+        "has_exact_location": getattr(item, "has_exact_location", False),
+        "location_kind": extra.get("location_kind") or "",
+        "portal_exact": extra.get("portal_exact"),
+        "portal_approx": extra.get("portal_approx"),
+        "portal_lat": extra.get("portal_lat"),
+        "portal_lon": extra.get("portal_lon"),
+        "lat": getattr(item, "lat", None),
+        "lon": getattr(item, "lon", None),
+    }
+
+
+def location_is_precise(data: dict) -> bool:
+    """Calle+altura, esquina real o geo exacta del portal: no es la celda de 180 m."""
+    if has_direccion_fields(data) or has_interseccion_fields(data):
+        return True
+    return bool(data.get("portal_exact")) and not data.get("portal_approx")
+
+
+def stamp_location_flags(data: dict) -> dict:
+    real = bool(data.get("has_exact_location")) and not bool(data.get("location_approx"))
+    data["location_real"] = real
+    data["location_missing"] = (
+        not real
+        and not has_direccion_fields(data)
+        and not has_interseccion_fields(data)
+        and not has_scraped_approx_fields(data)
+    )
+    return data
+
+
+def _as_metric_int(value) -> int | None:
+    if value in {None, "", 0, "0"}:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0 or abs(number - round(number)) > 0.01:
+        return None
+    return int(round(number))
+
+
+def listing_metric_numbers(item) -> set[int]:
+    nums: set[int] = set()
+    for val in (
+        getattr(item, "covered_m2", None),
+        getattr(item, "total_m2", None),
+        getattr(item, "rooms", None),
+        getattr(item, "bedrooms", None),
+        getattr(item, "bathrooms", None),
+        getattr(item, "parking", None),
+        getattr(item, "age_years", None),
+    ):
+        n = _as_metric_int(val)
+        if n is not None:
+            nums.add(n)
+    extra = getattr(item, "extra", None) or {}
+    llm = extra.get("llm") if isinstance(extra.get("llm"), dict) else {}
+    for key in ("floor", "expenses", "covered_m2", "total_m2", "rooms", "bedrooms", "bathrooms"):
+        n = _as_metric_int(llm.get(key) if llm else extra.get(key))
+        if n is not None:
+            nums.add(n)
+    n = _as_metric_int(extra.get("expenses"))
+    if n is not None:
+        nums.add(n)
+    blob = " ".join(
+        str(p)
+        for p in (
+            getattr(item, "title", ""),
+            getattr(item, "address", ""),
+            getattr(item, "description", ""),
+        )
+        if p
+    )
+    for match in re.finditer(
+        r"(\d{1,5})\s*(?:cuotas?|pisos?|amb(?:ientes?)?|dorm(?:itorios?)?|años?|mts?|m²|m2)\b",
+        blob,
+        re.I,
+    ):
+        nums.add(int(match.group(1)))
+    for match in re.finditer(
+        r"\b(?:cuotas?|piso|planta)\s*(?:n(?:ro|umero|úmero)?\.?\s*)?(\d{1,4})\b",
+        blob,
+        re.I,
+    ):
+        nums.add(int(match.group(1)))
+    return nums
+
+
+def recovered_location_overlay(item) -> dict:
+    """Calle, altura o esquina desde el aviso, el LLM o el geocode. No inventa barrios."""
+    from .text_quality import address_quality, is_plot_label, is_plot_street_name
+
+    extra = getattr(item, "extra", None) or {}
+    street = str(extra.get("street") or "").strip()
+    number = extra.get("street_number")
+    address = str(getattr(item, "address", None) or "").strip()
+    intersection = str(extra.get("intersection") or "").strip()
+    geo_label = str(extra.get("geo_label") or "").strip()
+    metrics = listing_metric_numbers(item)
+    parsed_addr, parsed_num = parse_street(address)
+    if parsed_num and parsed_num in metrics:
+        address = _pretty_barrio(parsed_addr) if parsed_addr else ""
+        number = None if number in metrics or number == parsed_num else number
+
+    def take_street_number(st: str, num: int | None, raw: str = "") -> None:
+        nonlocal street, number, address, geo_label
+        from .text_quality import is_plot_label, is_plot_street_name
+
+        if not st or not num or num in metrics or num <= 0:
+            return
+        if is_plot_street_name(st) or is_plot_label(st, str(num), raw):
+            return
+        pretty = _pretty_barrio(st)
+        if not street:
+            street = pretty
+        if number in {None, "", 0, "0"} or number in metrics:
+            number = num
+        shown = raw.strip() if raw.strip() and not raw.isupper() else f"{pretty} {num}"
+        if raw.isupper():
+            shown = _pretty_barrio(raw.split(",")[0])
+        if address_quality(shown) > address_quality(address):
+            address = shown
+        if raw:
+            geo_label = raw.split(",")[0].strip()
+
+    def consider(label: str) -> None:
+        nonlocal street, address
+        raw = (label or "").split(",")[0].strip()
+        if not raw:
+            return
+        st, num = parse_street(raw)
+        if st and num:
+            take_street_number(st, num, raw)
+        elif st and not street:
+            street = _pretty_barrio(st)
+            weak = fold(address) in {fold(getattr(item, "barrio", "") or ""), fold(getattr(item, "city", "") or "")}
+            if not address or weak:
+                address = street
+
+    llm_geo = extra.get("llm_geo") if isinstance(extra.get("llm_geo"), dict) else {}
+    plot_addr = is_plot_label(address) or is_plot_street_name(str(extra.get("street") or ""))
+    if not plot_addr:
+        consider(str(llm_geo.get("label") or ""))
+        consider(geo_label)
+    llm = extra.get("llm") if isinstance(extra.get("llm"), dict) else {}
+    consider(str(llm.get("address_text") or ""))
+    llm_street = str(llm.get("street") or "").strip()
+    llm_num = _as_metric_int(llm.get("street_number") or llm.get("number"))
+    if llm_street and llm_num and llm_num not in metrics:
+        take_street_number(llm_street, llm_num)
+    elif llm_street and not street and not is_plot_street_name(llm_street):
+        street = _pretty_barrio(llm_street)
+    ca = str(llm.get("corner_a") or "").strip()
+    cb = str(llm.get("corner_b") or "").strip()
+    if ca and cb and not intersection:
+        intersection = f"{_pretty_barrio(ca)} y {_pretty_barrio(cb)}"
+    if not intersection:
+        intersection = str(extra.get("between") or "").strip()
+    if number in metrics or number in {None, "", 0, "0"}:
+        number = None
+    if street:
+        street = _pretty_barrio(street)
+    if is_plot_street_name(street) or is_plot_label(address, street, str(number or "")):
+        street = ""
+        number = None
+        geo_label = ""
+    if street and number is not None:
+        shown = f"{street} {number}"
+        addr_street, _addr_n = parse_street(address)
+        conflict = bool(addr_street and not street_names_match(street, addr_street))
+        if conflict or address_quality(shown) >= address_quality(address):
+            address = shown
+    return {
+        "street": street,
+        "street_number": number,
+        "address": address,
+        "intersection": intersection,
+        "geo_label": geo_label,
+    }
+
+
+def apply_recovered_location(item) -> bool:
+    overlay = recovered_location_overlay(item)
+    extra = dict(getattr(item, "extra", None) or {})
+    changed = False
+    if overlay.get("street") and extra.get("street") != overlay["street"]:
+        extra["street"] = overlay["street"]
+        changed = True
+    elif not overlay.get("street") and extra.get("street"):
+        from .text_quality import is_plot_street_name, is_plot_label
+
+        if is_plot_street_name(str(extra.get("street") or "")) or is_plot_label(
+            str(extra.get("street") or ""), str(extra.get("street_number") or "")
+        ):
+            extra.pop("street", None)
+            extra.pop("street_number", None)
+            changed = True
+    if overlay.get("street_number") not in {None, ""} and extra.get("street_number") != overlay["street_number"]:
+        extra["street_number"] = overlay["street_number"]
+        changed = True
+    elif overlay.get("street_number") in {None, ""} and extra.get("street_number") not in {None, ""}:
+        from .text_quality import is_plot_street_name, is_plot_label
+
+        if is_plot_street_name(str(extra.get("street") or overlay.get("street") or "")) or is_plot_label(
+            item.address or "", str(extra.get("street_number") or "")
+        ):
+            extra.pop("street_number", None)
+            changed = True
+    if overlay.get("intersection") and not extra.get("intersection"):
+        extra["intersection"] = overlay["intersection"]
+        changed = True
+    if overlay.get("geo_label") and extra.get("geo_label") != overlay["geo_label"]:
+        extra["geo_label"] = overlay["geo_label"]
+        changed = True
+    addr = overlay.get("address") or ""
+    if addr and addr != (item.address or ""):
+        from .text_quality import address_quality
+
+        old_street, _old_n = parse_street(item.address or "")
+        new_street, _new_n = parse_street(addr)
+        conflict = bool(old_street and new_street and not street_names_match(old_street, new_street))
+        if (
+            conflict
+            or address_quality(addr) > address_quality(item.address or "")
+            or not (item.address or "").strip()
+        ):
+            item.address = addr
+            changed = True
+    item.extra = extra
+    return changed
+
+
 def snap_to_approx_cell(lat: float, lon: float, cell_m: float = APPROX_CELL_M) -> tuple[float, float]:
     lat_m = 111_320.0
     step_lat = cell_m / lat_m
@@ -1153,12 +1887,9 @@ def snap_to_approx_cell(lat: float, lon: float, cell_m: float = APPROX_CELL_M) -
 
 
 def apply_public_location(data: dict) -> dict:
-    """Calle/altura o esquina van al mapa; si solo hay pin de portal, una manzana."""
-    source = str(data.get("source") or "")
-    has_exact = bool(data.get("has_exact_location"))
-    kind = str(data.get("location_kind") or "")
+    """Pin redondo solo con calle+altura, esquina real o geolocalización exacta del portal."""
     lat, lon = data.get("lat"), data.get("lon")
-    exact = listing_coords_are_exact(source, has_exact, location_kind=kind)
+    exact = location_is_precise(data)
     if lat is None or lon is None:
         data["lat"] = None
         data["lon"] = None
@@ -1166,7 +1897,7 @@ def apply_public_location(data: dict) -> dict:
         data["location_approx"] = True
         data["approx_span_m"] = APPROX_CELL_M
         data["approx_cell"] = ""
-        return data
+        return stamp_location_flags(data)
     try:
         lat_f, lon_f = float(lat), float(lon)
     except (TypeError, ValueError):
@@ -1176,7 +1907,7 @@ def apply_public_location(data: dict) -> dict:
         data["location_approx"] = True
         data["approx_span_m"] = APPROX_CELL_M
         data["approx_cell"] = ""
-        return data
+        return stamp_location_flags(data)
     if exact:
         data["lat"] = lat_f
         data["lon"] = lon_f
@@ -1184,7 +1915,7 @@ def apply_public_location(data: dict) -> dict:
         data["location_approx"] = False
         data["approx_span_m"] = 0
         data["approx_cell"] = ""
-        return data
+        return stamp_location_flags(data)
     slat, slon = snap_to_approx_cell(lat_f, lon_f)
     data["lat"] = slat
     data["lon"] = slon
@@ -1192,7 +1923,7 @@ def apply_public_location(data: dict) -> dict:
     data["location_approx"] = True
     data["approx_span_m"] = APPROX_CELL_M
     data["approx_cell"] = f"{slat:.5f}:{slon:.5f}"
-    return data
+    return stamp_location_flags(data)
 
 
 def jitter(lat: float, lon: float, key: str, city: str = DEFAULT_CITY) -> tuple[float, float]:
@@ -1221,6 +1952,22 @@ def locate(
         lat = lon = None
     if lat and lon and (_dummy_coords(lat, lon, city) or _fake_number_offset(lat, lon, number, city)):
         lat = lon = None
+    extra = extracted or {}
+    try:
+        plat, plon = float(extra["portal_lat"]), float(extra["portal_lon"])
+    except (KeyError, TypeError, ValueError):
+        plat = plon = None
+    if plat is not None and _mapped_water(plat, plon, city):
+        plat = plon = None
+    if plat is not None and city and not in_city_radius(plat, plon, city):
+        portal_exact = bool(extra.get("portal_exact")) and not extra.get("portal_approx")
+        contained = barrio_containing(plat, plon, city=city)
+        if contained:
+            remember_barrio(city, contained[0], plat, plon)
+            return (*contained[:2], plat, plon, portal_exact, "saved")
+        remember_barrio(city, barrio, plat, plon)
+        zona = zona_from_bearing(plat, plon, city=city)
+        return barrio, zona, plat, plon, portal_exact, "saved"
     found: dict = {}
     try:
         from .geo_tools import parse_plain_locations, run_location_tools
@@ -1228,12 +1975,16 @@ def locate(
         blob = " ".join(p for p in parts if p)
         found = parse_plain_locations(blob)
         extra = extracted or {}
-        if (
+        extracted_geo = extra.get("street") or extra.get("corner_a") or extra.get("between")
+        parsed_geo = (
             found.get("corners")
+            or found.get("between")
             or (found.get("street") and found.get("number"))
-            or extra.get("street")
-            or extra.get("corner_a")
-        ):
+        )
+        # El pin EXACT del portal no se pisa con números sueltos de la descripción
+        # (cuotas, m², precios). Solo se geocodifica si el aviso ya trae calle+altura,
+        # esquina o entre-calles extraídos.
+        if extracted_geo or (parsed_geo and not extra.get("portal_exact")):
             tools = run_location_tools(blob, city, extra)
         else:
             tools = {}
@@ -1242,20 +1993,37 @@ def locate(
     geo = tools.get("geo") if isinstance(tools, dict) else None
     if geo and geo.get("ok") and geo.get("lat") is not None and geo.get("lon") is not None:
         glat, glon = float(geo["lat"]), float(geo["lon"])
-        exact = not bool(geo.get("approx"))
-        pin_kind = str(geo.get("pin_kind") or ("address" if geo.get("number") else "intersection"))
-        contained = barrio_containing(glat, glon, city=city)
-        if contained:
-            remember_barrio(city, contained[0], glat, glon)
-            return (*contained[:2], glat, glon, exact, pin_kind)
-        remember_barrio(city, barrio, glat, glon)
-        zona = zona_from_bearing(glat, glon, city=city)
-        return barrio, zona, glat, glon, exact, pin_kind
-    had_address = bool(street_name and number) or bool(found.get("street") and found.get("number")) or bool((extracted or {}).get("street") and (extracted or {}).get("number"))
+        if _mapped_water(glat, glon, city):
+            geo = None
+        else:
+            portal_exact = bool(extra.get("portal_exact")) and not extra.get("portal_approx")
+            if plat is not None and portal_exact and distance_km(glat, glon, plat, plon) > 1.5:
+                geo = None
+                lat, lon = plat, plon
+            else:
+                exact = not bool(geo.get("approx"))
+                pin_kind = str(geo.get("pin_kind") or ("address" if geo.get("number") else "intersection"))
+                contained = barrio_containing(glat, glon, city=city)
+                if contained:
+                    remember_barrio(city, contained[0], glat, glon)
+                    return (*contained[:2], glat, glon, exact, pin_kind)
+                remember_barrio(city, barrio, glat, glon)
+                zona = zona_from_bearing(glat, glon, city=city)
+                return barrio, zona, glat, glon, exact, pin_kind
+    had_address = False
+    from .geo_tools import _usable_street_pin
+
+    door = _usable_street_pin(
+        str((extracted or {}).get("street") or ""),
+        (extracted or {}).get("number"),
+    )
+    parsed_door = _usable_street_pin(street_name or "", number)
+    had_address = door or (parsed_door and not (extracted or {}).get("portal_exact"))
     had_corner = bool(found.get("corners")) or bool((extracted or {}).get("corner_a") and (extracted or {}).get("corner_b"))
+    had_between = bool(found.get("between")) or bool((extracted or {}).get("between"))
     if lat and lon and abs(lat) > 1 and abs(lon) > 1 and not _dummy_coords(lat, lon, city):
-        saved_exact = not (had_address or had_corner)
-        if (extracted or {}).get("portal_exact"):
+        saved_exact = not (had_address or had_corner or had_between)
+        if (extracted or {}).get("portal_exact") and not door:
             saved_exact = True
         contained = barrio_containing(lat, lon, city=city)
         if contained:
@@ -1279,13 +2047,30 @@ def locate(
         _name, slat, slon, barrio_name = street_hit
         long_axis = barrio_name in {"Centro", "Zona Sur", "Zona Norte", "Oeste residencial"}
         if number and long_axis:
-            lat2, lon2 = offset_by_number(slat, slon, number)
-        else:
-            lat2, lon2 = jitter(slat, slon, listing_id, city)
+            lat2, lon2 = offset_by_number(slat, slon, number, city)
+            if _mapped_water(lat2, lon2, city):
+                lat2, lon2 = slat, slon
+            if _mapped_water(lat2, lon2, city):
+                street_hit = None
+            else:
+                zona = zona_from_bearing(lat2, lon2, *city_center(city))
+                if barrio == "Sin clasificar" and barrio_name != "Oeste residencial":
+                    barrio = barrio_name
+                return barrio, zona, lat2, lon2, False, "address"
+        if lat and lon and abs(lat) > 1 and abs(lon) > 1:
+            exact = bool((extracted or {}).get("portal_exact"))
+            contained = barrio_containing(lat, lon, city=city)
+            if contained:
+                remember_barrio(city, contained[0], lat, lon)
+                return (*contained[:2], lat, lon, exact, "saved")
+            zona = zona_from_bearing(lat, lon, city=city)
+            remember_barrio(city, barrio, lat, lon)
+            return barrio, zona, lat, lon, exact, "saved"
+        lat2, lon2 = jitter(slat, slon, listing_id, city)
         zona = zona_from_bearing(lat2, lon2, *city_center(city))
         if barrio == "Sin clasificar" and barrio_name != "Oeste residencial":
             barrio = barrio_name
-        return barrio, zona, lat2, lon2, True, "address"
+        return barrio, zona, lat2, lon2, False, "approx"
     if street_name and number:
         slot_lat, slot_lon = approx_slot(barrio, zona, listing_id, city=city)
         return barrio, zona, slot_lat, slot_lon, False, "saved"
@@ -1324,7 +2109,7 @@ def _fake_number_offset(lat: float, lon: float, number: int | None, city: str) -
         return False
     samples = [city_center(city), *[(b["lat"], b["lon"]) for b in barrios_for(city)]]
     for slat, slon in samples:
-        elat, elon = offset_by_number(slat, slon, number)
+        elat, elon = offset_by_number(slat, slon, number, city)
         if abs(lat - elat) < 2e-5 and abs(lon - elon) < 2e-5:
             return True
     return False
@@ -1360,8 +2145,125 @@ def _interp_shore(lat: float) -> float:
     return -65.035
 
 
+def _mapped_water(lat: float, lon: float, city: str | None) -> bool:
+    key = (round(float(lat), 5), round(float(lon), 5))
+    cached = _WATER_POINTS.get(key)
+    if cached is not None:
+        return cached
+    return _point_in_rings(float(lat), float(lon), _water_rings(city))
+
+
+def remember_water(lat: float, lon: float, wet: bool) -> None:
+    _WATER_POINTS[(round(float(lat), 5), round(float(lon), 5))] = bool(wet)
+
+
+def remember_water_rings(city: str, rings: list[list[list[float]]]) -> None:
+    cid = (city or "").strip()
+    if not cid:
+        return
+    cleaned = [ring for ring in rings if isinstance(ring, list) and len(ring) >= 4]
+    if cleaned:
+        _WATER_RINGS[cid] = cleaned
+        _WATER_MISS.discard(cid)
+    else:
+        _WATER_MISS.add(cid)
+
+
+def _water_rings(city: str | None) -> list[list[list[float]]]:
+    seen: set[str] = set()
+    for cid in (city or "", *same_place_ids(city)):
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        cached = _WATER_RINGS.get(cid)
+        if cached:
+            return cached
+        if cid in _WATER_MISS:
+            continue
+        if os.environ.get("PROPMAP_TEST") == "1":
+            _WATER_MISS.add(cid)
+            continue
+        from . import store
+
+        store.init()
+        raw = store.get_meta(f"osm_water:{cid}")
+        if not raw:
+            _WATER_MISS.add(cid)
+            continue
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            _WATER_MISS.add(cid)
+            continue
+        rings = loaded if isinstance(loaded, list) else []
+        cleaned = [ring for ring in rings if isinstance(ring, list) and len(ring) >= 4]
+        if cleaned:
+            _WATER_RINGS[cid] = cleaned
+            return cleaned
+        _WATER_MISS.add(cid)
+    return []
+
+
 def in_water(lat: float | None, lon: float | None, city: str | None = "puerto-madryn") -> bool:
-    return _off_land(lat, lon, city or "puerto-madryn")
+    if lat is None or lon is None:
+        return False
+    if _off_land(float(lat), float(lon), city or "puerto-madryn"):
+        return True
+    key = (round(float(lat), 5), round(float(lon), 5))
+    cached = _WATER_POINTS.get(key)
+    if cached is not None:
+        return cached
+    rings = _water_rings(city)
+    if rings:
+        wet = _point_in_rings(float(lat), float(lon), rings)
+        _WATER_POINTS[key] = wet
+        return wet
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return False
+    try:
+        from .places import reverse_is_water
+
+        wet = reverse_is_water(float(lat), float(lon))
+    except Exception:
+        wet = None
+    if wet is None:
+        return False
+    _WATER_POINTS[key] = bool(wet)
+    return bool(wet)
+
+
+def drop_water_pin(item) -> bool:
+    """Si el pin quedó en el río, usa el del portal en tierra o lo saca."""
+    extra = dict(getattr(item, "extra", None) or {})
+    home = str(getattr(item, "city", None) or extra.get("search_city") or "")
+    try:
+        lat, lon = float(item.lat), float(item.lon)
+    except (TypeError, ValueError):
+        return False
+    if not _mapped_water(lat, lon, home):
+        return False
+    try:
+        plat, plon = float(extra["portal_lat"]), float(extra["portal_lon"])
+    except (KeyError, TypeError, ValueError):
+        plat = plon = None
+    if plat is not None and not _mapped_water(plat, plon, home):
+        item.lat, item.lon = plat, plon
+        extra["location_kind"] = "approx"
+        extra["pin_kind"] = "saved"
+        item.has_exact_location = False
+        calc, zona = barrio_from_pin(plat, plon, home)
+        if calc and calc != "Sin clasificar":
+            item.barrio = calc
+            if zona:
+                item.zona = zona
+        item.extra = extra
+        return True
+    item.lat = item.lon = None
+    extra["location_kind"] = "unknown"
+    extra["pin_kind"] = "none"
+    item.has_exact_location = False
+    item.extra = extra
+    return True
 
 
 def _off_land(lat: float | None, lon: float | None, city: str | None) -> bool:

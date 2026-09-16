@@ -16,6 +16,26 @@ WEAK_PLACES = {
     "argentina", "patagonia",
 }
 
+PLOT_STREETS = {"lote", "lotes", "parcela", "manzana", "mz", "fraccion", "loteo"}
+PLOT_LABEL_RE = re.compile(
+    r"\b(?:lotes?|parcela|manzana|mz\.?|fracci[oó]n(?:es)?|loteo)\s*"
+    r"(?:n(?:ro|umero|úmero)?\.?\s*)?\d{1,5}\b",
+    re.I,
+)
+
+
+def is_plot_street_name(name: str) -> bool:
+    return fold(name) in PLOT_STREETS
+
+
+def is_plot_label(*parts: str) -> bool:
+    blob = fold(" ".join(str(p) for p in parts if p))
+    if not blob:
+        return False
+    if is_plot_street_name(blob.split(" ")[0] if blob else "") and re.search(r"\d", blob):
+        return True
+    return bool(PLOT_LABEL_RE.search(blob))
+
 
 def looks_like_intersection(text: str) -> bool:
     raw = (text or "").strip()
@@ -29,7 +49,7 @@ def address_quality(text: str) -> int:
     folded = fold(t)
     if len(folded) < 6:
         return 0
-    if folded in WEAK_PLACES:
+    if folded in WEAK_PLACES or is_plot_label(t):
         return 0
     score = 1
     if re.search(r"\d{1,5}", t):

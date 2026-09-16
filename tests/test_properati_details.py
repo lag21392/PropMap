@@ -65,6 +65,8 @@ def test_properati_ficha_keeps_street_even_if_map_is_approx():
     assert "Vicente López 1900" in item.address
     assert "Recoleta" in item.address
     assert "Argentina" not in item.address
+    assert "vicente" in (item.extra.get("street") or "").lower()
+    assert int(item.extra.get("street_number") or 0) == 1900
     assert "Vicente López al 1900" in (item.description or "")
     assert item.lat and abs(item.lat + 34.590238) < 0.001
     assert item.lon and abs(item.lon + 58.391935) < 0.001
@@ -229,4 +231,47 @@ def test_properati_ver_mapa_reads_navent_encoded_pin():
     assert item.extra.get("map_visibility") == "approximate"
     assert item.extra.get("portal_approx") is True
     assert item.has_exact_location is False
+
+
+ACCURATE_BUT_AREA_HTML = """
+<script>
+    let pageData = {
+        mapData: {
+            showMap: true,
+            adLocationData: {
+                coordinates: {
+                    latitude: "-34.6436912",
+                    longitude: "-58.36284"
+                },
+                province: "Ciudad Autónoma de Buenos Aires",
+                locality: "Boca",
+                address: "Carlos F. Melo 600, Buenos Aires, Argentina",
+                postcode: ""
+            },
+            visibility: "accurate",
+            enableApproximateArea: true,
+        },
+    };
+</script>
+"""
+
+
+def test_properati_accurate_with_approx_area_keeps_street_and_is_not_a_door():
+    item = _item(
+        title="Terreno en Venta en Boca",
+        address="Boca",
+        source_id="melo-600",
+    )
+    _from_properati(item, ACCURATE_BUT_AREA_HTML)
+    assert "Carlos F. Melo 600" in item.address
+    street = (item.extra.get("street") or "").lower()
+    assert "carlos" in street and "melo" in street
+    assert "boca" not in street
+    assert int(item.extra.get("street_number") or 0) == 600
+    assert item.extra.get("portal_approx") is True
+    assert item.extra.get("portal_approx_area") is True
+    assert item.extra.get("portal_exact") is False
+    assert item.has_exact_location is False
+    assert item.extra.get("portal_lat") == -34.6436912
+    assert item.extra.get("portal_lon") == -58.36284
 

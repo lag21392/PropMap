@@ -50,7 +50,12 @@ _BARRIO_PLACE = re.compile(
     re.I,
 )
 _COMMA_CHUNK = re.compile(r"[^,/|]+")
-_CUT = re.compile(r"\s+(?:con|para|de|del|al|y|e/|esquina|cod:|financi)\b|\s*[\(\[]", re.I)
+_CUT = re.compile(
+    r"\s+(?:con|para|y|e/|esquina|cod:|financi)\b"
+    r"|\s+(?:de|del|al)\s+(?:\d|amb|dorm|hab|m2|m²|ha\b)"
+    r"|\s*[\(\[]",
+    re.I,
+)
 
 _mem: dict[str, dict[str, Any] | None] = {}
 _provinces: list[dict[str, Any]] | None = None
@@ -68,14 +73,24 @@ def reset_cache() -> None:
     _provinces = None
 
 
+_CITY_KINDS = frozenset({"localidad", "municipio", "asentamiento", "departamento", "provincia", "city"})
+_PLACE_JUNK = re.compile(
+    r"\d+\s*(?:dorm|bañ|banos|baño|amb|m2|m²|ha|coch)\b|\bcocheras?\b",
+    re.I,
+)
+
+
 def listing_places(item, *, remote: bool = True) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     seen: set[str] = set()
     cities = _listing_scope_cities(item)
     for raw, hint in _candidates(item):
-        place = _local_barrio_place(raw, cities)
-        if not place:
-            place = lookup_place(raw, province_hint=hint or _scope_province(cities), remote=remote)
+        local = _local_barrio_place(raw, cities)
+        place = lookup_place(raw, province_hint=hint or _scope_province(cities), remote=remote)
+        if place and str(place.get("kind") or "") in _CITY_KINDS:
+            pass
+        elif local:
+            place = local
         if not place:
             continue
         key = _fold(str(place.get("name") or raw))
@@ -118,39 +133,66 @@ def _scope_province(cities: list[str]) -> str | None:
     return None
 
 
+_BARRIO_IDX: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def forget_barrio_index(city: str | None = None) -> None:
+    if city:
+        _BARRIO_IDX.pop(city, None)
+    else:
+        _BARRIO_IDX.clear()
+
+
+def _barrio_lookup(cid: str, token: str) -> dict[str, Any] | None:
+    from .geo import barrios_for
+
+    idx = _BARRIO_IDX.get(cid)
+    if idx is None:
+        idx = {}
+        for barrio in barrios_for(cid):
+            names = [barrio.get("name") or "", *(barrio.get("aliases") or [])]
+            for n in names:
+                folded = _fold(n)
+                if folded:
+                    idx.setdefault(folded, barrio)
+        _BARRIO_IDX[cid] = idx
+    return idx.get(token)
+
+
 def _local_barrio_place(name: str, cities: list[str]) -> dict[str, Any] | None:
-    from .geo import CITIES, barrios_for
+    from .geo import CITIES
 
     token = _fold(name)
     if not token or token in _NOT_A_PLACE:
         return None
     for cid in cities:
-        for barrio in barrios_for(cid):
-            names = [barrio.get("name") or "", *(barrio.get("aliases") or [])]
-            if not any(_fold(n) == token for n in names if n):
-                continue
-            cfg = CITIES.get(cid) or {}
-            lat, lon = barrio.get("lat"), barrio.get("lon")
-            if lat is None or lon is None:
-                continue
-            return {
-                "name": barrio.get("name") or name,
-                "kind": "barrio",
-                "province": str(cfg.get("province") or ""),
-                "lat": lat,
-                "lon": lon,
-            }
+        barrio = _barrio_lookup(cid, token)
+        if not barrio:
+            continue
+        cfg = CITIES.get(cid) or {}
+        lat, lon = barrio.get("lat"), barrio.get("lon")
+        if lat is None or lon is None:
+            continue
+        return {
+            "name": barrio.get("name") or name,
+            "kind": "barrio",
+            "province": str(cfg.get("province") or ""),
+            "lat": lat,
+            "lon": lon,
+        }
     return None
 
 
 def place_conflicts_city(place: dict[str, Any], city: str) -> bool:
-    from .geo import CITIES, city_center, city_radius_km, distance_km, own_barrio_names, own_place_names
+    from .geo import CITIES, city_center, city_radius_km, distance_km, official_barrio_names, own_place_names
 
     token = _fold(str(place.get("name") or ""))
-    own = own_place_names(city) | own_barrio_names(city)
+    own = own_place_names(city) | official_barrio_names(city)
+    kind = str(place.get("kind") or "")
+    is_locality = kind in {"localidad", "municipio", "asentamiento", "departamento"}
     if token and token in own:
         return False
-    if token and len(token) >= 8:
+    if not is_locality and token and len(token) >= 8:
         for name in own:
             if len(name) >= 8 and (token in name or name in token):
                 return False
@@ -179,20 +221,18 @@ def search_localidades(query: str, limit: int = 8) -> list[dict[str, Any]]:
         return []
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    kinds = (("/localidades", "localidades", "localidad"), ("/municipios", "municipios", "municipio"))
-    for path, key, kind in kinds:
-        data = _georef(path, {"nombre": q, "max": limit, "campos": "completo"})
-        for row in data.get(key) or []:
-            place = _from_georef(row, kind)
-            if not place or place.get("lat") is None or place.get("lon") is None:
-                continue
-            token = _fold(str(place.get("name") or ""))
-            if not token or token in seen:
-                continue
-            seen.add(token)
-            out.append(place)
-            if len(out) >= limit:
-                return out
+    data = _georef("/localidades", {"nombre": q, "max": limit, "campos": "completo"})
+    for row in data.get("localidades") or []:
+        place = _from_georef(row, "localidad")
+        if not place or place.get("lat") is None or place.get("lon") is None:
+            continue
+        token = _fold(str(place.get("name") or ""))
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(place)
+        if len(out) >= limit:
+            return out
     return out
 
 
@@ -243,7 +283,7 @@ def provinces() -> list[dict[str, Any]]:
 
 
 def _candidates(item) -> list[tuple[str, str | None]]:
-    from .geo import parse_street
+    from .geo import parse_street, street_names_match
 
     parts = [
         str(getattr(item, "title", "") or ""),
@@ -251,6 +291,17 @@ def _candidates(item) -> list[tuple[str, str | None]]:
         str(getattr(item, "barrio", "") or ""),
     ]
     text = " · ".join(p for p in parts if p.strip())
+    listed_street, listed_num = parse_street(text)
+    inter_streets = {
+        _fold(part)
+        for match in re.finditer(
+            r"\be/\s*([a-záéíóúñ0-9\.][a-záéíóúñ0-9\.\s]{1,28}?)\s+y\s+([a-záéíóúñ0-9\.][a-záéíóúñ0-9\.\s]{1,28})",
+            text,
+            re.I,
+        )
+        for part in match.groups()
+        if _fold(part)
+    }
     out: list[tuple[str, str | None]] = []
     seen: set[str] = set()
 
@@ -264,8 +315,12 @@ def _candidates(item) -> list[tuple[str, str | None]]:
         street, number = parse_street(name)
         if street and number:
             return
+        if listed_street and listed_num and street_names_match(name, listed_street):
+            return
         token = _fold(name)
-        if not token or token in seen or token in _NOT_A_PLACE:
+        if not token or token in seen or token in _NOT_A_PLACE or token in inter_streets:
+            return
+        if _PLACE_JUNK.search(name):
             return
         seen.add(token)
         out.append((name, _clean_name(hint) if hint else None))
@@ -274,11 +329,11 @@ def _candidates(item) -> list[tuple[str, str | None]]:
         add(match.group(1))
     for match in _BARRIO_PLACE.finditer(text):
         add(match.group(1))
-    chunks = [_clean_name(part) for part in _COMMA_CHUNK.findall(text)]
-    chunks = [c for c in chunks if c]
-    for idx, chunk in enumerate(chunks):
-        nxt = chunks[idx + 1] if idx + 1 < len(chunks) else None
-        add(chunk, nxt if nxt and _looks_province(nxt) else None)
+    raw_chunks = [part.strip() for part in _COMMA_CHUNK.findall(text) if part.strip()]
+    for idx, chunk in enumerate(raw_chunks):
+        nxt = raw_chunks[idx + 1] if idx + 1 < len(raw_chunks) else None
+        nxt_name = _clean_name(nxt) if nxt else ""
+        add(chunk, nxt_name if nxt_name and _looks_province(nxt_name) else None)
         if "/" in chunk:
             for bit in chunk.split("/"):
                 add(bit)
@@ -366,10 +421,16 @@ def _calle_bare(name: str) -> str:
     return _STREET_KIND_RE.sub("", _fold(name)).strip()
 
 
-def _calle_name_hit(query: str, row: dict[str, Any]) -> bool:
+def _calle_name_hit(query: str, row: dict[str, Any], *, loose: bool = False) -> bool:
     q_bare = _calle_bare(query)
     n_bare = _calle_bare(str(row.get("nombre") or ""))
-    return bool(q_bare and n_bare and q_bare == n_bare and len(q_bare) >= 3)
+    if not q_bare or not n_bare or len(q_bare) < 3:
+        return False
+    if q_bare == n_bare:
+        return True
+    if not loose or len(q_bare) < 5:
+        return False
+    return n_bare.endswith(f" {q_bare}")
 
 
 def _calle_in_city(row: dict[str, Any], city_id: str) -> bool:
@@ -463,14 +524,24 @@ def _pick_calle(street: str, city_id: str) -> dict[str, Any] | None:
         if prov:
             params["provincia"] = prov
         data = _georef("/calles", params)
+        exact = None
+        suffix = None
         for row in data.get("calles") or []:
             if not isinstance(row, dict):
                 continue
-            if not (_calle_name_hit(nombre, row) or _calle_name_hit(street, row)):
-                continue
             if not _calle_in_city(row, city_id):
                 continue
-            return row
+            if _calle_name_hit(nombre, row) or _calle_name_hit(street, row):
+                exact = row
+                break
+            if suffix is None and (
+                _calle_name_hit(nombre, row, loose=True) or _calle_name_hit(street, row, loose=True)
+            ):
+                suffix = row
+        if exact:
+            return exact
+        if suffix:
+            return suffix
     return None
 
 
@@ -581,6 +652,11 @@ def _from_georef(row: dict[str, Any], kind: str) -> dict[str, Any] | None:
         lon = float(centro["lon"]) if centro.get("lon") is not None else None
     except (TypeError, ValueError):
         lat = lon = None
+    mun = row.get("municipio") if isinstance(row.get("municipio"), dict) else {}
+    censal = row.get("localidad_censal") if isinstance(row.get("localidad_censal"), dict) else {}
+    mun_name = str((mun or {}).get("nombre") or "")
+    if kind == "municipio" and not mun_name:
+        mun_name = name
     return {
         "name": name,
         "kind": kind,
@@ -588,12 +664,16 @@ def _from_georef(row: dict[str, Any], kind: str) -> dict[str, Any] | None:
         "lat": lat,
         "lon": lon,
         "id": str(row.get("id") or ""),
+        "categoria": str(row.get("categoria") or ""),
+        "municipio": mun_name,
+        "localidad_censal": str((censal or {}).get("nombre") or ""),
     }
 
 
 def _georef(path: str, params: dict[str, Any]) -> dict[str, Any]:
     try:
-        with httpx.Client(headers=HEADERS, timeout=12.0) as client:
+        timeout = httpx.Timeout(connect=2.0, read=6.0, write=6.0, pool=2.0)
+        with httpx.Client(headers=HEADERS, timeout=timeout, trust_env=False) as client:
             response = client.get(GEOREF + path, params=params)
             response.raise_for_status()
             data = response.json()
@@ -630,7 +710,7 @@ def _same_province(a: str, b: str) -> bool:
         return False
     if left == right:
         return True
-    caba = {"capital-federal", "caba", "ciudad-autonoma-de-buenos-aires", "buenos-aires"}
+    caba = {"capital-federal", "caba", "ciudad-autonoma-de-buenos-aires"}
     return left in caba and right in caba
 
 
@@ -638,14 +718,18 @@ def _province_slug(name: str) -> str:
     token = _fold(name)
     if not token:
         return ""
+    dashed = token.replace(" ", "-")
     for row in provinces():
         slug = str(row.get("slug") or "")
         folded = _fold(row.get("nombre") or "")
-        if token in {slug, folded} or token.replace(" ", "-") == slug:
+        if token in {slug, folded} or dashed == slug:
             return slug
-        if len(token) >= 5 and (token in folded or folded in token):
+    for row in provinces():
+        slug = str(row.get("slug") or "")
+        folded = _fold(row.get("nombre") or "")
+        if folded and len(folded) >= 8 and folded in token:
             return slug
-    return token.replace(" ", "-")
+    return dashed
 
 
 def _read_cache(token: str) -> dict[str, Any] | None:

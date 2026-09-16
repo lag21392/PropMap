@@ -6,7 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 
 from .models import Listing
 from .text_quality import address_quality, title_quality
@@ -15,19 +15,85 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
 DB_PATH = DATA_DIR / "listings.sqlite"
 _write = Lock()
+_counts_lock = Lock()
+_tls = local()
+_counts_memo: dict[str, int] = {}
+_counts_at = 0.0
+COUNTS_TTL_SEC = 25.0
+# 4 MB por hilo. -80000 (80 MB) × el pool de uvicorn se iba a varios GB y no volvía.
+CACHE_KB = 4000
 EDIT_FIELDS = (
     "title", "price", "currency", "address", "covered_m2", "total_m2",
     "bedrooms", "bathrooms", "description", "property_type",
 )
 
 
-def connect() -> sqlite3.Connection:
+class _TlsConn:
+    """`with connect()` commitea o hace rollback; no cierra. Cerrar reciclaba 80 MB de caché."""
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        return False
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        finally:
+            if getattr(_tls, "conn", None) is self._conn:
+                _tls.conn = None
+                _tls.key = None
+
+
+def _open_conn(timeout: float = 10) -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute(f"PRAGMA cache_size=-{CACHE_KB}")
+    conn.execute("PRAGMA busy_timeout=8000")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     return conn
+
+
+def connect() -> _TlsConn:
+    key = str(DB_PATH)
+    conn = getattr(_tls, "conn", None)
+    if conn is not None and getattr(_tls, "key", None) != key:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        conn = None
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.Error:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            conn = None
+    if conn is None:
+        conn = _open_conn()
+        _tls.conn = conn
+        _tls.key = key
+    return _TlsConn(conn)
 
 
 def init() -> None:
@@ -71,7 +137,14 @@ def init() -> None:
                 city TEXT DEFAULT 'caba',
                 quality_score REAL,
                 quality_label TEXT,
-                details_scraped INTEGER DEFAULT 0
+                details_scraped INTEGER DEFAULT 0,
+                needs_llm INTEGER NOT NULL DEFAULT 0,
+                is_hidden INTEGER NOT NULL DEFAULT 0,
+                llm_ready INTEGER NOT NULL DEFAULT 0,
+                llm_ver INTEGER NOT NULL DEFAULT 0,
+                llm_partial INTEGER NOT NULL DEFAULT 0,
+                llm_await INTEGER NOT NULL DEFAULT 0,
+                llm_fix INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -80,6 +153,16 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ops_minute (
+                minute INTEGER NOT NULL,
+                metric TEXT NOT NULL,
+                n INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (minute, metric)
             )
             """
         )
@@ -105,6 +188,7 @@ def init() -> None:
             conn.execute("ALTER TABLE listings ADD COLUMN quality_label TEXT")
         if "details_scraped" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN details_scraped INTEGER DEFAULT 0")
+        _ensure_listing_query_columns(conn)
         pin_cols = {row[1] for row in conn.execute("PRAGMA table_info(pins)").fetchall()}
         if "contacted" not in pin_cols:
             conn.execute("ALTER TABLE pins ADD COLUMN contacted INTEGER DEFAULT 0")
@@ -166,6 +250,27 @@ def init() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_city ON rental_comps(city, period, property_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_city ON listings(city)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_listings_city_price ON listings(city, price_usd)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_listings_details_scraped ON listings(details_scraped)"
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_needs_llm
+            ON listings(details_scraped, scraped_at DESC)
+            WHERE needs_llm = 1 AND is_hidden = 0
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_need_details
+            ON listings(city, scraped_at DESC)
+            WHERE details_scraped = 0 AND is_hidden = 0
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS visits (
@@ -294,7 +399,110 @@ def apply_user_edits(item: Listing) -> Listing:
     return item
 
 
-def upsert_listings(listings: list[Listing], delete_source: str | None = None) -> None:
+_QUERY_FLAG_COLS = (
+    "needs_llm",
+    "is_hidden",
+    "llm_ready",
+    "llm_ver",
+    "llm_partial",
+    "llm_await",
+    "llm_fix",
+)
+_LLM_FLAG_META = "llm_flag_schema"
+
+
+def _listing_query_flags(item: Listing) -> dict[str, int]:
+    extra = item.extra or {}
+    hidden = 1 if extra.get("duplicate_of") or extra.get("dedupe_hidden") else 0
+    ready = 1 if extra.get("llm_ready") else 0
+    try:
+        ver = int(extra.get("llm_ver") or 0)
+    except (TypeError, ValueError):
+        ver = 0
+    partial = 1 if extra.get("llm_partial") else 0
+    await_llm = 1 if extra.get("await_llm") else 0
+    fix = 1 if (extra.get("data_fixes") and not extra.get("llm_repair")) else 0
+    city = (item.city or "").strip()
+    unassigned = city in {"", "fuera", "otros", "argentina"}
+    from .llm_enrich import LLM_SCHEMA
+
+    if hidden:
+        needs = 0
+    elif unassigned and not extra.get("llm_city_ok"):
+        needs = 1
+    elif fix:
+        needs = 1
+    elif ver == LLM_SCHEMA and ready and not partial:
+        needs = 0
+    elif partial and ver == LLM_SCHEMA:
+        needs = 0
+    else:
+        needs = 1
+    return {
+        "needs_llm": needs,
+        "is_hidden": hidden,
+        "llm_ready": ready,
+        "llm_ver": ver,
+        "llm_partial": partial,
+        "llm_await": await_llm,
+        "llm_fix": fix,
+    }
+
+
+def _ensure_listing_query_columns(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(listings)").fetchall()}
+    added = False
+    for name in _QUERY_FLAG_COLS:
+        if name in cols:
+            continue
+        conn.execute(f"ALTER TABLE listings ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+        added = True
+    from .llm_enrich import LLM_SCHEMA
+
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (_LLM_FLAG_META,)).fetchone()
+    marked = str(row[0]) if row else ""
+    if added or marked != str(LLM_SCHEMA):
+        _backfill_listing_query_flags(conn, LLM_SCHEMA)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (_LLM_FLAG_META, str(LLM_SCHEMA)),
+        )
+
+
+def _backfill_listing_query_flags(conn: sqlite3.Connection, schema: int) -> None:
+    conn.execute(
+        """
+        UPDATE listings SET
+          is_hidden = CASE
+            WHEN IFNULL(json_extract(extra_json, '$.duplicate_of'), '') != ''
+              OR IFNULL(json_extract(extra_json, '$.dedupe_hidden'), 0) != 0
+            THEN 1 ELSE 0 END,
+          llm_ready = IFNULL(CAST(json_extract(extra_json, '$.llm_ready') AS INTEGER), 0),
+          llm_ver = IFNULL(CAST(json_extract(extra_json, '$.llm_ver') AS INTEGER), 0),
+          llm_partial = IFNULL(CAST(json_extract(extra_json, '$.llm_partial') AS INTEGER), 0),
+          llm_await = IFNULL(CAST(json_extract(extra_json, '$.await_llm') AS INTEGER), 0),
+          llm_fix = CASE
+            WHEN IFNULL(json_array_length(json_extract(extra_json, '$.data_fixes')), 0) > 0
+             AND IFNULL(json_extract(extra_json, '$.llm_repair'), 0) = 0
+            THEN 1 ELSE 0 END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE listings SET needs_llm = CASE
+          WHEN is_hidden = 1 THEN 0
+          WHEN IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina')
+           AND IFNULL(json_extract(extra_json, '$.llm_city_ok'), 0) = 0 THEN 1
+          WHEN llm_fix = 1 THEN 1
+          WHEN llm_ver = ? AND llm_ready = 1 AND llm_partial = 0 THEN 0
+          WHEN llm_partial = 1 AND llm_ver = ? THEN 0
+          ELSE 1 END
+        """,
+        (int(schema), int(schema)),
+    )
+
+
+def upsert_listings(listings: list[Listing], delete_source: str | None = None, *, notify: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _write:
         with connect() as conn:
@@ -305,6 +513,7 @@ def upsert_listings(listings: list[Listing], delete_source: str | None = None) -
                 if row:
                     _merge_existing(item, row)
                 data = item.to_dict()
+                flags = _listing_query_flags(item)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO listings (
@@ -313,14 +522,16 @@ def upsert_listings(listings: list[Listing], delete_source: str | None = None) -
                         rooms, bedrooms, bathrooms, parking, age_years, image, publisher,
                         description, published_at, price_m2, score, deal_label, vs_barrio_pct,
                         fingerprint, extra_json, scraped_at, has_exact_location, city,
-                        quality_score, quality_label, details_scraped
+                        quality_score, quality_label, details_scraped,
+                        needs_llm, is_hidden, llm_ready, llm_ver, llm_partial, llm_await, llm_fix
                     ) VALUES (
                         :id, :source, :source_id, :url, :title, :property_type, :price, :currency,
                         :price_usd, :address, :barrio, :zona, :lat, :lon, :covered_m2, :total_m2,
                         :rooms, :bedrooms, :bathrooms, :parking, :age_years, :image, :publisher,
                         :description, :published_at, :price_m2, :score, :deal_label, :vs_barrio_pct,
                         :fingerprint, :extra_json, :scraped_at, :has_exact_location, :city,
-                        :quality_score, :quality_label, :details_scraped
+                        :quality_score, :quality_label, :details_scraped,
+                        :needs_llm, :is_hidden, :llm_ready, :llm_ver, :llm_partial, :llm_await, :llm_fix
                     )
                     """,
                     {
@@ -336,13 +547,15 @@ def upsert_listings(listings: list[Listing], delete_source: str | None = None) -
                         "scraped_at": now,
                         "has_exact_location": 1 if data.get("has_exact_location") else 0,
                         "details_scraped": 1 if data.get("details_scraped") else 0,
+                        **flags,
                     },
                 )
             conn.commit()
     from .market import sync_listing_prices
 
     sync_listing_prices(listings)
-    _notify_listings(listings)
+    if notify:
+        _notify_listings(listings)
 
 
 def upsert_one(item: Listing) -> None:
@@ -419,8 +632,8 @@ def all_listings() -> list[Listing]:
     items = []
     for i, row in enumerate(rows):
         items.append(_listing_from_row(row, pins.get(row["id"])))
-        if os.environ.get("PROPMAP_TEST") != "1" and i % 40 == 0:
-            time.sleep(0.01)
+        if os.environ.get("PROPMAP_TEST") != "1" and i % 80 == 0:
+            time.sleep(0)
     for item in items:
         apply_user_edits(item)
     return items
@@ -451,10 +664,103 @@ def fetch_by_cities(cities: set[str] | list[str]) -> list[Listing]:
     items = []
     for i, row in enumerate(rows):
         items.append(_listing_from_row(row, pins.get(row["id"])))
-        if os.environ.get("PROPMAP_TEST") != "1" and i % 40 == 0:
-            time.sleep(0.01)
+        if os.environ.get("PROPMAP_TEST") != "1" and i % 80 == 0:
+            time.sleep(0)
     for item in items:
         apply_user_edits(item)
+    return items
+
+
+def fetch_for_city(city_id: str) -> list[Listing]:
+    from .geo import listing_fits_city, same_place_ids
+    from .place_tags import related_place_ids
+
+    wanted = [cid for cid in (related_place_ids(city_id) | (same_place_ids(city_id) or {city_id or ""})) if cid]
+    if not wanted:
+        return []
+    marks = ",".join("?" * len(wanted))
+    sql = (
+        f"SELECT * FROM listings WHERE city IN ({marks}) "
+        "ORDER BY price_usd IS NULL, price_usd ASC"
+    )
+    with connect() as conn:
+        rows = list(conn.execute(sql, tuple(wanted)).fetchall())
+        pins = _pins_map(conn)
+    items = []
+    seen: set[str] = set()
+    for i, row in enumerate(rows):
+        item = _listing_from_row(row, pins.get(row["id"]))
+        if item.id in seen:
+            continue
+        seen.add(item.id)
+        items.append(item)
+        if os.environ.get("PROPMAP_TEST") != "1" and i % 80 == 0:
+            time.sleep(0)
+    fitted: list[Listing] = []
+    for i, item in enumerate(items):
+        apply_user_edits(item)
+        if os.environ.get("PROPMAP_TEST") != "1" and i % 20 == 0:
+            time.sleep(0)
+        if not listing_fits_city(item, city_id, remote=False, require_radius=True):
+            continue
+        if (item.city or "") not in wanted:
+            item.city = city_id
+        fitted.append(item)
+    return fitted
+
+
+def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 6) -> list[Listing]:
+    """Avisos a enriquecer: primero lo nuevo, errores y sin ciudad/ubicación."""
+    n = max(1, min(160, int(limit or 1)))
+    prefer = (prefer_city or "").strip()
+    sql = """
+        SELECT * FROM listings
+        WHERE needs_llm = 1 AND is_hidden = 0
+        ORDER BY
+          CASE WHEN details_scraped = 1
+                 OR length(trim(IFNULL(description, ''))) >= 160
+               THEN 0 ELSE 1 END,
+          CASE WHEN scraped_at >= date('now', '-2 days') THEN 0 ELSE 1 END,
+          CASE WHEN llm_fix = 1 THEN 0 ELSE 1 END,
+          CASE WHEN IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina') THEN 0
+               WHEN llm_await = 1 THEN 1
+               WHEN lat IS NULL THEN 2
+               ELSE 3 END,
+          CASE WHEN city = ? THEN 0 ELSE 1 END,
+          CASE WHEN details_scraped = 1 THEN 0 ELSE 1 END,
+          scraped_at DESC
+        LIMIT ?
+    """
+    return _fetch_backlog_rows(sql, (prefer, n))
+
+
+def fetch_detail_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
+    """Fichas que todavía no se bajaron, de toda la base."""
+    n = max(1, min(80, int(limit or 1)))
+    prefer = (prefer_city or "").strip()
+    sql = """
+        SELECT * FROM listings
+        WHERE details_scraped = 0
+          AND IFNULL(url, '') != ''
+          AND is_hidden = 0
+        ORDER BY
+          CASE WHEN llm_await = 1 THEN 0 ELSE 1 END,
+          CASE WHEN city = ? THEN 0 ELSE 1 END,
+          scraped_at DESC
+        LIMIT ?
+    """
+    return _fetch_backlog_rows(sql, (prefer, n))
+
+
+def _fetch_backlog_rows(sql: str, params: tuple) -> list[Listing]:
+    with connect() as conn:
+        rows = list(conn.execute(sql, params).fetchall())
+        pins = _pins_map(conn)
+    items = []
+    for row in rows:
+        item = _listing_from_row(row, pins.get(row["id"]))
+        apply_user_edits(item)
+        items.append(item)
     return items
 
 
@@ -471,6 +777,7 @@ def update_scores(listings: list[Listing]) -> None:
     with _write:
         with connect() as conn:
             for item in listings:
+                flags = _listing_query_flags(item)
                 conn.execute(
                     """
                     UPDATE listings
@@ -479,7 +786,9 @@ def update_scores(listings: list[Listing]) -> None:
                         has_exact_location = ?, quality_score = ?, quality_label = ?,
                         extra_json = ?, description = ?, details_scraped = ?, city = ?,
                         price = ?, currency = ?, covered_m2 = ?, total_m2 = ?,
-                        property_type = ?, address = ?
+                        property_type = ?, address = ?,
+                        needs_llm = ?, is_hidden = ?, llm_ready = ?, llm_ver = ?,
+                        llm_partial = ?, llm_await = ?, llm_fix = ?
                     WHERE id = ?
                     """,
                     (
@@ -506,6 +815,13 @@ def update_scores(listings: list[Listing]) -> None:
                         item.total_m2,
                         item.property_type,
                         item.address,
+                        flags["needs_llm"],
+                        flags["is_hidden"],
+                        flags["llm_ready"],
+                        flags["llm_ver"],
+                        flags["llm_partial"],
+                        flags["llm_await"],
+                        flags["llm_fix"],
                         item.id,
                     ),
                 )
@@ -529,6 +845,26 @@ def set_meta(key: str, value: str) -> None:
 def listing_ids() -> set[str]:
     with connect() as conn:
         return {row[0] for row in conn.execute("SELECT id FROM listings")}
+
+
+def city_listing_counts() -> dict[str, int]:
+    global _counts_memo, _counts_at
+    testing = os.environ.get("PROPMAP_TEST") == "1"
+    if not testing:
+        now = time.time()
+        with _counts_lock:
+            if _counts_memo and now - _counts_at < COUNTS_TTL_SEC:
+                return dict(_counts_memo)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT city, COUNT(*) FROM listings WHERE city IS NOT NULL AND city != '' GROUP BY city"
+        ).fetchall()
+    out = {str(row[0]): int(row[1]) for row in rows if row[0]}
+    if not testing:
+        with _counts_lock:
+            _counts_memo = out
+            _counts_at = time.time()
+    return dict(out)
 
 
 def sale_m2_by_city() -> dict[str, float]:
@@ -575,9 +911,24 @@ def update_extras(listings: list[Listing]) -> None:
             conn.commit()
 
 
-def get_meta(key: str, default: str = "") -> str:
-    with connect() as conn:
+def get_meta(key: str, default: str = "", *, timeout: float = 5.0) -> str:
+    if timeout >= 1.0:
+        try:
+            with connect() as conn:
+                row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+        except sqlite3.OperationalError:
+            return default
+    conn = sqlite3.connect(DB_PATH, timeout=max(0.05, timeout))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA cache_size=-500")
+        conn.execute(f"PRAGMA busy_timeout={max(50, int(timeout * 1000))}")
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return default
+    finally:
+        conn.close()
     return row["value"] if row else default
 
 
@@ -733,6 +1084,78 @@ def replace_city_rentals(city: str, rows: list[dict]) -> None:
                     ),
                 )
             conn.commit()
+
+
+KEEP_OPS_MIN = 8 * 24 * 60
+
+
+def ops_bump(metric: str, n: int, minute: int | None = None) -> None:
+    name = (metric or "").strip()[:40]
+    if not name or n <= 0:
+        return
+    slot = int(minute if minute is not None else time.time() // 60)
+    with _write:
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ops_minute(minute, metric, n) VALUES (?, ?, ?)
+                ON CONFLICT(minute, metric) DO UPDATE SET n = n + excluded.n
+                """,
+                (slot, name, int(n)),
+            )
+            if slot % 60 == 0:
+                conn.execute("DELETE FROM ops_minute WHERE minute < ?", (slot - KEEP_OPS_MIN,))
+            conn.commit()
+
+
+def ops_window(start_min: int, end_min: int) -> dict[int, dict[str, int]]:
+    out: dict[int, dict[str, int]] = {}
+    try:
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT minute, metric, n FROM ops_minute WHERE minute >= ? AND minute <= ?",
+                (int(start_min), int(end_min)),
+            ).fetchall()
+    except Exception:
+        return out
+    for minute, metric, n in rows:
+        out.setdefault(int(minute), {})[str(metric)] = int(n)
+    return out
+
+
+def ops_sum_since(metric: str, start_min: int) -> int:
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(n), 0) FROM ops_minute WHERE metric = ? AND minute >= ?",
+                ((metric or "").strip()[:40], int(start_min)),
+            ).fetchone()
+    except Exception:
+        return 0
+    return int(row[0] if row else 0)
+
+
+def drop_listings(ids: list[str] | tuple[str, ...] | set[str]) -> int:
+    wanted = [lid for lid in ids if lid]
+    if not wanted:
+        return 0
+    with _write:
+        with connect() as conn:
+            conn.executemany("DELETE FROM listings WHERE id = ?", [(lid,) for lid in wanted])
+            conn.commit()
+    try:
+        from .listings_cache import forget_ids
+
+        forget_ids(wanted)
+    except Exception:
+        pass
+    try:
+        from .ops import note
+
+        note("gone", n=len(wanted))
+    except Exception:
+        pass
+    return len(wanted)
 
 
 replace_source = replace_portal_listings

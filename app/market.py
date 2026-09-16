@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import math
 import statistics
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .geo import default_city
 from .models import Listing
 from .places import public_place
-from .scoring import excluded_from_comps
+from .scoring import PRICE_BOUNDS, excluded_from_comps
 
 try:
     from zoneinfo import ZoneInfo
@@ -28,8 +31,16 @@ NEW_HOURS = 14 * 24
 DROP_PCT = 0.03
 DROP_USD = 800.0
 PRICE_TICK_PCT = 0.01
+CACHE_TTL_SEC = 45.0
+_PAYLOAD_CACHE: dict[tuple, tuple[float, dict[str, Any]]] = {}
+_CACHE_LOCK = threading.Lock()
 PRICE_TICK_USD = 200.0
 COHORT_DAYS = 21
+# A tick this far from the listing's real cluster is a typo, not a baja.
+_OUTLIER_RATIO = 8.0
+_POWER10_SLACK = 0.12
+_WILD_LO = 0.2
+_WILD_HI = 1.5
 
 
 def _now() -> datetime:
@@ -181,7 +192,7 @@ def sync_listing_prices(listings: list[Listing]) -> None:
 def seed_existing(listings: list[Listing] | None = None) -> None:
     from . import store
 
-    items = listings if listings is not None else store.fetch_all()
+    items = listings if listings is not None else []
     if not items:
         return
     fallback = (_now() - timedelta(days=30)).isoformat()
@@ -238,15 +249,137 @@ def take_snapshots(listings: list[Listing]) -> None:
             conn.commit()
 
 
-def ensure_ready(listings: list[Listing] | None = None) -> None:
+def ensure_ready(listings: list[Listing] | None = None, *, seed: bool = True) -> None:
     from . import store
 
     store.init()
     with store.connect() as conn:
         ensure_tables(conn)
         conn.commit()
-    if store.get_meta("price_track_seed") != "1":
+    if seed and store.get_meta("price_track_seed") != "1":
         seed_existing(listings)
+
+
+def reset_cache() -> None:
+    with _CACHE_LOCK:
+        _PAYLOAD_CACHE.clear()
+
+
+def _price_history_rows(conn, listing_ids: list[str]) -> list:
+    if not listing_ids:
+        return []
+    out: list = []
+    for i in range(0, len(listing_ids), 400):
+        chunk = listing_ids[i : i + 400]
+        marks = ",".join("?" * len(chunk))
+        out.extend(
+            conn.execute(
+                f"""
+                SELECT listing_id, seen_at, price_usd, price_m2, deal_label, deal_score
+                FROM price_history
+                WHERE listing_id IN ({marks})
+                ORDER BY listing_id, seen_at ASC, id ASC
+                """,
+                chunk,
+            ).fetchall()
+        )
+    return out
+
+
+def _row_usd(row: dict[str, Any] | None) -> float | None:
+    if not row:
+        return None
+    raw = row.get("price_usd")
+    if raw is None:
+        return None
+    try:
+        usd = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return usd if usd > 0 else None
+
+
+def _wild_absolute(usd: float, property_type: str | None) -> bool:
+    lo, hi = PRICE_BOUNDS.get(property_type or "", (5_000, 8_000_000))
+    return usd < lo * _WILD_LO or usd > hi * _WILD_HI
+
+
+def _power10_typo(a: float, b: float) -> bool:
+    if a <= 0 or b <= 0:
+        return False
+    ratio = max(a, b) / min(a, b)
+    if ratio < _OUTLIER_RATIO:
+        return False
+    log10 = math.log10(ratio)
+    nearest = round(log10)
+    return nearest >= 1 and abs(log10 - nearest) <= _POWER10_SLACK
+
+
+def _cluster_ref(usds: list[float], property_type: str | None) -> float | None:
+    vals = [v for v in usds if v > 0]
+    if not vals:
+        return None
+    sane = [v for v in vals if not _wild_absolute(v, property_type)]
+    pool = sane or vals
+    best: list[float] = []
+    for v in pool:
+        group = [x for x in pool if 0.25 <= x / v <= 4]
+        if len(group) > len(best):
+            best = group
+    return statistics.median(best) if best else None
+
+
+def _is_bogus_tick(usd: float, ref: float, property_type: str | None) -> bool:
+    if usd <= 0 or ref <= 0:
+        return False
+    ratio = max(usd, ref) / min(usd, ref)
+    if ratio < _OUTLIER_RATIO:
+        return False
+    if _wild_absolute(usd, property_type):
+        return True
+    return _power10_typo(usd, ref) and ratio >= 50
+
+
+def mark_price_outliers(
+    points: list,
+    current_usd: float | None = None,
+    property_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Tag typo ticks (extra zeros, prices outside type bounds) without dropping them from the list."""
+    tagged = [dict(row) for row in points]
+    usds = [u for u in (_row_usd(p) for p in tagged) if u]
+    if current_usd:
+        try:
+            cur = float(current_usd)
+        except (TypeError, ValueError):
+            cur = 0.0
+        if cur > 0:
+            usds.append(cur)
+    ref = _cluster_ref(usds, property_type)
+    for row in tagged:
+        usd = _row_usd(row)
+        row["outlier"] = bool(usd and ref and _is_bogus_tick(usd, ref, property_type))
+    return tagged
+
+
+def history_payload(
+    listing_id: str,
+    points: list,
+    current_usd: float | None = None,
+    property_type: str | None = None,
+) -> dict[str, Any]:
+    tagged = mark_price_outliers(points, current_usd=current_usd, property_type=property_type)
+    usable = [p for p in tagged if _row_usd(p) and not p.get("outlier")]
+    change_pct = None
+    if len(usable) >= 2:
+        first, last = float(usable[0]["price_usd"]), float(usable[-1]["price_usd"])
+        change_pct = round((last - first) / first * 100, 1)
+    return {
+        "id": listing_id,
+        "points": tagged,
+        "change_pct": change_pct,
+        "outlier_n": sum(1 for p in tagged if p.get("outlier")),
+    }
 
 
 def listing_history(listing_id: str) -> dict[str, Any]:
@@ -274,11 +407,13 @@ def listing_history(listing_id: str) -> dict[str, Any]:
         }
         for row in rows
     ]
-    change_pct = None
-    if len(points) >= 2 and points[0]["price_usd"] and points[-1]["price_usd"]:
-        first, last = points[0]["price_usd"], points[-1]["price_usd"]
-        change_pct = round((last - first) / first * 100, 1)
-    return {"id": listing_id, "points": points, "change_pct": change_pct}
+    item = store.get_listing(listing_id)
+    return history_payload(
+        listing_id,
+        points,
+        current_usd=item.price_usd if item else None,
+        property_type=item.property_type if item else None,
+    )
 
 
 def _card(item: Listing, extra: dict | None = None) -> dict[str, Any]:
@@ -300,6 +435,89 @@ def _card(item: Listing, extra: dict | None = None) -> dict[str, Any]:
     if extra:
         data.update(extra)
     return data
+
+
+def _drop_from_points(
+    points: list,
+    current_usd: float | None = None,
+    property_type: str | None = None,
+) -> dict[str, Any] | None:
+    priced = [dict(row) for row in points if row.get("price_usd")]
+    if current_usd:
+        last_seen = priced[-1]["seen_at"] if priced else None
+        if not priced or abs(float(priced[-1]["price_usd"]) - float(current_usd)) >= 1:
+            priced = [*priced, {"price_usd": current_usd, "seen_at": last_seen or ""}]
+    priced = mark_price_outliers(priced, current_usd=current_usd, property_type=property_type)
+    usable = [row for row in priced if _row_usd(row) and not row.get("outlier")]
+    if len(usable) < 2:
+        return None
+    peak = max(usable, key=lambda row: float(row["price_usd"]))
+    last = usable[-1]
+    old_usd = float(peak["price_usd"])
+    new_usd = float(last["price_usd"])
+    if new_usd >= old_usd:
+        return None
+    gap = old_usd - new_usd
+    pct = gap / old_usd
+    if pct < PRICE_TICK_PCT and gap < PRICE_TICK_USD:
+        return None
+    return {
+        "old_usd": old_usd,
+        "new_usd": new_usd,
+        "change_pct": round(-pct * 100, 1),
+        "seen_at": last.get("seen_at"),
+    }
+
+
+def price_drops(pool: list[Listing], grouped: dict[str, list]) -> list[dict[str, Any]]:
+    drops = []
+    for item in pool:
+        found = _drop_from_points(
+            grouped.get(item.id) or [],
+            item.price_usd,
+            item.property_type,
+        )
+        if found:
+            drops.append(_card(item, found))
+    drops.sort(key=lambda r: (r.get("change_pct") or 0, -(r.get("old_usd") or 0)))
+    return drops
+
+
+def relevant_deals(pool: list[Listing], grouped: dict[str, list], cutoff: datetime) -> list[dict[str, Any]]:
+    highlights = []
+    for item in pool:
+        if excluded_from_comps(item) or not item.price_m2:
+            continue
+        vs = item.vs_barrio_pct or 0
+        if item.deal_label != "oportunidad" and vs < 8:
+            continue
+        score = (item.extra or {}).get("deal_score") or 0
+        published = _parse_dt(item.published_at)
+        hist_pts = grouped.get(item.id) or []
+        first = _parse_dt(hist_pts[0]["seen_at"] if hist_pts else None)
+        born = published or first
+        fresh = bool(born and born >= cutoff)
+        strong = item.deal_label == "oportunidad" or vs >= 18 or score >= 80
+        highlights.append(
+            _card(
+                item,
+                {
+                    "first_seen": (born.isoformat() if born else None),
+                    "fresh": fresh,
+                    "strong": strong,
+                },
+            )
+        )
+    highlights.sort(
+        key=lambda r: (
+            r.get("deal_label") != "oportunidad",
+            not r.get("fresh"),
+            not r.get("strong"),
+            -(r.get("vs_barrio_pct") or 0),
+            -(r.get("deal_score") or 0),
+        )
+    )
+    return highlights
 
 
 def _trend(latest: float | None, previous: float | None) -> tuple[str, float | None]:
@@ -337,28 +555,56 @@ def _headline(
 
 
 def _yield_block(items: list[Listing], city: str) -> dict[str, Any]:
-    from .yields import apply_yields, yield_stats
+    from . import store
+    from .yields import yield_stats
 
-    apply_yields(items)
-    return yield_stats(items)
+    try:
+        comps = store.fetch_rentals(city)
+    except Exception:
+        comps = []
+    return yield_stats(items, comps=comps)
 
 
 def market_payload(city: str, property_type: str = "") -> dict[str, Any]:
-    from . import store
-
     city = city or default_city()
     kind = property_type if property_type in TYPES else "all"
-    from .geo import listing_fits_city, pin_listing_city
+    key = (city, kind)
+    now = time.time()
+    with _CACHE_LOCK:
+        hit = _PAYLOAD_CACHE.get(key)
+        if hit and now - hit[0] < CACHE_TTL_SEC:
+            return hit[1]
+    data = _build_market(city, kind)
+    with _CACHE_LOCK:
+        _PAYLOAD_CACHE[key] = (now, data)
+        if len(_PAYLOAD_CACHE) > 24:
+            oldest = min(_PAYLOAD_CACHE, key=lambda item: _PAYLOAD_CACHE[item][0])
+            _PAYLOAD_CACHE.pop(oldest, None)
+    return data
 
-    raw = store.fetch_all()
-    for item in raw:
-        pin_listing_city(item)
-    items = [i for i in raw if listing_fits_city(i, city)]
-    ensure_ready(items)
-    take_snapshots(items)
+
+def _build_market(city: str, kind: str) -> dict[str, Any]:
+    from . import store
+    from .http_timing import note
+
+    t0 = time.perf_counter()
+    from .listings_cache import market_items
+    from .geo import same_place_ids
+    from .place_tags import related_place_ids
+
+    items = market_items(city)
+    source = "snap"
+    if not items:
+        wanted = related_place_ids(city) | (same_place_ids(city) or {city})
+        items = store.fetch_by_cities(wanted)
+        source = "sql"
+    note("market.fetch", (time.perf_counter() - t0) * 1000, {"city": city, "n": len(items), "src": source})
+    ensure_ready(items, seed=False)
     place = public_place(city)
     city_label = place.get("label") or city
 
+    t1 = time.perf_counter()
+    ids = [item.id for item in items if item.id]
     with store.connect() as conn:
         ensure_tables(conn)
         series_rows = conn.execute(
@@ -379,13 +625,8 @@ def market_payload(city: str, property_type: str = "") -> dict[str, Any]:
             """,
             (city,),
         ).fetchall()
-        hist = conn.execute(
-            """
-            SELECT listing_id, seen_at, price_usd, price_m2, deal_label, deal_score
-            FROM price_history
-            ORDER BY listing_id, seen_at ASC, id ASC
-            """
-        ).fetchall()
+        hist = _price_history_rows(conn, ids)
+    note("market.sql", (time.perf_counter() - t1) * 1000, {"city": city, "ids": len(ids)})
 
     series = [
         {
@@ -442,69 +683,18 @@ def market_payload(city: str, property_type: str = "") -> dict[str, Any]:
         )
     by_type.sort(key=lambda r: TYPES.index(r["property_type"]) if r["property_type"] in TYPES else 9)
 
-    by_id = {item.id: item for item in items}
     grouped: dict[str, list] = {}
     for row in hist:
-        grouped.setdefault(row["listing_id"], []).append(row)
+        grouped.setdefault(row["listing_id"], []).append(dict(row))
 
     cutoff = _now() - timedelta(hours=NEW_HOURS)
-    drops = []
-    highlights = []
     pool = [i for i in items if kind == "all" or i.property_type == kind]
     mix = {"oportunidad": 0, "bueno": 0, "mercado": 0, "caro": 0}
     for item in pool:
         if item.deal_label in mix:
             mix[item.deal_label] += 1
-    for listing_id, points in grouped.items():
-        item = by_id.get(listing_id)
-        if not item or (kind != "all" and item.property_type != kind):
-            continue
-        if len(points) >= 2:
-            old, new = points[-2], points[-1]
-            old_usd, new_usd = old["price_usd"], new["price_usd"]
-            if old_usd and new_usd and new_usd < old_usd:
-                gap = old_usd - new_usd
-                pct = gap / old_usd
-                if pct >= DROP_PCT or gap >= DROP_USD:
-                    drops.append(
-                        _card(
-                            item,
-                            {
-                                "old_usd": old_usd,
-                                "new_usd": new_usd,
-                                "change_pct": round(-pct * 100, 1),
-                                "seen_at": new["seen_at"],
-                            },
-                        )
-                    )
-    for item in pool:
-        if excluded_from_comps(item) or item.deal_label != "oportunidad" or not item.price_m2:
-            continue
-        vs = item.vs_barrio_pct or 0
-        score = (item.extra or {}).get("deal_score") or 0
-        if vs < (18 if item.property_type == "terreno" else 12):
-            continue
-        published = _parse_dt(item.published_at)
-        hist_pts = grouped.get(item.id) or []
-        first = _parse_dt(hist_pts[0]["seen_at"] if hist_pts else None)
-        born = published or first
-        fresh = bool(born and born >= cutoff)
-        strong = vs >= 18 or score >= 80
-        highlights.append(
-            _card(
-                item,
-                {
-                    "first_seen": (born.isoformat() if born else None),
-                    "fresh": fresh,
-                    "strong": strong,
-                },
-            )
-        )
-
-    drops.sort(key=lambda r: (r.get("change_pct") or 0, -(r.get("old_usd") or 0)))
-    highlights.sort(
-        key=lambda r: (not r.get("fresh"), not r.get("strong"), -(r.get("vs_barrio_pct") or 0), -(r.get("deal_score") or 0))
-    )
+    drops = price_drops(pool, grouped)
+    highlights = relevant_deals(pool, grouped, cutoff)
     deals_n = mix["oportunidad"]
 
     return {
@@ -523,6 +713,7 @@ def market_payload(city: str, property_type: str = "") -> dict[str, Any]:
         "drops": drops[:8],
         "new_deals": highlights[:8],
         "tracked": sum(1 for i in items if i.price_usd),
+        "history_n": sum(1 for item in pool if grouped.get(item.id)),
         "days": len(series),
         "yields": _yield_block(items, city),
     }

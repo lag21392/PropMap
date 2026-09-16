@@ -10,15 +10,24 @@ def search_password() -> str:
     return (os.environ.get("SEARCH_PASSWORD") or "").strip()
 
 
+def _candidates() -> list[str]:
+    seen: list[str] = []
+    for key in ("SEARCH_PASSWORD", "MATOMO_PASSWORD"):
+        value = (os.environ.get(key) or "").strip()
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
 def password_matches(got: str | None) -> bool:
-    expected = search_password()
-    if not expected:
-        return False
     provided = (got or "").encode()
-    want = expected.encode()
-    if len(provided) != len(want):
+    if not provided:
         return False
-    return secrets.compare_digest(provided, want)
+    for expected in _candidates():
+        want = expected.encode()
+        if len(provided) == len(want) and secrets.compare_digest(provided, want):
+            return True
+    return False
 
 
 def require_search_password(got: str | None) -> None:

@@ -41,22 +41,199 @@ def test_tiny_microcentro_bbox_does_not_hide_palermo():
     assert in_city_radius(-34.588, -58.430, "caba") is True
 
 
+def _box_ring(lat: float, lon: float, d: float = 0.02) -> list[list[float]]:
+    return [
+        [lat - d, lon - d],
+        [lat - d, lon + d],
+        [lat + d, lon + d],
+        [lat + d, lon - d],
+        [lat - d, lon - d],
+    ]
+
+
+def _caba_area_polygons() -> list[dict]:
+    centers = [
+        (-34.6037, -58.3816, "San Nicolás"),
+        (-34.588, -58.430, "Palermo"),
+        (-34.562, -58.456, "Belgrano"),
+        (-34.620, -58.440, "Caballito"),
+        (-34.635, -58.365, "La Boca"),
+        (-34.650, -58.500, "Mataderos"),
+        (-34.580, -58.500, "Villa Devoto"),
+        (-34.615, -58.500, "Flores"),
+    ]
+    rows = []
+    for lat, lon, name in centers:
+        rows.append(
+            {
+                "name": name,
+                "zona": name,
+                "lat": lat,
+                "lon": lon,
+                "ring": _box_ring(lat, lon),
+            }
+        )
+    return rows
+
+
+def _caba_city_outline() -> list[list[list[float]]]:
+    # Caja que cubre CABA (Palermo, Obelisco, Lugano) y deja afuera Vicente López y Avellaneda.
+    return [
+        [
+            [-34.705, -58.531],
+            [-34.705, -58.335],
+            [-34.535, -58.335],
+            [-34.535, -58.531],
+            [-34.705, -58.531],
+        ]
+    ]
+
+
+def test_rings_from_geojson_swaps_lon_lat():
+    from app.places import rings_from_geojson
+
+    rings = rings_from_geojson(
+        {
+            "type": "Polygon",
+            "coordinates": [[[-58.4, -34.6], [-58.3, -34.6], [-58.3, -34.5], [-58.4, -34.5], [-58.4, -34.6]]],
+        }
+    )
+    assert rings
+    assert rings[0][0] == [-34.6, -58.4]
+
+
+def test_gba_point_is_not_caba_when_barrio_polygons_exist():
+    from app.geo import clear_city_polygons, remember_city_outline, remember_city_polygons
+
+    remember_city_polygons("caba", _caba_area_polygons())
+    remember_city_outline("caba", _caba_city_outline())
+    try:
+        assert in_city_radius(-34.588, -58.430, "caba") is True
+        assert in_city_radius(-34.6037, -58.3816, "caba") is True
+        assert in_city_radius(-34.526, -58.475, "caba") is False
+        assert in_city_radius(-34.507, -58.487, "caba") is False
+        vl = Listing(
+            source="zonaprop",
+            source_id="vl",
+            url="https://example.com/vl",
+            title="Depto Vicente López",
+            property_type="departamento",
+            city="caba",
+            address="Maipú 600, Vicente López",
+            lat=-34.526,
+            lon=-58.475,
+            extra={"search_city": "caba"},
+        )
+        assert listing_fits_city(vl, "caba") is False
+        palermo = Listing(
+            source="zonaprop",
+            source_id="pal",
+            url="https://example.com/pal",
+            title="Depto Palermo",
+            property_type="departamento",
+            city="caba",
+            address="Honduras 3800",
+            lat=-34.588,
+            lon=-58.430,
+            extra={"search_city": "caba"},
+        )
+        assert listing_fits_city(palermo, "caba") is True
+    finally:
+        clear_city_polygons("caba")
+
+
+def test_caba_pin_stays_on_map_if_title_names_another_locality():
+    from app.geo import clear_city_polygons, remember_city_outline, remember_city_polygons
+    from app.place_api import remember
+
+    remember_city_polygons("caba", _caba_area_polygons())
+    remember_city_outline("caba", _caba_city_outline())
+    remember(
+        "hudson",
+        {"name": "Hudson", "kind": "localidad", "province": "buenos-aires", "lat": -34.79, "lon": -58.16},
+    )
+    try:
+        item = Listing(
+            source="mercadolibre",
+            source_id="hudson-caba",
+            url="https://example.com/hudson",
+            title="Lagoon Hudson - Viví En Contacto Con El Agua",
+            property_type="departamento",
+            city="caba",
+            address="Balvanera",
+            barrio="Balvanera",
+            lat=-34.6138,
+            lon=-58.3952,
+            extra={"search_city": "caba"},
+        )
+        assert listing_fits_city(item, "caba", remote=False) is True
+    finally:
+        clear_city_polygons("caba")
+
+
 def test_listed_cities_only_shows_used_or_searched_places():
+    from app.places import reset_listed_places
+    from app.schedule import reset
+
+    reset()
+    reset_listed_places()
     rows = listed_cities([])
     ids = {row["id"] for row in rows}
     assert "caba" in ids
     assert "trelew" not in ids
     assert "gaiman" not in ids
+    assert "canning" not in ids
 
 
-def test_listed_cities_keeps_a_searched_place():
-    from app.schedule import note_search, reset
+def test_listing_count_for_catalog_skips_tiny_places():
+    from app.places import listing_count_for_catalog
+
+    assert listing_count_for_catalog(0) is False
+    assert listing_count_for_catalog(7) is False
+    assert listing_count_for_catalog(8) is True
+    assert listing_count_for_catalog(80) is True
+
+
+def test_listed_cities_includes_places_that_have_listings(monkeypatch):
+    from app.places import reset_listed_places
+    from app.schedule import reset
 
     reset()
-    note_search("puerto-madryn")
+    reset_listed_places()
+    monkeypatch.setattr("app.places._ids_with_saved_listings", lambda: {"quilmes", "fuera"})
     ids = {row["id"] for row in listed_cities([])}
-    assert "puerto-madryn" in ids
     assert "caba" in ids
+    assert "quilmes" not in ids
+    assert "fuera" not in ids
+
+
+def test_listed_cities_hides_empty_searched_place(monkeypatch):
+    from app.places import remember_listed_place, reset_listed_places
+    from app.schedule import reset
+
+    monkeypatch.setattr("app.pipeline.loading_city_ids", lambda: set())
+    reset()
+    reset_listed_places()
+    remember_listed_place("puerto-madryn")
+    ids = {row["id"] for row in listed_cities([])}
+    assert "puerto-madryn" not in ids
+    assert "caba" in ids
+    reset_listed_places()
+    reset()
+
+
+def test_listed_cities_hides_a_loading_empty_place(monkeypatch):
+    from app.places import remember_listed_place, reset_listed_places
+    from app.schedule import reset
+
+    reset()
+    reset_listed_places()
+    remember_listed_place("puerto-madryn")
+    monkeypatch.setattr("app.pipeline.loading_city_ids", lambda: {"puerto-madryn"})
+    ids = {row["id"] for row in listed_cities([])}
+    assert "puerto-madryn" not in ids
+    assert "caba" in ids
+    reset_listed_places()
     reset()
 
 
@@ -131,10 +308,14 @@ def test_madryn_listing_mentioning_buenos_aires_is_still_foreign():
 
 
 def test_san_nicolas_caba_is_not_a_foreign_town():
-    from app.geo import remember_barrio
+    from app.geo import CITIES, remember_barrio
     from app.place_api import remember
 
     remember_barrio("caba", "San Nicolás", -34.6037, -58.3816)
+    cfg = CITIES["caba"]
+    barrios = list(cfg.get("barrios") or [])
+    barrios.append({"name": "San Nicolás", "lat": -34.6037, "lon": -58.3816, "aliases": ["san nicolas"]})
+    cfg["barrios"] = barrios
     remember(
         "san nicolas",
         {"name": "San Nicolás", "kind": "localidad", "province": "La Rioja", "lat": -29.115, "lon": -67.473},
@@ -150,8 +331,7 @@ def test_san_nicolas_caba_is_not_a_foreign_town():
         barrio="San Nicolás",
         extra={"search_city": "caba"},
     )
-    assert listing_mentions_city(item, "caba") is True
-    assert listing_fits_city(item, "caba") is False  # city field is fuera until rehomed
+    assert listing_fits_city(item, "caba") is True  # se buscó en CABA aunque el tag haya quedado en fuera
     from app.geo import foreign_locality
 
     assert foreign_locality(item, "caba") is False

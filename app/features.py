@@ -91,15 +91,61 @@ def analyze(item: Listing) -> Listing:
         extra["mortgage_credit"] = True
     item.extra = extra
     fill_areas(item, blob)
+    from .layout import apply_layout_counts
+
+    apply_layout_counts(item)
     item.quality_score = _quality(item, amenities)
     item.quality_label = _quality_label(item.quality_score)
     return item
 
 
+def extract_uncovered(text: str) -> float | None:
+    blob = text or ""
+    found: list[float] = []
+    for pattern in (
+        r"(\d[\d\.]{1,6})\s*m[²2]?\s*(?:descubiertos?|semicubiertos?|semi[\s-]?cubiertos?)",
+        r"(?:descubiertos?|semicubiertos?|semi[\s-]?cubiertos?)\D{0,16}(\d[\d\.]{1,6})\s*m[²2]",
+    ):
+        found.extend(_area_all(blob, pattern))
+    return max(found) if found else None
+
+
+def combine_areas(
+    covered: float | None,
+    total: float | None,
+    uncovered: float | None = None,
+    *,
+    property_type: str = "",
+) -> tuple[float | None, float | None]:
+    """Cubiertos y totales. Si hay descubiertos y no hay lote distinto, se suman."""
+    cov = covered if covered and covered > 0 else None
+    tot = total if total and total > 0 else None
+    unc = uncovered if uncovered and uncovered > 0 else None
+    if cov and tot and (tot + 0.5) < cov:
+        tot = None
+    copied = bool(cov and tot and abs(tot - cov) < 1)
+    if cov and unc:
+        summed = cov + unc
+        if not tot or copied or (tot < summed and tot <= cov + 15):
+            tot = summed
+    elif copied:
+        tot = None
+    if cov and not tot and property_type in {"departamento", "ph", "oficina", "local"}:
+        tot = cov
+    return cov, tot
+
+
 def extract_areas(text: str) -> tuple[float | None, float | None]:
     blob = text or ""
-    lot = _area_match(blob, r"(\d[\d\.]{1,6})\s*m[²2]?\s*(?:de\s*)?(?:terreno|lote|totales?)")
     covered = _area_match(blob, r"(\d[\d\.]{1,6})\s*m[²2]?\s*(?:cubiertos?|cub)")
+    lots: list[float] = []
+    for pattern in (
+        r"(\d[\d\.]{1,6})\s*m[²2]?\s*(?:de\s*)?(?:terreno|lote|totales?)",
+        r"(?:terreno|lote|patio)\b[\s\wÁÉÍÓÚáéíóúüñ°²,.:;/-]{0,120}?(\d[\d\.]{1,6})\s*m[²2]",
+    ):
+        lots.extend(_area_all(blob, pattern))
+    lot = max(lots) if lots else None
+    covered, lot = combine_areas(covered, lot, extract_uncovered(blob))
     return covered, lot
 
 
@@ -108,8 +154,15 @@ def fill_areas(item: Listing, blob: str | None = None) -> Listing:
     covered, lot = extract_areas(text)
     if not item.covered_m2 and covered:
         item.covered_m2 = covered
-    if not item.total_m2 and lot:
-        item.total_m2 = lot
+    if lot:
+        covered_now = item.covered_m2 or covered
+        copied = bool(
+            item.total_m2 and covered_now and abs(float(item.total_m2) - float(covered_now)) < 1
+        )
+        if not item.total_m2 or copied or float(item.total_m2 or 0) + 9 < lot:
+            item.total_m2 = lot
+    if item.covered_m2 and not item.total_m2 and item.property_type in {"departamento", "ph", "oficina", "local"}:
+        item.total_m2 = item.covered_m2
     if item.property_type == "terreno":
         if item.covered_m2 and (not item.total_m2 or item.total_m2 < 40):
             if item.covered_m2 >= 80:
@@ -130,6 +183,19 @@ def _area_match(text: str, pattern: str) -> float | None:
     except ValueError:
         return None
     return value if 10 <= value <= 500_000 else None
+
+
+def _area_all(text: str, pattern: str) -> list[float]:
+    out: list[float] = []
+    for match in re.finditer(pattern, text or "", re.I):
+        raw = match.group(1).replace(".", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if 10 <= value <= 500_000:
+            out.append(value)
+    return out
 
 
 def scan_red_flags(item: Listing) -> list[str]:

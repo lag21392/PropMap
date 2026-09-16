@@ -90,3 +90,42 @@ def test_reused_cover_photo_does_not_merge_other_streets():
         lon=-58.430,
     )
     assert collapse_duplicates([a, b]) == []
+
+
+def test_similar_photos_nearby_approx_pins_are_same_unit():
+    photo = "https://cdn.agency.net/unidad-living-aabb9911.jpg"
+    a = _listing(
+        has_exact_location=False,
+        extra={"photos": [photo]},
+    )
+    b = _listing(
+        source="properati",
+        source_id="p-near",
+        url="https://www.properati.com.ar/detalle/p-near",
+        address="Florida 610",
+        has_exact_location=False,
+        lat=-34.6018,
+        lon=-58.3769,
+        extra={"photos": [photo]},
+    )
+    changed = collapse_duplicates([a, b])
+    assert {item.id for item in changed} == {a.id, b.id}
+    loser = next(item for item in changed if item.extra.get("duplicate_of"))
+    assert should_publish(loser) is False
+
+
+def test_nearby_photos_different_size_not_merged():
+    photo = "https://cdn.agency.net/unidad-living-aabb9911.jpg"
+    a = _listing(covered_m2=80, bedrooms=3, extra={"photos": [photo]}, has_exact_location=False)
+    b = _listing(
+        source="argenprop",
+        source_id="otro",
+        url="https://www.argenprop.com/otro",
+        covered_m2=40,
+        bedrooms=1,
+        extra={"photos": [photo]},
+        has_exact_location=False,
+        lat=-34.6018,
+        lon=-58.3769,
+    )
+    assert collapse_duplicates([a, b]) == []

@@ -5,7 +5,7 @@ import time
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from threading import Lock
+from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
 
 from starlette.responses import Response
@@ -15,8 +15,11 @@ from . import store
 _rate: dict[str, list[float]] = {}
 _rate_lock = Lock()
 _recent: dict[tuple[str, str, str], float] = {}
+_prune_at = 0.0
 MAX_PER_MIN = 80
 KEEP_DAYS = 90
+WRITE_WAIT_SEC = 0.05
+PRUNE_EVERY_SEC = 6 * 3600
 COOKIE = "propmap_vid"
 OWN_HOSTS = {"", "127.0.0.1", "localhost"}
 PIXEL_GIF = bytes.fromhex(
@@ -44,6 +47,18 @@ def stamp_cookie(response: Response, vid: str) -> None:
     )
 
 
+def record_later(payload: dict, ua: str = "", header_ref: str = "") -> None:
+    """La portada no puede esperar el candado de sqlite (geo/LLM lo ocupan minutos)."""
+    Thread(target=_record_safe, args=(payload, ua, header_ref), daemon=True, name="visit").start()
+
+
+def _record_safe(payload: dict, ua: str = "", header_ref: str = "") -> None:
+    try:
+        record(payload, ua=ua, header_ref=header_ref)
+    except Exception:
+        pass
+
+
 def record(payload: dict, ua: str = "", header_ref: str = "") -> None:
     store.init()
     name = str(payload.get("n") or payload.get("name") or "pageview")[:40]
@@ -60,7 +75,10 @@ def record(payload: dict, ua: str = "", header_ref: str = "") -> None:
     extra = {k: payload.get(k) for k in ("q", "listing", "tab", "utm") if payload.get(k)}
     extra["source"] = source
     now = datetime.now(timezone.utc).isoformat()
-    with store._write:
+    got = store._write.acquire(timeout=WRITE_WAIT_SEC)
+    if not got:
+        return
+    try:
         with store.connect() as conn:
             conn.execute(
                 """
@@ -78,9 +96,17 @@ def record(payload: dict, ua: str = "", header_ref: str = "") -> None:
                     json.dumps(extra, ensure_ascii=False),
                 ),
             )
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)).isoformat()
-            conn.execute("DELETE FROM visits WHERE seen_at < ?", (cutoff,))
+            global _prune_at
+            tick = time.time()
+            if tick - _prune_at >= PRUNE_EVERY_SEC:
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)).isoformat()
+                conn.execute("DELETE FROM visits WHERE seen_at < ?", (cutoff,))
+                _prune_at = tick
             conn.commit()
+    except Exception:
+        return
+    finally:
+        store._write.release()
 
 
 def summary(days: int = 14) -> dict:

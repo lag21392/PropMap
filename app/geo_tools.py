@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .geo import CITIES, fold, offset_by_number, parse_street, street_names_match
+from .geo import CITIES, fold, _mapped_water, in_water, offset_by_number, parse_street, street_names_match
 
 _SKIP = {
     "venta", "alquiler", "departamento", "depto", "casa", "terreno", "ph",
@@ -11,6 +11,10 @@ _SKIP = {
     "lindo", "excelente", "oportunidad", "cocina", "comedor", "living",
     "patio", "jardin", "jardín", "balcon", "balcón", "estacionamiento",
     "whatsapp", "calidad", "dimensiones", "amplio", "unico", "único",
+    "lote", "lotes", "parcela", "manzana", "fraccion", "loteo",
+    "valor", "medidas", "adquirir", "lindero", "identicas", "idénticas",
+    "precio", "superficie", "frente", "fondo", "metros", "entorno",
+    "paredes", "interiores", "exteriores", "proyecto", "construir",
 }
 CORNER_RE = re.compile(
     r"(?:esquina(?:\s+de)?|esq\.?)\s+"
@@ -45,6 +49,15 @@ BETWEEN_RE = re.compile(
     r"([a-záéíóúüñ0-9.]{2,}(?:\s+[a-záéíóúüñ0-9.]{2,}){0,3})",
     re.I,
 )
+ENTRECALLES_RE = re.compile(
+    r"(?:entrecalles?|e\s*/)\s+"
+    r"(?:calle\s+|av(?:enida|\.)?\s+|pasaje\s+)?"
+    r"([a-záéíóúüñ0-9.]{2,}(?:\s+[a-záéíóúüñ0-9.]{2,}){0,4})"
+    r"\s+(?:y|e)\s+"
+    r"(?:calle\s+|av(?:enida|\.)?\s+|pasaje\s+)?"
+    r"([a-záéíóúüñ0-9.]{2,}(?:\s+[a-záéíóúüñ0-9.]{2,}){0,4})",
+    re.I,
+)
 
 
 def _clean_street(name: str) -> str:
@@ -77,9 +90,9 @@ def parse_plain_locations(text: str) -> dict[str, Any]:
         if (left, right) not in corners and (right, left) not in corners:
             corners.append((left, right))
     betweens: list[tuple[str, str]] = []
-    for match in BETWEEN_RE.finditer(blob):
+    for match in (*BETWEEN_RE.finditer(blob), *ENTRECALLES_RE.finditer(blob)):
         left, right = _clean_street(match.group(1)), _clean_street(match.group(2))
-        if _useful(left) and _useful(right):
+        if _useful(left) and _useful(right) and (left, right) not in betweens and (right, left) not in betweens:
             betweens.append((left, right))
     return {
         "street": street or "",
@@ -103,16 +116,21 @@ def validate_street(name: str, city: str = "") -> dict[str, Any]:
 
 
 def validate_address(street: str, number: int | str, city: str = "") -> dict[str, Any]:
+    from .text_quality import is_plot_street_name
+
     token = _clean_street(street)
     try:
         num = int(str(number).strip())
     except (TypeError, ValueError):
         num = 0
-    if not _useful(token) or num <= 0:
+    if is_plot_street_name(token) or not _useful(token) or num <= 0:
         return {"ok": False, "reason": "direccion incompleta"}
     from .place_api import geocode_direccion
 
     official = geocode_direccion(token, num, city)
+    if official and official.get("lat") is not None and official.get("lon") is not None:
+        if _mapped_water(official["lat"], official["lon"], city):
+            official = None
     if official and official.get("lat") is not None and official.get("lon") is not None:
         return {
             "ok": True,
@@ -129,7 +147,9 @@ def validate_address(street: str, number: int | str, city: str = "") -> dict[str
     if not hits:
         street_hit = validate_street(token, city)
         if street_hit.get("ok") and street_hit.get("lat") is not None:
-            lat, lon = offset_by_number(float(street_hit["lat"]), float(street_hit["lon"]), num)
+            lat, lon = offset_by_number(float(street_hit["lat"]), float(street_hit["lon"]), num, city)
+            if in_water(lat, lon, city):
+                return {"ok": False, "street": token, "number": num, "reason": "en el agua"}
             return {
                 "ok": True,
                 "approx": True,
@@ -141,6 +161,8 @@ def validate_address(street: str, number: int | str, city: str = "") -> dict[str
             }
         return {"ok": False, "street": token, "number": num, "reason": "no encontrada"}
     best = hits[0]
+    if _mapped_water(best.get("lat"), best.get("lon"), city):
+        return {"ok": False, "street": token, "number": num, "reason": "en el agua"}
     return {"ok": bool(best.get("ok")), "street": token, "number": num, "approx": False, **best}
 
 
@@ -187,25 +209,90 @@ def city_label(city: str) -> str:
     return str(cfg.get("label") or city or "")
 
 
+def _pair_from_text(raw: str) -> tuple[str, str]:
+    text = (raw or "").strip()
+    if not text:
+        return "", ""
+    parts = re.split(r"\s+(?:y|e)\s+", text, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return "", ""
+    left, right = _clean_street(parts[0]), _clean_street(parts[1])
+    if _useful(left) and _useful(right):
+        return left, right
+    return "", ""
+
+
+def _usable_street_pin(street: str, number: Any) -> bool:
+    from .text_quality import is_plot_label, is_plot_street_name
+
+    token = _clean_street(street)
+    if not token or is_plot_street_name(token) or is_plot_label(street, str(number or "")):
+        return False
+    try:
+        num = int(str(number).strip())
+    except (TypeError, ValueError):
+        return False
+    return num > 0
+
+
+def validate_between(calle_a: str, calle_b: str, city: str = "") -> dict[str, Any]:
+    hit = validate_corner(calle_a, calle_b, city)
+    if hit.get("ok"):
+        return {**hit, "pin_kind": "intersection"}
+    left = validate_street(calle_a, city)
+    right = validate_street(calle_b, city)
+    if left.get("ok") and right.get("ok") and left.get("lat") is not None and right.get("lat") is not None:
+        lat = (float(left["lat"]) + float(right["lat"])) / 2
+        lon = (float(left["lon"]) + float(right["lon"])) / 2
+        return {
+            "ok": True,
+            "approx": True,
+            "calle_a": _clean_street(calle_a),
+            "calle_b": _clean_street(calle_b),
+            "lat": lat,
+            "lon": lon,
+            "label": f"{calle_a} y {calle_b}",
+            "pin_kind": "intersection",
+        }
+    return {"ok": False, "calle_a": calle_a, "calle_b": calle_b, "reason": "calles no encontradas"}
+
+
 def run_location_tools(text: str, city: str, extracted: dict[str, Any] | None = None) -> dict[str, Any]:
+    from .text_quality import is_plot_label
+
     found = parse_plain_locations(text)
     extra = extracted or {}
     street = _clean_street(str(extra.get("street") or found.get("street") or ""))
     number = extra.get("street_number") or extra.get("number") or found.get("number")
+    if is_plot_label(str(extra.get("address_text") or ""), street, str(number or "")):
+        street, number = "", None
     corner_a = _clean_street(str(extra.get("corner_a") or extra.get("calle_a") or ""))
     corner_b = _clean_street(str(extra.get("corner_b") or extra.get("calle_b") or ""))
     if not corner_a and found["corners"]:
         corner_a, corner_b = found["corners"][0]
+    between_a = _clean_street(str(extra.get("between_a") or ""))
+    between_b = _clean_street(str(extra.get("between_b") or ""))
+    if not between_a:
+        between_a, between_b = _pair_from_text(str(extra.get("between") or ""))
+    if not between_a and found.get("between"):
+        between_a, between_b = found["between"][0]
     checked: list[dict[str, Any]] = []
     geo = None
-    if street and number:
+    if _usable_street_pin(street, number):
         hit = validate_address(street, number, city)
         checked.append({"tool": "validar_direccion", **hit})
-        if hit.get("ok"):
+        if hit.get("ok") and not hit.get("approx"):
             geo = {**hit, "pin_kind": "address"}
-    if geo is None and corner_a and corner_b:
+        elif hit.get("ok"):
+            geo = {**hit, "pin_kind": "address"}
+    if (geo is None or geo.get("approx")) and corner_a and corner_b:
         hit = validate_corner(corner_a, corner_b, city)
         checked.append({"tool": "validar_esquina", **hit})
-        if hit.get("ok"):
+        if hit.get("ok") and (geo is None or geo.get("approx") or not hit.get("approx")):
             geo = {**hit, "pin_kind": "intersection"}
+    if (geo is None or geo.get("approx")) and between_a and between_b:
+        hit = validate_between(between_a, between_b, city)
+        checked.append({"tool": "validar_entre", **hit})
+        if hit.get("ok") and (geo is None or (geo.get("approx") and not hit.get("approx"))):
+            geo = {**hit, "pin_kind": hit.get("pin_kind") or "intersection"}
     return {"found": found, "checked": checked, "geo": geo}

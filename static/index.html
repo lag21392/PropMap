@@ -8,11 +8,18 @@
   <title>PropMap · avisos en el mapa</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui12" />
+  <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
+  <link rel="preload" href="/static/styles.css?v=ui28" as="style" />
+  <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui70" as="script" />
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <noscript>
+    <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
+  </noscript>
+  <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
+  <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
+  <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui28" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -25,7 +32,7 @@
             <span class="logo-word">PROPMAP</span>
           </h1>
           <div class="brand-actions">
-            <button type="button" class="account-btn" id="accountBtn" aria-haspopup="dialog" title="Cuenta">
+            <button type="button" class="account-btn" id="accountBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu" title="Cuenta">
               Cuenta
             </button>
             <button type="button" class="info-btn" id="helpBtn" aria-haspopup="dialog" aria-controls="helpModal" title="Cómo usar PropMap">
@@ -38,7 +45,7 @@
 
       <div class="filters">
         <label class="place-wrap">Lugar
-          <input id="placeQuery" type="search" placeholder="Playa Unión, Bariloche, un barrio…" autocomplete="off" />
+          <input id="placeQuery" type="search" placeholder="Escribí y elegí un lugar de la lista" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="placeSuggest" />
           <div id="placeSuggest" class="place-suggest" hidden></div>
         </label>
         <label class="span-2">Lugares cargados
@@ -83,6 +90,10 @@
           <input id="favOnly" type="checkbox" />
           Solo favoritos
         </label>
+        <label class="check" title="Saca avisos sin dirección, intersección ni pin aproximado del portal. Quedan ubicación real y manzanas del aviso.">
+          <input id="hideNoLoc" type="checkbox" checked />
+          Ocultar sin ubicación
+        </label>
       </div>
 
       <div class="deal-block">
@@ -90,7 +101,7 @@
           <span>Ganga</span>
           <details class="deal-help">
             <summary aria-label="Ayuda del filtro de ganga">i</summary>
-            <p>Esto no es una tasación. Comparamos USD/m² del mismo tipo y tamaño en la zona. Un lote o depto barato puede ser ganga; <strong>dato raro</strong> es solo si el USD/m² es imposible (error de carga), no por estar debajo de la mediana.</p>
+            <p>Esto no es una tasación. El score es <strong>respecto de esta ciudad</strong>: USD/m² del mismo tipo y tamaño acá, no contra el resto del país. Un lote o depto barato puede ser ganga; <strong>dato raro</strong> es solo si el USD/m² es imposible (error de carga), no por estar debajo de la mediana.</p>
           </details>
         </div>
         <input id="dealBar" type="range" min="0" max="70" step="5" value="0" aria-label="Filtro de ganga" />
@@ -141,7 +152,9 @@
           <button type="button" id="reloadStats" class="ghost">actualizar</button>
         </div>
         <p class="market-kicker" id="analyticsHeadline">El mapa por ciudad y el detalle de visitas están en Matomo.</p>
-        <p><a id="matomoLink" href="http://127.0.0.1:3102" target="_blank" rel="noopener">Abrir tablero Matomo</a></p>
+        <p><a href="/tablero">Tablero de scrape</a></p>
+        <p><a id="matomoLink" href="/stats" target="_blank" rel="noopener">Abrir tablero Matomo</a></p>
+        <p><a href="/flujo">Cómo se mueven los datos</a></p>
         <div id="analyticsReadout"></div>
       </section>
 
@@ -178,7 +191,7 @@
     <main class="map-wrap" id="pane-map" data-pane="map">
       <div class="survey-frame" aria-hidden="true"></div>
       <div id="map"></div>
-      <button type="button" class="map-account" id="mapAccountBtn">Cuenta</button>
+      <button type="button" class="map-account" id="mapAccountBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu">Cuenta</button>
       <div class="map-loading" id="mapLoading" role="status" aria-live="polite">
         <span class="list-loading-pulse" aria-hidden="true"></span>
         <p data-loading-copy>Cargando propiedades… esperá un segundo.</p>
@@ -195,11 +208,12 @@
           <li><span class="dot high"></span><span><strong>Coral:</strong> caro. El m² pide más que la mediana de la zona.</span></li>
           <li><span class="dot warn"></span><span><strong>Amarillo:</strong> revisar. Precio irreal, error de carga o el texto habla de juicio / a demoler / loteo.</span></li>
           <li><span class="dot loteo"></span><span><strong>Beige:</strong> loteo o catálogo. No entra en la mediana del barrio.</span></li>
-          <li><span class="pin-legend round"></span><span><strong>Punto redondo:</strong> el aviso trae calle y altura (no es Properati ni un punto de manzana).</span></li>
-          <li><span class="pin-legend square"></span><span><strong>Cuadrado:</strong> ubicación aproximada, como en Properati: una manzana o zona, no la puerta.</span></li>
+          <li><span class="pin-legend round"></span><span><strong>Punto redondo:</strong> ubicación real (calle y altura, o intersección geocodificada).</span></li>
+          <li><span class="pin-legend square"></span><span><strong>Cuadrado:</strong> ubicación aproximada del aviso: una manzana o zona, no la puerta.</span></li>
+          <li><span class="pin-legend lost"></span><span><strong>Sin ubicación:</strong> no hay dirección, intersección ni pin aproximado scrapeo. El filtro los puede sacar del mapa.</span></li>
         </ul>
       </aside>
-      <p class="map-hint">Arrastrá el mapa · rueda = zoom · cuadrado = manzana aproximada · el color es el precio vs el barrio</p>
+      <p class="map-hint">Arrastrá el mapa · rueda = zoom · redondo = ubicación real · cuadrado = manzana del aviso</p>
       <p class="map-legal"><a href="/legal">Términos, privacidad y derechos reservados</a> · avisos de terceros · Ley 25.326</p>
       <section class="stats-card" id="statsCard">
         <div class="stats-head">
@@ -227,8 +241,9 @@
           <span class="dot high"></span> caro
           <span class="dot warn"></span> revisar
           <span class="dot loteo"></span> loteo
-          <span class="pin-legend round"></span> calle y altura
+          <span class="pin-legend round"></span> ubicación real
           <span class="pin-legend square"></span> aprox. (manzana)
+          <span class="pin-legend lost"></span> sin ubicación
         </div>
       </section>
     </main>
@@ -311,7 +326,7 @@
       <p class="eyebrow">Mapa de avisos en venta</p>
       <h2 id="welcomeTitle">Bienvenido a PropMap</h2>
       <p>En la ficha ves cuánto <strong>podría</strong> alquilarse, con contrato y temporal. Son estimaciones según la zona: no es un ingreso garantizado ni una tasación.</p>
-      <p class="welcome-note">Los pines cuadrados marcan una manzana aproximada, como en Properati. Creá una cuenta si querés guardar favoritos cifrados.</p>
+      <p class="welcome-note">Los pines cuadrados marcan una manzana o zona aproximada, no la puerta. Creá una cuenta si querés guardar favoritos cifrados.</p>
       <button type="button" class="primary" id="welcomeStart">Empezar</button>
     </div>
   </dialog>
@@ -321,9 +336,9 @@
       <h2 id="helpTitle">Cómo usar PropMap</h2>
       <ul class="help-list">
         <li>Escribí un lugar, filtrá tipo / barrio / precio y ordená la lista.</li>
-        <li>Tocá un pin o una tarjeta para abrir la ficha a la derecha.</li>
+        <li>Tocá un pin o una tarjeta para abrir la ficha a la derecha. Si hay varios avisos en el mismo punto, el mapa solo sirve para elegir cuál.</li>
         <li>El color compara el USD/m² con el mismo tipo en esa zona. No es una tasación.</li>
-        <li>Los cuadrados del mapa son ubicación aproximada (manzana). El punto redondo aparece solo si hay calle y altura.</li>
+        <li>El punto redondo es ubicación real (calle y altura o esquina). El cuadrado es la manzana aproximada del aviso. Lo que no tiene ni eso queda marcado como sin ubicación; podés ocultarlos con el filtro del mapa.</li>
         <li>Marcá favoritos con una cuenta validada; se guardan cifrados. En el celular usá las solapas de abajo.</li>
       </ul>
       <p class="help-rent"><strong>Alquileres:</strong> el contrato (USD/mes) y el temporal (USD/noche) son <em>estimaciones</em> armadas con avisos de la zona, el tipo y el tamaño. Descuentan vacancia u ocupación típica. No son un alquiler cerrado ni un ingreso asegurado.</p>
@@ -359,6 +374,7 @@
       <p class="status is-ok" id="authOk" hidden></p>
       <div class="dialog-actions">
         <button value="cancel" type="button" id="authCancel">Cancelar</button>
+        <button type="button" id="authResend" hidden>Reenviar mail</button>
         <button class="primary" type="submit" id="authSubmit">Entrar</button>
       </div>
     </form>
@@ -372,7 +388,6 @@
         <div><dt>Usuario</dt><dd id="setUser">—</dd></div>
         <div><dt>Mail</dt><dd id="setEmail">—</dd></div>
         <div><dt>Validación</dt><dd id="setVerified">—</dd></div>
-        <div><dt>Mail de PropMap</dt><dd><a data-site-mail href="mailto:cuenta@propmap.local">cuenta@propmap.local</a></dd></div>
       </dl>
       <p class="muted"><a data-mail-inbox hidden href="http://127.0.0.1:7500" target="_blank" rel="noopener">Abrir bandeja de validación</a></p>
       <p class="status" id="settingsMsg" hidden></p>
@@ -397,9 +412,14 @@
     </form>
   </dialog>
 
+  <div id="accountMenu" class="account-menu" hidden role="menu" aria-label="Cuenta">
+    <button type="button" role="menuitem" id="favReportMenuBtn">Descargar reporte de favoritos</button>
+    <button type="button" role="menuitem" id="accountSettingsBtn">Ajustes</button>
+  </div>
+
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-  <script src="/static/app.js?v=ui26"></script>
+  <script defer src="/static/vendor/leaflet/leaflet.js"></script>
+  <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
+  <script defer src="/static/app.js?v=ui70"></script>
 </body>
 </html>

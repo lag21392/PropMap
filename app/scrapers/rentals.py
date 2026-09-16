@@ -32,7 +32,7 @@ def scrape_rentals(city: str, progress=lambda _m: None, should_stop=None, usd_ar
                     break
                 chunk = _pages(
                     lambda page, t=target, p=ptype, c=city, fn=pager: fn(t, p, page, c),
-                    max_pages=3 if hinted == "monthly" else 2,
+                    max_pages=8 if hinted == "monthly" else 2,
                     should_stop=should_stop,
                 )
                 for item in chunk:

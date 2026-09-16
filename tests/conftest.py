@@ -7,6 +7,7 @@ os.environ["PROPMAP_TEST"] = "1"
 from app import place_api
 from app.geo import CITIES, register_city
 from app.http_client import reset_fetch_state
+from app.places import reset_listed_places
 
 
 def _place(name, province, lat, lon, kind="localidad"):
@@ -16,6 +17,7 @@ def _place(name, province, lat, lon, kind="localidad"):
 @pytest.fixture(autouse=True)
 def georef_fixtures(monkeypatch):
     reset_fetch_state()
+    reset_listed_places()
     place_api.reset_cache()
     from app.places import reset_search_cache
 
@@ -51,6 +53,7 @@ def georef_fixtures(monkeypatch):
         "berazategui": _place("Berazategui", "Buenos Aires", -34.75, -58.21, "municipio"),
         "parque bonito": _place("Parque Bonito", "Buenos Aires", -34.90, -58.18),
         "palermo": _place("Palermo", "Ciudad Autónoma de Buenos Aires", -34.588, -58.430),
+        "mar del plata": _place("Mar del Plata", "Buenos Aires", -38.0055, -57.5426),
     }
     for name, place in fixtures.items():
         place_api.remember(name, place)

@@ -14,26 +14,44 @@ _queue: deque[str] = deque()
 _seen: set[str] = set()
 _lock = threading.Lock()
 _workers = 0
-MAX_WORKERS = 2
+MAX_WORKERS = 3
 
 
 def enabled() -> bool:
     return os.environ.get("PROPMAP_TEST") != "1"
 
 
-def workers() -> int:
-    raw = os.environ.get("DETAIL_WORKERS") or str(MAX_WORKERS)
+def _ops_note(metric: str, **labels: Any) -> None:
     try:
-        return max(1, min(4, int(raw)))
-    except ValueError:
-        return MAX_WORKERS
+        from .ops import note
+
+        note(metric, **labels)
+    except Exception:
+        return
+
+
+def workers() -> int:
+    from .egress import lane_count
+
+    raw = os.environ.get("DETAIL_WORKERS")
+    if raw:
+        try:
+            return max(1, min(16, int(raw)))
+        except ValueError:
+            pass
+    n = lane_count()
+    target = n * 3 if n > 1 else MAX_WORKERS
+    return max(1, min(16, max(MAX_WORKERS, target)))
 
 
 def queue_stats() -> dict[str, Any]:
     with _lock:
         return {
             "pending": len(_urgent) + len(_queue),
+            "urgent": len(_urgent),
+            "rest": len(_queue),
             "downloading": int(_workers),
+            "workers": workers(),
             "enabled": enabled(),
         }
 
@@ -72,6 +90,25 @@ def enqueue(listings: list[Listing] | None) -> None:
         _ensure_workers_locked()
     if ready_for_llm:
         enqueue_llm(ready_for_llm)
+
+
+def refill(prefer_city: str = "") -> int:
+    """Baja fichas de toda la base, no solo de la ciudad en scrape."""
+    if not enabled():
+        return 0
+    with _lock:
+        pending = len(_urgent) + len(_queue)
+        room = max(0, workers() * 3 - pending)
+        skip = set(_seen)
+    if room <= 0:
+        return 0
+    from . import store
+
+    items = store.fetch_detail_backlog(min(24, room + 8), prefer_city=prefer_city)
+    take = [item for item in items if item.id not in skip][:room]
+    if take:
+        enqueue(take)
+    return len(take)
 
 
 def _has_work() -> bool:
@@ -115,8 +152,10 @@ def _fetch_id(listing_id: str) -> None:
     if needs_detail_fetch(item) and item.url:
         try:
             enrich_details(item)
+            _ops_note("details", outcome="ok" if item.details_scraped else "fail")
         except Exception:
             analyze(item)
+            _ops_note("details", outcome="fail")
         store.upsert_many([item])
         item = store.get_listing(listing_id) or item
     if needs_llm(item):
@@ -125,3 +164,6 @@ def _fetch_id(listing_id: str) -> None:
             [item],
             urgent=location_incomplete(item) or bool(extra.get("await_llm")),
         )
+    with _lock:
+        if listing_id not in _urgent and listing_id not in _queue:
+            _seen.discard(listing_id)

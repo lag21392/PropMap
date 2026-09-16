@@ -85,7 +85,13 @@ force_ssl = 0
 enable_trusted_host_check = 1
 assume_secure_protocol = 0
 proxy_client_headers[] = "HTTP_X_FORWARDED_FOR"
+proxy_host_headers[] = "HTTP_X_FORWARDED_HOST"
 proxy_client_headers[] = "HTTP_X_REAL_IP"
+proxy_ip_read_last_in_list = 1
+proxy_ips[] = "10.0.0.0/8"
+proxy_ips[] = "172.16.0.0/12"
+proxy_ips[] = "192.168.0.0/16"
+proxy_ips[] = "127.0.0.1/32"
 noreply_email_address = "noreply@localhost.local"
 emails_enabled = 0
 enable_update_communication = 0
@@ -145,25 +151,68 @@ function ensure_trusted_hosts(string $file): void
     }
     $raw = (string) file_get_contents($file);
     $needed = ['127.0.0.1:3102', 'localhost:3102', '127.0.0.1', 'localhost', 'matomo'];
+    foreach ([getenv('APP_PUBLIC_URL') ?: '', getenv('MATOMO_PUBLIC_URL') ?: ''] as $url) {
+        $host = parse_url((string) $url, PHP_URL_HOST);
+        if (is_string($host) && $host !== '' && !in_array($host, $needed, true)) {
+            $needed[] = $host;
+        }
+    }
     $missing = [];
     foreach ($needed as $host) {
         if (!str_contains($raw, 'trusted_hosts[] = "' . $host . '"')) {
             $missing[] = $host;
         }
     }
-    if (!$missing) {
-        return;
+    if ($missing) {
+        $block = '';
+        foreach ($missing as $host) {
+            $block .= 'trusted_hosts[] = "' . $host . '"' . "\n";
+        }
+        if (preg_match('/^trusted_hosts\[\] = /m', $raw)) {
+            $raw = preg_replace('/^(trusted_hosts\[\] = .*)$/m', $block . '$1', $raw, 1) ?? $raw;
+        } elseif (str_contains($raw, '[General]')) {
+            $raw = str_replace('[General]', "[General]\n" . rtrim($block), $raw);
+        } else {
+            $raw .= "\n[General]\n" . $block;
+        }
     }
-    $block = '';
-    foreach ($missing as $host) {
-        $block .= 'trusted_hosts[] = "' . $host . '"' . "\n";
+    $public = (string) (getenv('APP_PUBLIC_URL') ?: getenv('MATOMO_PUBLIC_URL') ?: '');
+    if (str_starts_with($public, 'https://') && !preg_match('/^assume_secure_protocol\s*=\s*1\s*$/m', $raw)) {
+        if (preg_match('/^assume_secure_protocol\s*=/m', $raw)) {
+            $raw = preg_replace('/^assume_secure_protocol\s*=\s*.*$/m', 'assume_secure_protocol = 1', $raw) ?? $raw;
+        } elseif (str_contains($raw, '[General]')) {
+            $raw = str_replace('[General]', "[General]\nassume_secure_protocol = 1", $raw);
+        }
     }
-    if (preg_match('/^trusted_hosts\[\] = /m', $raw)) {
-        $raw = preg_replace('/^(trusted_hosts\[\] = .*)$/m', $block . '$1', $raw, 1) ?? $raw;
-    } elseif (str_contains($raw, '[General]')) {
-        $raw = str_replace('[General]', "[General]\n" . rtrim($block), $raw);
+    if (!str_contains($raw, 'proxy_host_headers[]')) {
+        if (str_contains($raw, '[General]')) {
+            $raw = str_replace('[General]', "[General]\nproxy_host_headers[] = \"HTTP_X_FORWARDED_HOST\"", $raw);
+        }
+    }
+    if (!preg_match('/^proxy_ip_read_last_in_list\s*=/m', $raw)) {
+        if (str_contains($raw, '[General]')) {
+            $raw = str_replace('[General]', "[General]\nproxy_ip_read_last_in_list = 1", $raw);
+        }
     } else {
-        $raw .= "\n[General]\n" . $block;
+        $raw = preg_replace('/^proxy_ip_read_last_in_list\s*=\s*.*$/m', 'proxy_ip_read_last_in_list = 1', $raw) ?? $raw;
+    }
+    $proxyIps = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.1/32'];
+    $missingProxy = [];
+    foreach ($proxyIps as $cidr) {
+        if (!str_contains($raw, 'proxy_ips[] = "' . $cidr . '"')) {
+            $missingProxy[] = $cidr;
+        }
+    }
+    if ($missingProxy) {
+        $block = '';
+        foreach ($missingProxy as $cidr) {
+            $block .= 'proxy_ips[] = "' . $cidr . '"' . "\n";
+        }
+        if (preg_match('/^proxy_ips\[\] = /m', $raw)) {
+            $raw = preg_replace('/^(proxy_ips\[\] = .*)$/m', $block . '$1', $raw, 1) ?? $raw;
+        } elseif (str_contains($raw, '[General]')) {
+            $raw = str_replace('[General]', "[General]\n" . rtrim($block), $raw);
+        }
     }
     file_put_contents($file, $raw);
 }
@@ -249,6 +298,11 @@ if ($phase === 'finalize' || $phase === 'all') {
         if ($siteUrl !== 'http://localhost:8000') {
             $urlStmt->execute([$siteId, 'http://localhost:8000']);
         }
+    }
+    $publicApp = rtrim((string) (getenv('APP_PUBLIC_URL') ?: ''), '/');
+    if ($siteId && $publicApp !== '') {
+        $alias = $pdo->prepare('INSERT IGNORE INTO matomo_site_url (idsite, url) VALUES (?, ?)');
+        $alias->execute([$siteId, $publicApp]);
     }
 
     upsert_option($pdo, 'usercountry.location_provider', 'geoip2php');

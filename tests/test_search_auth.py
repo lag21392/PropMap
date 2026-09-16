@@ -24,5 +24,14 @@ def test_rejects_wrong_and_empty(monkeypatch):
 
 def test_rejects_when_password_missing(monkeypatch):
     monkeypatch.delenv("SEARCH_PASSWORD", raising=False)
+    monkeypatch.delenv("MATOMO_PASSWORD", raising=False)
     assert not password_matches("test-secret")
     assert not password_matches("")
+
+
+def test_accepts_matomo_password(monkeypatch):
+    monkeypatch.setenv("SEARCH_PASSWORD", "ops-secret")
+    monkeypatch.setenv("MATOMO_PASSWORD", "matomo-secret")
+    assert password_matches("ops-secret")
+    assert password_matches("matomo-secret")
+    assert not password_matches("nope")

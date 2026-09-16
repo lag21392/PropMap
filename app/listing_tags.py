@@ -69,6 +69,14 @@ def catalog_text(limit: int = 56) -> str:
     return ", ".join(catalog()[:limit])
 
 
+def tags_for_prompt(blob: str, limit: int = 12) -> str:
+    text = fold(blob)
+    if not text:
+        return ""
+    hits = [tag for tag in catalog() if fold(tag) in text]
+    return ", ".join(hits[:limit])
+
+
 def normalize_tag(raw: str) -> str | None:
     text = (raw or "").strip()
     if not text or len(text) > 40:

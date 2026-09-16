@@ -46,12 +46,33 @@ def test_already_downloaded_today_is_skipped():
 
 def test_same_day_old_parser_needs_fetch():
     now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
-    item = _item(
+    zp = _item(
         "1",
+        source="zonaprop",
         details_scraped=True,
         extra={"details_at": now.isoformat(), "details_parser": "6", "detail_price": 100000},
     )
-    assert needs_detail_fetch(item, now=now) is True
+    assert needs_detail_fetch(zp, now=now) is False
+    ap = _item(
+        "2",
+        source="argenprop",
+        details_scraped=True,
+        extra={"details_at": now.isoformat(), "details_parser": "6", "detail_price": 100000},
+    )
+    assert needs_detail_fetch(ap, now=now) is True
+    ap_map = _item(
+        "3",
+        source="argenprop",
+        details_scraped=True,
+        extra={
+            "details_at": now.isoformat(),
+            "details_parser": "6",
+            "detail_price": 100000,
+            "portal_lat": -42.78,
+            "portal_lon": -65.03,
+        },
+    )
+    assert needs_detail_fetch(ap_map, now=now) is False
 
 
 def test_same_day_even_if_price_changed_is_skipped():
@@ -127,3 +148,9 @@ def test_paginate_keeps_going_while_there_are_new_ids():
     assert calls == [1, 2]
     assert "n1" in {x.source_id for x in items}
     assert "never" not in {x.source_id for x in items}
+
+
+def test_page_workers_stay_serial_in_tests():
+    from app.scrapers import page_workers
+
+    assert page_workers() == 1

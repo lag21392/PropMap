@@ -14,7 +14,7 @@ from ..models import Listing
 from ..text_quality import address_quality, clean_portal_address, looks_like_intersection, title_quality
 from . import attach_location_facts, detect_type, parse_number
 
-DETAILS_PARSER = "8"
+DETAILS_PARSER = "9"
 PDF_HREF = re.compile(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', re.I)
 ZP_MAP_LAT = re.compile(
     r"(?:const|let|var)\s+mapLatOf\s*=\s*[\"']([A-Za-z0-9+/=]+)[\"']",
@@ -60,6 +60,57 @@ PROPERATI_MAP = re.compile(
     r"[\s\S]{0,250}?visibility:\s*[\"'](\w+)[\"']",
     re.I,
 )
+AP_MAP_TAG = re.compile(
+    r"<div[^>]*(?:data-location-map|leaflet-container)[^>]*>",
+    re.I,
+)
+AP_LAT = re.compile(r'data-latitude=["\']([^"\']+)["\']', re.I)
+AP_LON = re.compile(r'data-longitude=["\']([^"\']+)["\']', re.I)
+AP_LOCATION_LABEL = re.compile(
+    r'class="location-label"[\s\S]{0,500}?<span>([^<]{6,220})</span>',
+    re.I,
+)
+AP_DESC = re.compile(
+    r"<h2[^>]*>\s*Descripci(?:&oacute;|ó)n\s*</h2>([\s\S]{80,8000}?)(?:<h2|<section)",
+    re.I,
+)
+
+
+GONE_SNIPPETS = (
+    "ya no está disponible",
+    "ya no esta disponible",
+    "publicación finalizada",
+    "publicacion finalizada",
+    "aviso no encontrado",
+    "propiedad no encontrada",
+    "no encontramos esta propiedad",
+    "listing is no longer available",
+    "this listing is no longer",
+    "publicación inactiva",
+    "publicacion inactiva",
+    "este artículo no existe",
+    "este articulo no existe",
+    "el aviso fue dado de baja",
+    "esta publicación fue finalizada",
+    "esta publicacion fue finalizada",
+)
+
+
+def listing_page_is_gone(html: str) -> bool:
+    low = (html or "").lower()
+    if len(low) < 40:
+        return False
+    return any(snip in low for snip in GONE_SNIPPETS)
+
+
+def _drop_gone(item: Listing) -> Listing:
+    extra = dict(item.extra or {})
+    extra["gone"] = True
+    item.extra = extra
+    from ..store import drop_listings
+
+    drop_listings([item.id])
+    return item
 
 
 def enrich_details(item: Listing, should_stop=lambda: False) -> Listing:
@@ -71,11 +122,17 @@ def enrich_details(item: Listing, should_stop=lambda: False) -> Listing:
         return analyze(item)
     try:
         html = fetch_text(item.url)
-    except Exception:
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "404" in msg or "410" in msg:
+            return _drop_gone(item)
         return analyze(item)
+    if listing_page_is_gone(html):
+        return _drop_gone(item)
     _from_zonaprop_state(item, html)
     _from_mercadolibre(item, html)
     _from_properati(item, html)
+    _from_argenprop(item, html)
     _from_json_ld(item, html)
     _from_visible_html(item, html)
     _coords_from_html(item, html)
@@ -130,10 +187,9 @@ def _from_zonaprop_state(item: Listing, html: str) -> None:
         neighborhood = portal_neighborhood(loc.get("neighborhood"), loc.get("barrio"), loc.get("zone"))
         if neighborhood:
             extra_loc = dict(item.extra or {})
+            extra_loc["portal_barrio"] = neighborhood
             extra_loc["barrio"] = neighborhood
             item.extra = extra_loc
-            if item.barrio in {"", "Sin clasificar"}:
-                item.barrio = neighborhood
         expenses = posting.get("expenses") or {}
         amount = parse_number(str(expenses.get("amount") or expenses.get("formattedAmount") or ""))
         extra = dict(item.extra or {})
@@ -249,6 +305,51 @@ def _from_mercadolibre(item: Listing, html: str) -> None:
     item.property_type = detect_type(f"{item.title} {item.address} {item.property_type}", item.property_type or "casa")
 
 
+def _from_argenprop(item: Listing, html: str) -> None:
+    """El mapa de la ficha usa data-latitude/data-longitude con coma decimal argentina."""
+    url = (item.url or "").lower()
+    if item.source != "argenprop" and "argenprop.com" not in url:
+        return
+    tag = ""
+    found = AP_MAP_TAG.search(html or "")
+    if found:
+        tag = found.group(0)
+    lat_m = AP_LAT.search(tag) or AP_LAT.search(html or "")
+    lon_m = AP_LON.search(tag) or AP_LON.search(html or "")
+    extra = dict(item.extra or {})
+    label = AP_LOCATION_LABEL.search(html or "")
+    if label:
+        _set_address(item, unescape(label.group(1)))
+        extra = dict(item.extra or {})
+    desc = AP_DESC.search(html or "")
+    if desc:
+        _set_description(item, desc.group(1))
+    if not (lat_m and lon_m):
+        item.extra = extra
+        return
+    lat, lon = _coord(lat_m.group(1)), _coord(lon_m.group(1))
+    if lat is None or lon is None:
+        item.extra = extra
+        return
+    _set_coords(item, lat, lon)
+    extra = dict(item.extra or {})
+    extra["portal_lat"] = item.lat
+    extra["portal_lon"] = item.lon
+    extra["portal_map"] = "ficha"
+    extra["portal_exact"] = False
+    extra["portal_approx"] = True
+    extra["map_visibility"] = "approximate"
+    item.has_exact_location = False
+    item.extra = extra
+
+
+def _coord(raw) -> float | None:
+    text = str(raw or "").strip().replace(" ", "")
+    if re.fullmatch(r"-?\d{1,3},\d{2,8}", text):
+        text = text.replace(",", ".")
+    return _num(text)
+
+
 def _from_json_ld(item: Listing, html: str) -> None:
     for match in JSON_LD.finditer(html):
         raw = unescape(match.group(1).strip())
@@ -337,17 +438,24 @@ def _from_properati(item: Listing, html: str) -> None:
         extra["map_visibility"] = visibility
     if re.search(r"enableApproximateArea\s*:\s*true", block or html, re.I):
         extra["portal_approx_area"] = True
+    item.extra = extra
     if address:
         _set_address(item, _street_line(address))
+    extra = dict(item.extra or extra)
     if lat and lon:
+        plat, plon = _coord(lat), _coord(lon)
+        if plat is not None and plon is not None:
+            extra["portal_lat"] = plat
+            extra["portal_lon"] = plon
         _set_coords(item, lat, lon)
-        extra["portal_lat"] = item.lat
-        extra["portal_lon"] = item.lon
-        extra["portal_approx"] = visibility != "accurate"
         extra["portal_map"] = "ver_mapa"
-        if extra["portal_approx"]:
+        approx = bool(extra.get("portal_approx_area")) or visibility not in {"accurate", "exact"}
+        extra["portal_approx"] = approx
+        if approx:
             extra["portal_exact"] = False
             item.has_exact_location = False
+        elif visibility in {"accurate", "exact"}:
+            extra["portal_exact"] = True
     item.extra = extra
 
 
@@ -386,6 +494,14 @@ def _coords_from_html(item: Listing, html: str) -> None:
 def _map_widget_coords(html: str) -> tuple[str, str]:
     """Centro del mapa que se ve al tocar Ver mapa: static map, iframe o data-lat."""
     blob = unquote(html or "")
+    tag = AP_MAP_TAG.search(html or "")
+    if tag:
+        lat_m = AP_LAT.search(tag.group(0))
+        lon_m = AP_LON.search(tag.group(0))
+        if lat_m and lon_m:
+            lat, lon = _coord(lat_m.group(1)), _coord(lon_m.group(1))
+            if lat is not None and lon is not None:
+                return str(lat), str(lon)
     for pattern in (MAP_CENTER, MAP_MARKERS, GMAPS_AT, GENERIC_LATLON):
         found = pattern.search(blob) or pattern.search(html or "")
         if found:
@@ -397,7 +513,7 @@ def _map_widget_coords(html: str) -> tuple[str, str]:
 
 
 def _set_coords(item: Listing, lat, lon) -> None:
-    parsed_lat, parsed_lon = _num(lat), _num(lon)
+    parsed_lat, parsed_lon = _coord(lat), _coord(lon)
     if parsed_lat is None or parsed_lon is None:
         return
     if abs(parsed_lat + 38.416) < 0.05 and abs(parsed_lon + 63.616) < 0.05:
@@ -448,7 +564,7 @@ def _set_description(item: Listing, raw: str) -> None:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) > max(80, len(item.description or "")):
-        item.description = text[:2000]
+        item.description = text[:3500]
 
 
 def _js_block(html: str, key: str) -> str:

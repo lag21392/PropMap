@@ -1,29 +1,33 @@
 from __future__ import annotations
 
+import re
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 from .geo import default_city, fold
+from .layout import classify_comp, classify_listing
 from .models import Listing
 from .scoring import USD_FALLBACK, is_catalog_ad, useful_m2
 
-RENT_MODEL_VERSION = "3"
-OCCUPANCY = {}
-TOURIST = {}
+RENT_MODEL_VERSION = "7"
+DEFAULT_OCCUPANCY = 0.45
 MONTHLY_VACANCY = 0.08
 MONTHLY_COST = 0.08
 TEMPORAL_COST = 0.22
 FALLBACK_GROSS = 0.055
 TYPICAL_M2 = {
+    ("departamento", "0"): 28.0,
     ("departamento", "1"): 38.0,
     ("departamento", "2"): 58.0,
     ("departamento", "3+"): 85.0,
     ("departamento", "na"): 50.0,
+    ("casa", "0"): 40.0,
     ("casa", "1"): 60.0,
     ("casa", "2"): 85.0,
     ("casa", "3+"): 130.0,
     ("casa", "na"): 110.0,
+    ("ph", "0"): 35.0,
     ("ph", "1"): 45.0,
     ("ph", "2"): 70.0,
     ("ph", "3+"): 95.0,
@@ -34,14 +38,15 @@ _GENERIC_PLACES = {
     "sin barrio",
     "sin zona",
     "la ciudad",
-    "puerto madryn",
-    "trelew",
-    "rawson",
-    "gaiman",
-    "playa union",
+    "centro",
+    "norte",
+    "sur",
+    "este",
+    "oeste",
     "microcentro",
-    "microcentro caba",
 }
+_EN_SALE_RENT = re.compile(r"\ben\s+(?:venta|alquiler)\s+en\s+(.{3,48})", re.I)
+_PLACE_CUT = re.compile(r"\s+(?:tipo|amoblad|,|\(|de\s+\d|con\s+\d)\b", re.I)
 _model_cache: dict[str, "RentModel"] = {}
 
 
@@ -63,17 +68,19 @@ def infer_period(price_usd: float | None, title: str = "", description: str = ""
         return "nightly"
     if "semana" in blob or "/sem" in blob:
         return "weekly"
+    if hinted in {"nightly", "weekly"} and price_usd and price_usd > 280:
+        return "monthly"
     if hinted == "nightly" and price_usd and price_usd <= 280:
         return "nightly"
-    if hinted == "nightly" and price_usd and price_usd > 280:
-        return "monthly"
+    if hinted == "weekly" and price_usd and price_usd <= 280:
+        return "weekly"
     if price_usd and price_usd <= 180:
         return "nightly"
     return "monthly"
 
 
 def occupancy_for(city: str) -> float:
-    return OCCUPANCY.get(city or default_city(), 0.45)
+    return DEFAULT_OCCUPANCY
 
 
 def _median(values: list[float]) -> float | None:
@@ -90,20 +97,26 @@ def _median(values: list[float]) -> float | None:
 def _beds_bucket(beds: int | None) -> str:
     if beds is None:
         return "na"
-    if beds <= 1:
+    if beds <= 0:
+        return "0"
+    if beds == 1:
         return "1"
     if beds == 2:
         return "2"
     return "3+"
 
 
+def _comp_beds(row: dict) -> str:
+    return classify_comp(row).bucket
+
+
 def _nightly_from_comp(price_usd: float, period: str) -> float | None:
     if period == "nightly":
-        return price_usd
+        return price_usd if 18 <= price_usd <= 220 else None
     if period == "weekly":
+        if price_usd > 220:
+            return None
         return price_usd / 7
-    if period == "monthly" and 200 <= price_usd <= 2500:
-        return None
     return None
 
 
@@ -117,8 +130,15 @@ def _comp_m2(row: dict) -> float | None:
     return None
 
 
-def _generic_name(name: str | None) -> bool:
-    return fold(name or "") in _GENERIC_PLACES or not (name or "").strip()
+def _generic_name(name: str | None, city: str | None = None) -> bool:
+    token = fold(name or "")
+    if not token or token in _GENERIC_PLACES:
+        return True
+    if city:
+        slug = fold((city or "").replace("-", " "))
+        if token == slug or token == fold(_city_label(city)):
+            return True
+    return False
 
 
 def _city_label(city: str) -> str:
@@ -130,14 +150,21 @@ def _city_label(city: str) -> str:
     return (city or "la ciudad").replace("-", " ").title()
 
 
-def _place_name(item: Listing) -> str:
+def _place_name(item: Listing, kind: str = "") -> str:
     barrio = (item.barrio or "").strip()
     zona = (item.zona or "").strip()
-    if not _generic_name(barrio):
+    city = item.city or ""
+    if kind.startswith("local-barrio") and not _generic_name(barrio, city):
         return barrio
-    if not _generic_name(zona):
+    if kind.startswith("local-zona") and not _generic_name(zona, city):
         return zona
-    return _city_label(item.city or "")
+    if kind in {"similar-m2", "local-beds", "local-type", "local-city", ""}:
+        if kind.startswith("local-barrio"):
+            return barrio
+        return _city_label(city)
+    if not _generic_name(barrio, city) and kind.startswith("local"):
+        return barrio
+    return _city_label(city)
 
 
 def _type_word(ptype: str) -> str:
@@ -148,49 +175,82 @@ def _type_word(ptype: str) -> str:
     }.get(ptype or "", "")
 
 
+def _comp_matches_city(row: dict) -> bool:
+    city = (row.get("city") or "").strip()
+    if not city:
+        return True
+    title = row.get("title") or ""
+    match = _EN_SALE_RENT.search(title)
+    if not match:
+        return True
+    place = _PLACE_CUT.split(match.group(1), maxsplit=1)[0].strip(" -.,")
+    if len(place) < 3:
+        return True
+    head = fold(place).split()[:1]
+    if head and head[0] in {"alquiler", "venta", "departamento", "casa", "ph"}:
+        return True
+    try:
+        from .geo import resolve_city, same_place_ids
+
+        cid = resolve_city(place)
+    except Exception:
+        return True
+    if not cid or cid in {"fuera", "otros", "argentina"}:
+        return True
+    return cid == city or cid in (same_place_ids(city) or {city})
+
+
 def _period_rows(comps: list[dict], period: str) -> list[dict]:
+    rows = [row for row in comps if _comp_matches_city(row)]
     if period == "nightly":
         nights = []
-        for row in comps:
+        for row in rows:
             hinted = row.get("period") or "nightly"
-            if hinted not in {"nightly", "weekly"} or not row.get("price_usd"):
+            price = float(row.get("price_usd") or 0)
+            if hinted == "weekly" and price > 280:
                 continue
-            night = _nightly_from_comp(float(row["price_usd"]), hinted)
-            if night and 18 <= night <= 400:
+            if hinted not in {"nightly", "weekly"} or not price:
+                continue
+            night = _nightly_from_comp(price, hinted)
+            if night and 18 <= night <= 220:
                 nights.append({**row, "price_usd": night, "period": "nightly"})
         return nights
-    return [
-        row
-        for row in comps
-        if row.get("period") == "monthly" and row.get("price_usd") and 80 <= float(row["price_usd"]) <= 3500
-    ]
+    monthly = []
+    for row in rows:
+        hinted = row.get("period") or "monthly"
+        try:
+            price = float(row.get("price_usd") or 0)
+        except (TypeError, ValueError):
+            continue
+        if hinted == "weekly" and price > 280:
+            hinted = "monthly"
+        if hinted == "monthly" and 80 <= price <= 2500:
+            monthly.append({**row, "period": "monthly", "price_usd": price})
+    return _trim_rent_outliers(monthly)
+
+
+def _trim_rent_outliers(rows: list[dict]) -> list[dict]:
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for row in rows:
+        groups[(row.get("city") or "", row.get("property_type") or "")].append(row)
+    keep: list[dict] = []
+    for items in groups.values():
+        prices = [float(row["price_usd"]) for row in items]
+        if len(prices) < 8:
+            keep.extend(items)
+            continue
+        med = statistics.median(prices)
+        lo, hi = med * 0.35, med * 2.2
+        keep.extend(row for row in items if lo <= float(row["price_usd"]) <= hi)
+    return keep
 
 
 def infer_beds(item: Listing) -> int | None:
-    if item.bedrooms and item.bedrooms > 0:
-        return int(item.bedrooms)
-    if item.rooms and item.rooms >= 2:
-        return max(1, int(item.rooms) - 1)
-    m2 = useful_m2(item)
-    if not m2:
-        return None
-    if item.property_type == "departamento":
-        if m2 < 40:
-            return 1
-        if m2 < 65:
-            return 2
-        return 3
-    if m2 < 60:
-        return 1
-    if m2 < 90:
-        return 2
-    return 3
+    return classify_listing(item).beds
 
 
 def infer_m2(item: Listing, typical: float | None = None) -> float | None:
     raw = useful_m2(item)
-    if raw and typical and not (0.45 * typical <= raw <= 2.2 * typical):
-        return typical
     if raw:
         return raw
     return typical
@@ -227,6 +287,10 @@ class PeriodSlice:
     city_type_beds: dict[str, float] = field(default_factory=dict)
     barrio: dict[str, float] = field(default_factory=dict)
     zona: dict[str, float] = field(default_factory=dict)
+    barrio_type: dict[str, float] = field(default_factory=dict)
+    barrio_type_beds: dict[str, float] = field(default_factory=dict)
+    zona_type: dict[str, float] = field(default_factory=dict)
+    zona_type_beds: dict[str, float] = field(default_factory=dict)
     unit_type: dict[str, float] = field(default_factory=dict)
     city_unit: dict[str, float] = field(default_factory=dict)
     typical_m2: dict[str, float] = field(default_factory=dict)
@@ -241,6 +305,8 @@ class RentModel:
     sale_m2: dict[str, float]
     ref_sale_m2: float | None
     cities_with_rent: set[str]
+    monthly_rows: list[dict] = field(default_factory=list)
+    nightly_rows: list[dict] = field(default_factory=list)
 
 
 def _fill_slice(rows: list[dict]) -> PeriodSlice:
@@ -252,7 +318,7 @@ def _fill_slice(rows: list[dict]) -> PeriodSlice:
         price = float(row["price_usd"])
         city = row.get("city") or ""
         ptype = row.get("property_type") or ""
-        beds = _beds_bucket(row.get("bedrooms"))
+        beds = _comp_beds(row)
         barrio = (row.get("barrio") or "").strip()
         zona = (row.get("zona") or "").strip()
         buckets["all"].append(price)
@@ -264,10 +330,16 @@ def _fill_slice(rows: list[dict]) -> PeriodSlice:
         if city and ptype:
             buckets[f"ct:{city}|{ptype}"].append(price)
             buckets[f"ctb:{city}|{ptype}|{beds}"].append(price)
-        if city and not _generic_name(barrio):
+        if city and not _generic_name(barrio, city):
             buckets[f"b:{city}|{barrio}"].append(price)
-        if city and not _generic_name(zona):
+            if ptype:
+                buckets[f"bt:{city}|{barrio}|{ptype}"].append(price)
+                buckets[f"btb:{city}|{barrio}|{ptype}|{beds}"].append(price)
+        if city and not _generic_name(zona, city):
             buckets[f"z:{city}|{zona}"].append(price)
+            if ptype:
+                buckets[f"zt:{city}|{zona}|{ptype}"].append(price)
+                buckets[f"ztb:{city}|{zona}|{ptype}|{beds}"].append(price)
         m2 = _comp_m2(row)
         if m2:
             m2_buckets[f"{ptype}|{beds}"].append(m2)
@@ -278,13 +350,14 @@ def _fill_slice(rows: list[dict]) -> PeriodSlice:
 
     def take(prefix: str, dest: dict[str, float], min_n: int) -> None:
         for key, values in buckets.items():
-            if not key.startswith(prefix):
+            head, _, tail = key.partition(":")
+            if f"{head}:" != prefix:
                 continue
             if len(values) < min_n:
                 continue
             med = _median(values)
             if med:
-                dest[key.split(":", 1)[1]] = med
+                dest[tail] = med
                 slice_.counts[key] = len(values)
 
     take("c:", slice_.city_median, 2)
@@ -294,6 +367,10 @@ def _fill_slice(rows: list[dict]) -> PeriodSlice:
     take("ctb:", slice_.city_type_beds, 2)
     take("b:", slice_.barrio, 2)
     take("z:", slice_.zona, 2)
+    take("bt:", slice_.barrio_type, 2)
+    take("btb:", slice_.barrio_type_beds, 2)
+    take("zt:", slice_.zona_type, 2)
+    take("ztb:", slice_.zona_type_beds, 2)
     for key, values in unit_buckets.items():
         med = _median(values)
         if not med or len(values) < 2:
@@ -317,8 +394,10 @@ def comps_fingerprint(comps: list[dict], sale_m2: dict[str, float]) -> str:
 
 def build_rent_model(comps: list[dict], sale_m2: dict[str, float] | None = None) -> RentModel:
     sale_m2 = {key: value for key, value in (sale_m2 or {}).items() if value}
-    monthly = _fill_slice(_period_rows(comps, "monthly"))
-    nightly = _fill_slice(_period_rows(comps, "nightly"))
+    monthly_rows = _period_rows(comps, "monthly")
+    nightly_rows = _period_rows(comps, "nightly")
+    monthly = _fill_slice(monthly_rows)
+    nightly = _fill_slice(nightly_rows)
     cities_with_rent = set(monthly.city_median)
     ref_sales = [sale_m2[city] for city in cities_with_rent if city in sale_m2]
     return RentModel(
@@ -328,6 +407,8 @@ def build_rent_model(comps: list[dict], sale_m2: dict[str, float] | None = None)
         sale_m2=sale_m2,
         ref_sale_m2=_median(ref_sales),
         cities_with_rent=set(monthly.city_median),
+        monthly_rows=monthly_rows,
+        nightly_rows=nightly_rows,
     )
 
 
@@ -358,42 +439,147 @@ def _city_scale(model: RentModel, item: Listing) -> tuple[float, str]:
     return 1.0, ""
 
 
-def _predict_period(model: RentModel, item: Listing, period: str) -> tuple[float | None, str, int]:
-    slice_ = model.monthly if period == "monthly" else model.nightly
+def _spread(values: list[float]) -> tuple[float | None, float | None, float | None]:
+    clean = sorted(v for v in values if v and v > 0)
+    if not clean:
+        return None, None, None
+    mid = _median(clean)
+    if len(clean) == 1:
+        return mid, mid, mid
+    lo_i = int((len(clean) - 1) * 0.25)
+    hi_i = int((len(clean) - 1) * 0.75)
+    return clean[lo_i], mid, clean[hi_i]
+
+
+def _similar_rows(rows: list[dict], item: Listing, bucket: str) -> list[dict]:
     city = item.city or ""
     ptype = item.property_type or ""
-    beds = infer_beds(item)
-    bucket = _beds_bucket(beds)
+    m2 = useful_m2(item)
+    same: list[dict] = []
+    for row in rows:
+        if city and (row.get("city") or "") != city:
+            continue
+        if ptype and (row.get("property_type") or "") != ptype:
+            continue
+        if _comp_beds(row) != bucket:
+            continue
+        same.append(row)
+    if not m2 or len(same) < 3:
+        return same
+    lo, hi = m2 * 0.7, m2 * 1.3
+    sized = [row for row in same if (cm := _comp_m2(row)) and lo <= cm <= hi]
+    return sized if len(sized) >= 3 else same
+
+
+def _predict_period(model: RentModel, item: Listing, period: str) -> tuple[float | None, str, int, dict]:
+    slice_ = model.monthly if period == "monthly" else model.nightly
+    rows = model.monthly_rows if period == "monthly" else model.nightly_rows
+    city = item.city or ""
+    ptype = item.property_type or ""
+    layout = classify_listing(item)
+    bucket = layout.bucket
+    beds = layout.beds
+    barrio = (item.barrio or "").strip()
+    zona = (item.zona or "").strip()
     observed_m2 = slice_.typical_m2.get(f"{ptype}|{bucket}") or slice_.typical_m2.get(ptype)
-    typical = observed_m2 or TYPICAL_M2.get((ptype, bucket))
+    catalog_m2 = TYPICAL_M2.get((ptype, bucket))
+    typical = observed_m2 or catalog_m2
     listing_m2 = infer_m2(item, typical)
     scale, scale_note = _city_scale(model, item)
     local = city in slice_.city_median
+    meta: dict = {"layout": layout.label, "conflict": layout.conflict, "confidence": layout.confidence}
 
-    candidates: list[tuple[float, int, str]] = []
-    keys = [
-        (slice_.city_type_beds.get(f"{city}|{ptype}|{bucket}"), slice_.counts.get(f"ctb:{city}|{ptype}|{bucket}", 0), "local-beds"),
-        (slice_.city_type.get(f"{city}|{ptype}"), slice_.counts.get(f"ct:{city}|{ptype}", 0), "local-type"),
-        (slice_.city_median.get(city), slice_.counts.get(f"c:{city}", 0), "local-city"),
-        (slice_.type_beds.get(f"{ptype}|{bucket}"), slice_.counts.get(f"tb:{ptype}|{bucket}", 0), "global-beds"),
-        (slice_.type_median.get(ptype), slice_.counts.get(f"t:{ptype}", 0), "global-type"),
-    ]
-    for rent, n, kind in keys:
-        if rent:
-            candidates.append((rent, n, kind))
+    similar = _similar_rows(rows, item, bucket)
+    similar_prices = [float(row["price_usd"]) for row in similar if row.get("price_usd")]
+    sized = False
+    if listing_m2 and len(similar) >= 3:
+        lo_m, hi_m = listing_m2 * 0.7, listing_m2 * 1.3
+        sized = sum(1 for row in similar if (cm := _comp_m2(row)) and lo_m <= cm <= hi_m) >= 3
 
     est = None
     n = 0
     kind = ""
-    if local:
-        for rent, count, label in candidates:
-            if label.startswith("local"):
-                est, n, kind = rent, count, label
-                break
-    if est is None and candidates:
-        est, n, kind = candidates[0]
-        if kind.startswith("global"):
-            est *= scale
+    if similar_prices and len(similar_prices) >= 3 and (layout.conflict or sized):
+        est = _median(similar_prices)
+        n = len(similar_prices)
+        kind = "similar-m2"
+        lo, _mid, hi = _spread(similar_prices)
+        meta["lo"] = lo
+        meta["hi"] = hi
+    elif similar_prices and len(similar_prices) < 3:
+        est = _median(similar_prices)
+        n = len(similar_prices)
+        kind = "local-beds"
+        lo, _mid, hi = _spread(similar_prices)
+        meta["lo"] = lo
+        meta["hi"] = hi
+
+    if est is None:
+        candidates: list[tuple[float, int, str]] = []
+        keys: list[tuple[float | None, int, str]] = []
+        if city and ptype and not _generic_name(barrio, city):
+            keys.append(
+                (
+                    slice_.barrio_type_beds.get(f"{city}|{barrio}|{ptype}|{bucket}"),
+                    slice_.counts.get(f"btb:{city}|{barrio}|{ptype}|{bucket}", 0),
+                    "local-barrio-beds",
+                )
+            )
+        if city and ptype and not _generic_name(zona, city):
+            keys.append(
+                (
+                    slice_.zona_type_beds.get(f"{city}|{zona}|{ptype}|{bucket}"),
+                    slice_.counts.get(f"ztb:{city}|{zona}|{ptype}|{bucket}", 0),
+                    "local-zona-beds",
+                )
+            )
+        keys.append(
+            (
+                slice_.city_type_beds.get(f"{city}|{ptype}|{bucket}"),
+                slice_.counts.get(f"ctb:{city}|{ptype}|{bucket}", 0),
+                "local-beds",
+            )
+        )
+        if not layout.conflict and city and ptype and not _generic_name(barrio, city):
+            keys.append(
+                (
+                    slice_.barrio_type.get(f"{city}|{barrio}|{ptype}"),
+                    slice_.counts.get(f"bt:{city}|{barrio}|{ptype}", 0),
+                    "local-barrio-type",
+                )
+            )
+        if not layout.conflict and city and ptype and not _generic_name(zona, city):
+            keys.append(
+                (
+                    slice_.zona_type.get(f"{city}|{zona}|{ptype}"),
+                    slice_.counts.get(f"zt:{city}|{zona}|{ptype}", 0),
+                    "local-zona-type",
+                )
+            )
+        keys.extend(
+            [
+                (
+                    slice_.city_type.get(f"{city}|{ptype}"),
+                    slice_.counts.get(f"ct:{city}|{ptype}", 0),
+                    "local-type",
+                ),
+                (slice_.city_median.get(city), slice_.counts.get(f"c:{city}", 0), "local-city"),
+                (slice_.type_beds.get(f"{ptype}|{bucket}"), slice_.counts.get(f"tb:{ptype}|{bucket}", 0), "global-beds"),
+                (slice_.type_median.get(ptype), slice_.counts.get(f"t:{ptype}", 0), "global-type"),
+            ]
+        )
+        for rent, count, label in keys:
+            if rent:
+                candidates.append((rent, count, label))
+        if local:
+            for rent, count, label in candidates:
+                if label.startswith("local"):
+                    est, n, kind = rent, count, label
+                    break
+        if est is None and candidates:
+            est, n, kind = candidates[0]
+            if kind.startswith("global"):
+                est *= scale
 
     if est is None and period == "monthly" and item.price_usd:
         est = item.price_usd * FALLBACK_GROSS / 12
@@ -403,65 +589,116 @@ def _predict_period(model: RentModel, item: Listing, period: str) -> tuple[float
             est *= scale
 
     if est is None:
-        return None, "", 0
+        return None, "", 0, meta
 
-    place = _place_name(item)
-    if city and not _generic_name(item.barrio):
-        barrio_med = slice_.barrio.get(f"{city}|{item.barrio.strip()}")
+    used_place = kind.startswith("local-barrio") or kind.startswith("local-zona")
+    if kind != "similar-m2" and not used_place and city and not _generic_name(barrio, city) and not layout.conflict:
+        barrio_med = slice_.barrio_type.get(f"{city}|{barrio}|{ptype}") or slice_.barrio.get(f"{city}|{barrio}")
         city_ref = slice_.city_type.get(f"{city}|{ptype}") or slice_.city_median.get(city)
-        if barrio_med and city_ref:
-            est *= min(1.22, max(0.82, barrio_med / city_ref))
-            n = max(n, slice_.counts.get(f"b:{city}|{item.barrio.strip()}", 0))
-    elif city and not _generic_name(item.zona):
-        zona_med = slice_.zona.get(f"{city}|{item.zona.strip()}")
+        n_place = max(
+            slice_.counts.get(f"bt:{city}|{barrio}|{ptype}", 0),
+            slice_.counts.get(f"b:{city}|{barrio}", 0),
+        )
+        if barrio_med and city_ref and n_place >= 3:
+            est *= min(1.14, max(0.86, barrio_med / city_ref))
+            n = max(n, n_place)
+    elif kind != "similar-m2" and not used_place and city and not _generic_name(zona, city) and not layout.conflict:
+        zona_med = slice_.zona_type.get(f"{city}|{zona}|{ptype}") or slice_.zona.get(f"{city}|{zona}")
         city_ref = slice_.city_type.get(f"{city}|{ptype}") or slice_.city_median.get(city)
-        if zona_med and city_ref:
-            est *= min(1.22, max(0.82, zona_med / city_ref))
+        n_place = max(
+            slice_.counts.get(f"zt:{city}|{zona}|{ptype}", 0),
+            slice_.counts.get(f"z:{city}|{zona}", 0),
+        )
+        if zona_med and city_ref and n_place >= 3:
+            est *= min(1.14, max(0.86, zona_med / city_ref))
 
-    unit = slice_.city_unit.get(f"{city}|{ptype}") or slice_.unit_type.get(ptype)
-    if listing_m2 and unit and kind != "yield":
-        unit_adj = unit * listing_m2
-        if kind.startswith("global"):
-            unit_adj *= scale
-        est = 0.55 * unit_adj + 0.45 * est
-    elif listing_m2 and observed_m2 and kind != "yield":
-        est *= min(1.40, max(0.72, (listing_m2 / observed_m2) ** 0.65))
+    skip_scale = kind == "similar-m2" and sized
+    ref_m2 = observed_m2 or typical
+    if bucket == "0" and catalog_m2:
+        ref_m2 = max(ref_m2 or 0, catalog_m2)
+    if listing_m2 and ref_m2 and kind != "yield" and not skip_scale:
+        ratio = listing_m2 / ref_m2
+        cap = 1.18 if bucket == "0" else 1.32
+        floor = 0.80 if bucket == "0" else 0.72
+        est *= min(cap, max(floor, ratio ** (0.32 if bucket == "0" else 0.4)))
+
+    if kind != "similar-m2":
+        bucket_cap = None
+        if city and ptype and not _generic_name(barrio, city):
+            bucket_cap = slice_.barrio_type_beds.get(f"{city}|{barrio}|{ptype}|{bucket}")
+        if bucket_cap is None and city and ptype and not _generic_name(zona, city):
+            bucket_cap = slice_.zona_type_beds.get(f"{city}|{zona}|{ptype}|{bucket}")
+        if bucket_cap is None:
+            bucket_cap = slice_.city_type_beds.get(f"{city}|{ptype}|{bucket}") or slice_.city_type.get(f"{city}|{ptype}")
+        if bucket_cap and kind != "yield":
+            if kind.startswith("global"):
+                bucket_cap *= scale
+            est = min(bucket_cap * 1.38, max(bucket_cap * 0.70, est))
 
     blob = fold(f"{item.title} {item.description} {' '.join((item.extra or {}).get('amenities') or [])}")
-    if item.parking or "cochera" in blob:
-        est *= 1.04
-    if "pileta" in blob or "piscina" in blob:
-        est *= 1.06 if period == "nightly" else 1.03
-    if item.barrio in TOURIST.get(city, set()):
-        est *= 1.06 if period == "nightly" else 1.02
-    if item.age_years and item.age_years >= 40:
-        est *= 0.95
-    if item.bathrooms and item.bathrooms >= 3 and (beds or 0) >= 3:
-        est *= 1.03
+    if not layout.conflict:
+        if item.parking or "cochera" in blob:
+            est *= 1.03
+        if "pileta" in blob or "piscina" in blob:
+            est *= 1.04 if period == "nightly" else 1.02
+        if item.age_years and item.age_years >= 40:
+            est *= 0.95
+        if item.bathrooms and item.bathrooms >= 3 and (beds or 0) >= 3:
+            est *= 1.02
 
     if period == "nightly":
-        est = min(400.0, max(18.0, est))
+        est = min(220.0, max(18.0, est))
     else:
-        est = min(3500.0, max(80.0, est))
+        est = min(2200.0, max(80.0, est))
 
+    if similar_prices and "lo" not in meta:
+        lo, _mid, hi = _spread(similar_prices)
+        if lo and hi:
+            meta["lo"] = round(lo, 2)
+            meta["hi"] = round(hi, 2)
+    if meta.get("lo") is None:
+        meta["lo"] = round(est * (0.82 if n < 5 or layout.conflict else 0.9), 2)
+        meta["hi"] = round(est * (1.18 if n < 5 or layout.conflict else 1.1), 2)
+
+    conf = layout.confidence
+    if n < 3 or layout.conflict:
+        conf = "low"
+    elif n < 8:
+        conf = "medium" if conf == "high" else conf
+    meta["confidence"] = conf
+    meta["kind"] = kind
+
+    place = _place_name(item, kind)
+    if kind == "similar-m2":
+        names = {
+            (row.get("barrio") or "").strip()
+            for row in similar
+            if not _generic_name((row.get("barrio") or "").strip(), city)
+        }
+        if len(names) == 1:
+            place = next(iter(names))
     bits = [place]
     kind_word = _type_word(ptype)
     if kind_word:
         bits.append(kind_word)
-    if beds:
-        bits.append(f"{bucket} dorm")
+    bits.append(layout.label)
     if listing_m2:
         bits.append(f"{listing_m2:.0f} m²")
     if scale_note and kind.startswith("global"):
         bits.append(scale_note)
     if kind == "yield":
         bits.append("por precio de venta")
-    return round(est, 2), "según " + ", ".join(bits), n
+    if layout.conflict:
+        bits.append("señales mixtas")
+    return round(est, 2), "según " + ", ".join(bits), n, meta
 
 
-def estimate_rent(comps: list[dict], item: Listing, period: str, sale_m2: dict[str, float] | None = None) -> tuple[float | None, str, int]:
+def estimate_rent(
+    comps: list[dict], item: Listing, period: str, sale_m2: dict[str, float] | None = None
+) -> tuple[float | None, str, int]:
     model = build_rent_model(comps, sale_m2)
-    return _predict_period(model, item, period)
+    rent, scope, n, _meta = _predict_period(model, item, period)
+    return rent, scope, n
 
 
 def pick_comp(comps: list[dict], item: Listing, period: str) -> tuple[float | None, str, int]:
@@ -525,14 +762,14 @@ def apply_yields(
             continue
         city = item.city or default_city()
         occ = occupancy_for(city)
-        month, month_scope, month_n = _predict_period(model, item, "monthly")
-        night, night_scope, night_n = _predict_period(model, item, "nightly")
+        month, month_scope, month_n, month_meta = _predict_period(model, item, "monthly")
+        night, night_scope, night_n, night_meta = _predict_period(model, item, "nightly")
         if month and not night:
-            night = round(min(400.0, max(18.0, night_from_month(month, occ))), 2)
+            night = round(min(220.0, max(18.0, night_from_month(month, occ))), 2)
             night_scope = month_scope + " · derivado del contrato"
             night_n = month_n
         elif night and not month:
-            month = round(min(3500.0, max(80.0, month_from_night(night, occ))), 2)
+            month = round(min(2200.0, max(80.0, month_from_night(night, occ))), 2)
             month_scope = night_scope + " · derivado del temporal"
             month_n = night_n
         monthly_yield = None
@@ -558,14 +795,22 @@ def apply_yields(
                 "rental_night_scope": night_scope,
                 "rental_month_n": month_n,
                 "rental_night_n": night_n,
+                "monthly_rent_lo": month_meta.get("lo"),
+                "monthly_rent_hi": month_meta.get("hi"),
+                "rent_confidence": month_meta.get("confidence") or night_meta.get("confidence") or "",
+                "layout_label": month_meta.get("layout") or "",
+                "layout_conflict": bool(month_meta.get("conflict")),
                 "rent_fp": fp,
                 "rent_model_version": RENT_MODEL_VERSION,
             }
         )
         item.extra = extra
         dirty.append(item)
-    if persist and dirty:
-        store.update_extras(dirty)
+    from .profile import apply_profiles
+
+    apply_profiles(listings)
+    if persist:
+        store.update_extras(listings)
         store.set_meta("rent_model_version", RENT_MODEL_VERSION)
         store.set_meta("rent_model_fp", model.fingerprint)
     return listings
@@ -585,6 +830,11 @@ def _empty_yield() -> dict:
         "rental_night_scope": "",
         "rental_month_n": 0,
         "rental_night_n": 0,
+        "monthly_rent_lo": None,
+        "monthly_rent_hi": None,
+        "rent_confidence": "",
+        "layout_label": "",
+        "layout_conflict": False,
     }
 
 
@@ -606,11 +856,7 @@ def rental_score(
     if temporal_yield is not None:
         score += max(-16, min(30, (temporal_yield - 8) * 2.6))
         reasons.append(f"temporal neto ~{temporal_yield:.1f}% anual (ocupación {round(occ * 100)}%)")
-    city = item.city or default_city()
-    if item.barrio in TOURIST.get(city, set()):
-        score += 7
-        reasons.append(f"zona demandada para turistas ({item.barrio})")
-    beds = item.bedrooms
+    beds = classify_listing(item).beds
     m2 = useful_m2(item)
     if item.property_type == "departamento" and beds in {1, 2}:
         score += 6
@@ -665,7 +911,7 @@ def yield_stats(listings: list[Listing], comps: list[dict] | None = None) -> dic
         for row in city_comps
         if row.get("period") in {"nightly", "weekly"} and row.get("price_usd")
     ]
-    nights = [n for n in nights if 18 <= n <= 400]
+    nights = [n for n in nights if 18 <= n <= 220]
     myields = [float((item.extra or {}).get("monthly_yield_pct") or 0) for item in listings if (item.extra or {}).get("monthly_yield_pct")]
     tyields = [float((item.extra or {}).get("temporal_yield_pct") or 0) for item in listings if (item.extra or {}).get("temporal_yield_pct")]
     recommended = sum(1 for item in listings if ((item.extra or {}).get("rental_score") or 0) >= 62)

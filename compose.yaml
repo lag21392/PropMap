@@ -23,22 +23,31 @@ services:
       SEARCH_PASSWORD: "${SEARCH_PASSWORD}"
       APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
       AUTH_SECRET: "${AUTH_SECRET:-}"
-      AUTH_DEV_SHOW_LINK: "${AUTH_DEV_SHOW_LINK:-1}"
+      AUTH_DEV_SHOW_LINK: "${AUTH_DEV_SHOW_LINK:-0}"
       SMTP_HOST: "${SMTP_HOST:-propmap-mail}"
       SMTP_PORT: "${SMTP_PORT:-1025}"
       SMTP_TLS: "${SMTP_TLS:-0}"
       SMTP_USER: "${SMTP_USER:-}"
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
-      SMTP_FROM: "${SMTP_FROM:-PropMap <cuenta@propmap.local>}"
-      MAIL_ADDRESS: "${MAIL_ADDRESS:-cuenta@propmap.local}"
+      SMTP_FROM: "${SMTP_FROM:-PropMap <no-reply@propmaplag.duckdns.org>}"
+      MAIL_ADDRESS: "${MAIL_ADDRESS:-no-reply@propmaplag.duckdns.org}"
       MAIL_UI_URL: "${MAIL_UI_URL:-http://127.0.0.1:7500}"
       LLM_URL: "${LLM_URL:-http://propmap-llm:8080}"
-      LLM_MODEL: "${LLM_MODEL:-qwen35-9b-iq2xxs}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-local}"
+      LLM_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
       LLM_WORKERS: "${LLM_WORKERS:-1}"
+      LLM_CTX: "${LLM_CTX:-2048}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       OLLAMA_URL: "${LLM_URL:-http://propmap-llm:8080}"
-      OLLAMA_MODEL: "${LLM_MODEL:-qwen35-9b-iq2xxs}"
+      OLLAMA_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
+      TOR_ENABLED: "${TOR_ENABLED:-1}"
+      TOR_SOCKS: "${TOR_SOCKS:-socks5h://tor:9050}"
+      TOR_CIRCUITS: "${TOR_CIRCUITS:-4}"
+      SCRAPE_PROXIES: "${SCRAPE_PROXIES:-}"
+      SCRAPE_USE_LOCAL: "${SCRAPE_USE_LOCAL:-0}"
       MATOMO_INTERNAL_URL: "${MATOMO_INTERNAL_URL}"
       MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL}"
+      MATOMO_SITE_ID: "${MATOMO_SITE_ID:-1}"
       MATOMO_USER: "${MATOMO_USER}"
       MATOMO_PASSWORD: "${MATOMO_PASSWORD}"
       MATOMO_EMAIL: "${MATOMO_EMAIL}"
@@ -52,23 +61,45 @@ services:
     depends_on:
       - matomo
       - propmap-mail
+      - tor
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)",
+          "import sys,time; from pathlib import Path; p=Path('/app/data/heartbeat'); sys.exit(0 if p.is_file() and time.time()-p.stat().st_mtime<12 else 1)",
         ]
-      interval: 30s
-      timeout: 5s
+      interval: 10s
+      timeout: 3s
       retries: 3
-      start_period: 20s
+      start_period: 35s
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+  # SOCKS interno (9050). No publicar al host: el scrape habla por TOR_SOCKS.
+  tor:
+    image: ghcr.io/oorabona/tor:latest
+    container_name: propmap-tor
+    restart: unless-stopped
+    environment:
+      TZ: America/Argentina/Buenos_Aires
+      SOCKS_BIND: "0.0.0.0"
+      SOCKS_PORT: "9050"
+    volumes:
+      - tor-data:/var/lib/tor
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"
 
   matomo-db:
     image: mariadb:lts
@@ -108,7 +139,7 @@ services:
     volumes:
       - matomo-html:/var/www/html
     ports:
-      - "3102:80"
+      - "127.0.0.1:3102:80"
 
   matomo-cron:
     image: matomo:latest
@@ -136,6 +167,8 @@ services:
       MATOMO_DATABASE_PASSWORD: "${MATOMO_DB_PASSWORD}"
       MATOMO_DATABASE_DBNAME: "${MATOMO_DB_NAME}"
       MATOMO_DATABASE_TABLES_PREFIX: matomo_
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
+      MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL:-}"
     depends_on:
       matomo-db:
         condition: service_healthy
@@ -178,12 +211,18 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      LLM_MODEL: "${LLM_MODEL:-qwen35-9b-iq2xxs}"
+      LLM_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
       LLM_PARALLEL: "${LLM_PARALLEL:-1}"
-      LLM_CTX: "${LLM_CTX:-4096}"
+      LLM_CTX: "${LLM_CTX:-2048}"
       LLM_CACHE_TYPE: "${LLM_CACHE_TYPE:-q8_0}"
       LLM_THREADS: "${LLM_THREADS:-1}"
+      LLM_BATCH: "${LLM_BATCH:-512}"
+      LLM_UBATCH: "${LLM_UBATCH:-256}"
+      LLM_FIT: "${LLM_FIT:-on}"
+      LLM_FIT_TARGET: "${LLM_FIT_TARGET:-64}"
       MODEL_DIR: /models
+      MODEL_FILE: "${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
+      MODEL_URL: "${MODEL_URL:-https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf}"
     volumes:
       - ./data/llm:/models
       - ./scripts/llm-serve.sh:/init/serve.sh:ro
@@ -192,7 +231,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 20
-      start_period: 180s
+      start_period: 300s
     logging:
       driver: json-file
       options:
@@ -203,3 +242,4 @@ volumes:
   matomo-db:
   matomo-html:
   mailpit:
+  tor-data:

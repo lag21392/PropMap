@@ -47,3 +47,63 @@ def test_parallel_waits_do_not_multiply_cooldown():
     elapsed = time.time() - started
     assert elapsed < 5.0
     assert elapsed >= 1.3
+
+
+def test_note_http_403_pauses_host_for_minutes():
+    crawl.reset()
+    try:
+        crawl.note_http(403, "www.zonaprop.com.ar")
+        assert crawl.host_paused("www.zonaprop.com.ar")
+        assert crawl.snapshot()["wait_s"] >= 12 * 60 - 1
+        assert not crawl.host_paused("www.argenprop.com")
+    finally:
+        crawl.reset()
+
+
+def test_note_http_401_is_short_pause():
+    crawl.reset()
+    try:
+        crawl.note_http(401, "www.properati.com.ar")
+        assert crawl.snapshot()["wait_s"] < 40
+        assert crawl.host_paused("www.properati.com.ar")
+    finally:
+        crawl.reset()
+
+
+def test_host_paused_false_when_idle():
+    crawl.reset()
+    from app.http_client import reset_fetch_state
+
+    reset_fetch_state()
+    try:
+        assert not crawl.host_paused("www.zonaprop.com.ar")
+    finally:
+        crawl.reset()
+
+
+def test_403_on_one_lane_does_not_pause_another():
+    crawl.reset()
+    try:
+        crawl.note_http(403, "www.zonaprop.com.ar", lane="direct")
+        assert crawl.host_paused("www.zonaprop.com.ar", lane="direct")
+        assert crawl.cooling("www.zonaprop.com.ar", "direct")
+        assert not crawl.host_paused("www.zonaprop.com.ar", lane="tor")
+        assert not crawl.cooling("www.zonaprop.com.ar", "tor")
+        started = time.time()
+        crawl.wait(host="www.zonaprop.com.ar", lane="tor")
+        assert time.time() - started < 1.6
+    finally:
+        crawl.reset()
+
+
+def test_short_pacing_is_not_cooling():
+    crawl.reset()
+    try:
+        crawl.backoff(0.5, "www.argenprop.com", lane="direct")
+        assert crawl.host_paused("www.argenprop.com", lane="direct")
+        assert not crawl.cooling("www.argenprop.com", "direct")
+        rows = crawl.busy_rows()
+        assert any(row["lane"] == "direct" and row["host"] == "www.argenprop.com" for row in rows)
+        assert all(not row["cooling"] for row in rows if row["host"] == "www.argenprop.com")
+    finally:
+        crawl.reset()

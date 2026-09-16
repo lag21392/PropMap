@@ -127,8 +127,7 @@ def _parse(raw: dict, fallback_type: str, city: str) -> Listing | None:
         extra["photos"] = photo_urls[:24]
     if neighborhood:
         extra["barrio"] = neighborhood
-        if neighborhood and neighborhood.lower() not in address.lower():
-            address = f"{address}, {neighborhood}" if address else neighborhood
+        extra["portal_barrio"] = neighborhood
     if visibility:
         extra["map_visibility"] = visibility
         if visibility in {"exact", "accurate"}:

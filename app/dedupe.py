@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import re
+import time
 from urllib.parse import urlparse
 
 from .geo import distance_km, fold, parse_street, same_place_ids
 from .models import SOURCE_LABELS, Listing
 from .text_quality import address_quality, title_quality
 
-DEDUPE_VERSION = "1"
+DEDUPE_VERSION = "2"
+NEAR_EXACT_M = 90.0
+NEAR_APPROX_M = 180.0
 _PHOTO_SKIP = ("unsplash.com", "placeholder", "data:image", "gravatar")
 _SIZE_SUFFIX = re.compile(r"[-_]\d{2,4}x\d{2,4}")
 _EXT = re.compile(r"\.(?:jpe?g|png|webp|gif|avif).*$", re.I)
@@ -80,10 +83,32 @@ def collapse_duplicates(items: list[Listing]) -> list[Listing]:
             parent[b] = a
 
     ordered = list(visible)
-    for i, left in enumerate(ordered):
-        for right in ordered[i + 1 :]:
-            if _same_cluster(left, right):
-                union(left.id, right.id)
+    buckets: dict[str, list[Listing]] = {}
+    for item in ordered:
+        for key in photo_keys(item):
+            buckets.setdefault(f"p:{key}", []).append(item)
+        if item.fingerprint:
+            buckets.setdefault(f"f:{item.fingerprint}", []).append(item)
+        street, num = parse_street(f"{item.address or ''} {item.title or ''}")
+        if street and num:
+            buckets.setdefault(f"s:{fold(street)}:{int(num)}", []).append(item)
+
+    seen: set[tuple[str, str]] = set()
+    compared = 0
+    for group in buckets.values():
+        if len(group) < 2:
+            continue
+        for i, left in enumerate(group):
+            for right in group[i + 1 :]:
+                pair = (left.id, right.id) if left.id < right.id else (right.id, left.id)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                compared += 1
+                if compared % 250 == 0:
+                    time.sleep(0)
+                if _same_cluster(left, right):
+                    union(left.id, right.id)
 
     groups: dict[str, list[Listing]] = {}
     for item in visible:
@@ -125,6 +150,9 @@ def _same_cluster(left: Listing, right: Listing) -> bool:
         return False
     if _conflicting_unit(left, right):
         return False
+    photos = bool(photo_keys(left) & photo_keys(right))
+    if photos and _near_pins(left, right):
+        return True
     return _match_score(left, right) >= 7
 
 
@@ -213,9 +241,10 @@ def _same_publisher(left: Listing, right: Listing) -> bool:
 def _near_pins(left: Listing, right: Listing) -> bool:
     if left.lat is None or left.lon is None or right.lat is None or right.lon is None:
         return False
-    if not left.has_exact_location or not right.has_exact_location:
-        return False
-    return distance_km(left.lat, left.lon, right.lat, right.lon) * 1000 <= 80
+    meters = distance_km(left.lat, left.lon, right.lat, right.lon) * 1000
+    if left.has_exact_location and right.has_exact_location:
+        return meters <= NEAR_EXACT_M
+    return meters <= NEAR_APPROX_M
 
 
 def _floor(item: Listing):

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PropMap · cómo está armado</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="preconnect" href="https://unpkg.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui29" />
+</head>
+<body class="flujo-page">
+  <header class="flujo-head">
+    <p class="ops-kicker">Administración</p>
+    <h1>Cómo está armado PropMap</h1>
+    <p>
+      Tres lecturas del sistema, generadas por librerías: el flujo lo acomoda
+      <strong>elkjs</strong>, el DER lo dibuja <strong>Mermaid</strong> leyendo el SQLite real,
+      y los módulos salen de los <code>import</code> de <code>app/</code>.
+    </p>
+      <p><a href="/admin">Mapa</a> · <a href="/tablero">Scrape</a> · <a href="/stats">Matomo</a></p>
+  </header>
+  <p id="flujoStatus" class="flujo-status">Cargando el mapa del sistema…</p>
+  <nav class="flujo-tabs" role="tablist" aria-label="Vistas del sistema" hidden>
+    <button type="button" role="tab" id="tab-flow" aria-selected="true" aria-controls="pane-flow" data-tab="flow">Flujo de datos</button>
+    <button type="button" role="tab" id="tab-er" aria-selected="false" aria-controls="pane-er" data-tab="er">DER · tablas</button>
+    <button type="button" role="tab" id="tab-mod" aria-selected="false" aria-controls="pane-mod" data-tab="mod">Módulos Python</button>
+  </nav>
+  <section id="pane-flow" class="flujo-pane" role="tabpanel" data-pane="flow">
+    <p class="flujo-lead">De qué portal entra cada aviso y por dónde llega al mapa.</p>
+    <div class="flujo-stage">
+      <svg id="flujoSvg" role="img" aria-label="Flujo de datos de PropMap"></svg>
+    </div>
+  </section>
+  <section id="pane-er" class="flujo-pane" role="tabpanel" data-pane="er" hidden>
+    <p class="flujo-lead">Entidades y relaciones del SQLite. Mermaid arma el DER; las FK que no están declaradas se infieren por columnas <code>*_id</code>.</p>
+    <div id="erStage" class="flujo-stage flujo-er"></div>
+  </section>
+  <section id="pane-mod" class="flujo-pane" role="tabpanel" data-pane="mod" hidden>
+    <p class="flujo-lead">Quién importa a quién dentro de <code>app/</code>. Sirve para ver acoplamiento antes de recortar o cachear.</p>
+    <div class="flujo-stage">
+      <svg id="modSvg" role="img" aria-label="Módulos Python de PropMap"></svg>
+    </div>
+  </section>
+  <aside id="flujoNote" class="flujo-note" hidden></aside>
+  <script src="https://unpkg.com/elkjs@0.12.0/lib/elk.bundled.js"></script>
+  <script src="https://unpkg.com/mermaid@11.6.0/dist/mermaid.min.js"></script>
+  <script src="/static/flujo.js?v=5"></script>
+</body>
+</html>

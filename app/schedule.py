@@ -77,6 +77,9 @@ def note_search(city_id: str | None) -> str:
     return cid
 
 
+VIEW_SAVE_SEC = 90
+
+
 def note_view(city_id: str | None) -> str:
     load()
     cid = _canon(city_id)
@@ -85,10 +88,15 @@ def note_view(city_id: str | None) -> str:
     now = _now()
     with _lock:
         row = _row(cid)
+        prev = row.get("last_view") or ""
         row["last_view"] = now
+        due_changed = False
         if not row.get("due_since") and _is_due_locked(cid, row, time.time()):
             row["due_since"] = now
-        _save_locked()
+            due_changed = True
+        age = _age_sec(prev, time.time())
+        if due_changed or age is None or age >= VIEW_SAVE_SEC:
+            _save_locked()
     return cid
 
 
@@ -134,36 +142,56 @@ def set_listing_counts(counts: dict[str, int]) -> None:
         _save_locked()
 
 
+def forget(city_id: str | None) -> str:
+    load()
+    cid = _canon(city_id)
+    if not cid or cid in SKIP:
+        return ""
+    with _lock:
+        _demand.pop(cid, None)
+        _save_locked()
+    return cid
+
+
 def searched_ids() -> list[str]:
     load()
     with _lock:
         return [cid for cid, row in _demand.items() if cid not in SKIP and int(row.get("searches") or 0) > 0]
 
 
+def viewed_ids() -> list[str]:
+    load()
+    with _lock:
+        return [cid for cid, row in _demand.items() if cid not in SKIP and row.get("last_view")]
+
+
 def pool_ids() -> list[str]:
     load()
-    from .geo import CITIES
-    from .listings_cache import cached_city_ids
-    from .places import listed_cities, load_custom_places
+    from .geo import DEFAULT_CITY
+    from .places import is_cache_artifact_id, listed_place_ids, load_custom_places, scrape_place_ok
 
     load_custom_places()
-    ids: set[str] = {COUNTRY_ID}
-    with _lock:
-        ids.update(cid for cid in _demand if cid not in SKIP)
-    for cid in cached_city_ids():
-        canon = _canon(cid)
-        if canon:
-            ids.add(canon)
-    if len(ids) <= 1:
-        for row in listed_cities([]):
-            canon = _canon(row.get("id"))
-            if canon:
-                ids.add(canon)
-    for cid in CITIES:
-        canon = _canon(cid)
-        if canon and (_row_get(canon).get("searches") or _row_get(canon).get("listings")):
-            ids.add(canon)
-    return sorted(ids)
+    ids: set[str] = {COUNTRY_ID, DEFAULT_CITY}
+    ids.update(listed_place_ids())
+    home = home_scrape_id()
+    if home:
+        ids.add(home)
+    return sorted(
+        cid
+        for cid in ids
+        if cid and cid not in SKIP and not is_cache_artifact_id(cid) and (cid == COUNTRY_ID or scrape_place_ok(cid))
+    )
+
+
+def home_scrape_id() -> str:
+    """Primer lugar de prioridad (Puerto Madryn, resuelto por API/catálogo)."""
+    try:
+        from .places import priority_place_ids
+
+        ids = priority_place_ids()
+    except Exception:
+        return ""
+    return ids[0] if ids else ""
 
 
 def score(city_id: str, now: float | None = None) -> float:
@@ -172,12 +200,13 @@ def score(city_id: str, now: float | None = None) -> float:
     if not cid:
         return -1.0
     now = now or time.time()
+    home = home_scrape_id()
     with _lock:
-        return _score_locked(cid, _row(cid), now)
+        return _score_locked(cid, _row(cid), now, home=home)
 
 
 def next_jobs(running: set[str] | None = None, slots: int = 1) -> list[tuple[str, bool]]:
-    """Devuelve (city_id, fast) sin inanición: un cupo va al que más espera."""
+    """Devuelve (city_id, fast). Si nadie venció, igual arranca el más viejo."""
     load()
     running = { _canon(cid) for cid in (running or set()) if _canon(cid) }
     slots = max(0, int(slots))
@@ -185,6 +214,7 @@ def next_jobs(running: set[str] | None = None, slots: int = 1) -> list[tuple[str
         return []
     now = time.time()
     ids = _canon_pool(pool_ids())
+    home = home_scrape_id()
     candidates: list[str] = []
     with _lock:
         for cid in ids:
@@ -197,14 +227,31 @@ def next_jobs(running: set[str] | None = None, slots: int = 1) -> list[tuple[str
                 row["due_since"] = _now()
             candidates.append(cid)
         if not candidates:
-            return []
+            rest = [cid for cid in ids if cid not in running]
+            local = [cid for cid in rest if cid != COUNTRY_ID]
+            pool = local or rest
+            if not pool:
+                return []
+
+            def _age_key(cid: str) -> float:
+                age = _age_sec(_row(cid).get("last_complete"), now)
+                return 10**12 if age is None else age
+
+            pool.sort(key=_age_key, reverse=True)
+            keep = pool[:slots]
+            for cid in keep:
+                if not _row(cid).get("due_since"):
+                    _row(cid)["due_since"] = _now()
+            candidates = keep
         picks: list[str] = []
-        starved = [cid for cid in candidates if _wait_sec_locked(_row(cid), now) >= STARVE_SEC]
+        if home and home in candidates:
+            picks.append(home)
+        starved = [cid for cid in candidates if cid not in picks and _wait_sec_locked(_row(cid), now) >= STARVE_SEC]
         if starved:
             starved.sort(key=lambda cid: -_wait_sec_locked(_row(cid), now))
             picks.append(starved[0])
         rest = [cid for cid in candidates if cid not in picks]
-        rest.sort(key=lambda cid: _score_locked(cid, _row(cid), now), reverse=True)
+        rest.sort(key=lambda cid: _score_locked(cid, _row(cid), now, home=home), reverse=True)
         picks.extend(rest)
         chosen = picks[:slots]
         out = [(cid, _want_fast_locked(cid, _row(cid), now)) for cid in chosen]
@@ -222,6 +269,7 @@ def queue_public(running: set[str] | None = None, limit: int = 8) -> list[dict]:
     running = { _canon(cid) for cid in (running or set()) if _canon(cid) }
     now = time.time()
     ids = _canon_pool(pool_ids())
+    home = home_scrape_id()
     rows = []
     with _lock:
         for cid in ids:
@@ -231,7 +279,7 @@ def queue_public(running: set[str] | None = None, limit: int = 8) -> list[dict]:
                 {
                     "id": cid,
                     "label": _label(cid),
-                    "score": round(_score_locked(cid, row, now), 2),
+                    "score": round(_score_locked(cid, row, now, home=home), 2),
                     "searches": int(row.get("searches") or 0),
                     "listings": int(row.get("listings") or 0),
                     "due": due,
@@ -239,6 +287,7 @@ def queue_public(running: set[str] | None = None, limit: int = 8) -> list[dict]:
                     "wait_s": int(_wait_sec_locked(row, now)) if due or cid in running else 0,
                     "fast": _want_fast_locked(cid, row, now),
                     "country": cid == COUNTRY_ID,
+                    "home": cid == home,
                 }
             )
     rows.sort(key=lambda item: (-item["running"], -item["score"], item["label"]))
@@ -322,7 +371,7 @@ def _recency(age: float | None, half_life: float) -> float:
     return 0.5 ** (age / half_life)
 
 
-def _score_locked(city_id: str, row: dict, now: float) -> float:
+def _score_locked(city_id: str, row: dict, now: float, *, home: str = "") -> float:
     searches = int(row.get("searches") or 0)
     listings = int(row.get("listings") or 0)
     search_age = _age_sec(row.get("last_search"), now)
@@ -338,7 +387,10 @@ def _score_locked(city_id: str, row: dict, now: float) -> float:
         important += 3.5
     stale = 10.0 if complete_age is None else complete_age / 86400.0
     aging = (wait / (6 * HOUR)) * 3.0
-    return 5.0 * demand + 1.2 * important + 1.5 * stale + aging
+    base = 5.0 * demand + 1.2 * important + 1.5 * stale + aging
+    if home and city_id == home and _is_due_locked(city_id, row, now):
+        base += 80.0
+    return base
 
 
 def _want_fast_locked(city_id: str, row: dict, now: float) -> bool:

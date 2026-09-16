@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
-import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,12 +11,13 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import store
 from .listings_cache import start_warmup
-from .pipeline import add_manual, edit_listing, listings_payload, refresh, request_pause, set_slow_crawl, start_background_scraper, status
-from .places import ensure_place, load_custom_places, public_place, search_places
+from .pipeline import add_manual, listings_payload, refresh, request_pause, set_slow_crawl, start_background_scraper, status
+from .places import load_custom_places, place_from_suggestion, public_place, search_places
 from .search_auth import require_search_password
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,40 +26,113 @@ STATIC = ROOT / "static"
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    from anyio.to_thread import current_default_thread_limiter
+
+    current_default_thread_limiter().total_tokens = max(
+        64, current_default_thread_limiter().total_tokens
+    )
     store.init()
     load_custom_places()
     if os.environ.get("PROPMAP_TEST") != "1":
         start_warmup()
         start_background_scraper()
+        from .watchdog import start as start_watchdog
+
+        start_watchdog()
         from .matomo import start_matomo_sync
 
         start_matomo_sync()
     yield
 
 
-class SecureHeaders(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "img-src 'self' data: blob: https://*.openstreetmap.org https://tile.openstreetmap.org https: http://127.0.0.1:3102 http://localhost:3102; "
-            "style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
-            "script-src 'self' https://unpkg.com; "
-            "connect-src 'self' https://unpkg.com; "
-            "frame-ancestors 'none'"
-        )
-        return response
+_CSP = (
+    "default-src 'self'; "
+    "img-src 'self' data: blob: https://*.openstreetmap.org https://tile.openstreetmap.org https: http://127.0.0.1:3102 http://localhost:3102; "
+    "style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "script-src 'self' https://unpkg.com; "
+    "connect-src 'self' https://unpkg.com; "
+    "frame-ancestors 'none'"
+)
+
+
+def _stats_is_asset(path: str, query: str) -> bool:
+    if "module=Proxy" in query:
+        return True
+    return path.endswith((".js", ".css", ".png", ".svg", ".jpg", ".woff", ".woff2", ".ico"))
+
+
+class SecureHeaders:
+    """Cabeceras en el start del response. No lee el cuerpo: un JSON de avisos no puede clavar la portada."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+
+        async def send_with_headers(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["X-Frame-Options"] = "DENY"
+                headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+                headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+                if path.startswith("/stats"):
+                    query = (scope.get("query_string") or b"").decode("latin-1")
+                    headers["X-Frame-Options"] = "SAMEORIGIN"
+                    headers["Content-Security-Policy"] = (
+                        "default-src 'self'; "
+                        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+                        "style-src 'self' 'unsafe-inline' data:; "
+                        "img-src 'self' data: blob: https:; "
+                        "font-src 'self' data:; "
+                        "connect-src 'self'; "
+                        "frame-src 'self'; "
+                        "frame-ancestors 'self'"
+                    )
+                    if not _stats_is_asset(path, query):
+                        headers["Cache-Control"] = "no-store"
+                else:
+                    headers["Content-Security-Policy"] = _CSP
+                if path.startswith("/static/"):
+                    headers.setdefault("Cache-Control", "public, max-age=604800, immutable")
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+class CachedStatic(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers.setdefault("Cache-Control", "public, max-age=604800, immutable")
+        return resp
+
+
+class SkipListingsGZip:
+    """No comprimir /api/listings en el pedido: el gzip ya está precocinado en disco."""
+
+    def __init__(self, app: ASGIApp, minimum_size: int = 800):
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = str(scope.get("path") or "")
+        if scope.get("type") == "http" and (
+            path.startswith("/api/listings") or path == "/api/alive"
+        ):
+            await self.app(scope, receive, send)
+            return
+        await self.gzip(scope, receive, send)
 
 
 app = FastAPI(title="PropMap", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(SecureHeaders)
-app.add_middleware(GZipMiddleware, minimum_size=800)
-app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+app.add_middleware(SkipListingsGZip, minimum_size=800)
+app.mount("/static", CachedStatic(directory=str(STATIC)), name="static")
 
 
 class TrackIn(BaseModel):
@@ -156,6 +231,11 @@ class LoginIn(BaseModel):
     password: str = ""
 
 
+class ResendIn(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
 class DeleteAccountIn(BaseModel):
     password: str = ""
     confirm: str = ""
@@ -163,6 +243,12 @@ class DeleteAccountIn(BaseModel):
 
 class PinsImportIn(BaseModel):
     pins: dict = Field(default_factory=dict)
+
+
+class AdminStatsIn(BaseModel):
+    password: str = ""
+    days: int = 14
+    client: dict = Field(default_factory=dict)
 
 
 @app.get("/api/config")
@@ -182,6 +268,7 @@ def public_config() -> dict:
 
 
 @app.get("/matomo.js")
+@app.get("/q/l.js")
 def matomo_script() -> Response:
     from .matomo import script_response
 
@@ -189,6 +276,7 @@ def matomo_script() -> Response:
 
 
 @app.api_route("/matomo.php", methods=["GET", "POST"])
+@app.api_route("/q/l", methods=["GET", "POST"])
 async def matomo_tracker(request: Request) -> Response:
     from .matomo import proxy_tracker
 
@@ -197,10 +285,10 @@ async def matomo_tracker(request: Request) -> Response:
 
 
 def _html_page(request: Request) -> FileResponse:
-    from .analytics import record, stamp_cookie, visitor_from_request
+    from .analytics import record_later, stamp_cookie, visitor_from_request
 
     vid = visitor_from_request(request)
-    record(
+    record_later(
         {
             "n": "pageview",
             "p": request.url.path,
@@ -211,13 +299,23 @@ def _html_page(request: Request) -> FileResponse:
         ua=request.headers.get("user-agent") or "",
         header_ref=request.headers.get("referer") or "",
     )
+    from .matomo import queue_visit
+
+    queue_visit(
+        request,
+        vid=vid,
+        path=request.url.path,
+        referrer=request.headers.get("referer") or "",
+        query=request.url.query,
+        name="pageview",
+    )
     response = FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
     stamp_cookie(response, vid)
     return response
 
 
 @app.get("/")
-def index(request: Request) -> FileResponse:
+async def index(request: Request) -> FileResponse:
     return _html_page(request)
 
 
@@ -225,36 +323,31 @@ def index(request: Request) -> FileResponse:
 @app.get("/privacidad")
 @app.get("/terminos")
 @app.get("/aviso")
-def legal_page() -> FileResponse:
+async def legal_page() -> FileResponse:
     return FileResponse(STATIC / "legal.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/verificar")
-def verify_email(token: str = Query("")) -> RedirectResponse:
-    from .accounts import verify_token
+def verify_email(request: Request, token: str = Query("")) -> RedirectResponse:
+    from .accounts import create_session, stamp_session, verify_token
 
     if not token:
         return RedirectResponse("/?cuenta=falta", status_code=302)
     try:
-        verify_token(token)
+        user = verify_token(token)
     except HTTPException:
         return RedirectResponse("/?cuenta=error", status_code=302)
-    return RedirectResponse("/?cuenta=ok", status_code=302)
+    response = RedirectResponse("/?cuenta=ok", status_code=302)
+    stamp_session(response, create_session(user.id), request)
+    return response
 
 
 @app.post("/api/auth/register")
 def auth_register(payload: RegisterIn, request: Request) -> JSONResponse:
-    from .accounts import login, public_account, register, stamp_session
+    from .accounts import register
 
     data = register(payload.username, payload.email, payload.password, payload.accept_terms, request)
-    try:
-        user, token = login(payload.username, payload.password, request)
-        data["user"] = public_account(user)
-        response = JSONResponse(data)
-        stamp_session(response, token, request)
-        return response
-    except HTTPException:
-        return JSONResponse(data)
+    return JSONResponse(data)
 
 
 @app.post("/api/auth/login")
@@ -279,18 +372,33 @@ def auth_logout(request: Request) -> JSONResponse:
 @app.get("/api/auth/me")
 def auth_me(request: Request) -> dict:
     from .accounts import optional_user, public_account
+    from .analytics import visitor_from_request
+    from .matomo import queue_visit
 
+    queue_visit(
+        request,
+        vid=visitor_from_request(request),
+        path="/",
+        referrer=request.headers.get("referer") or "",
+        name="pageview",
+    )
     user = optional_user(request)
-    if not user:
+    if not user or not user.email_verified:
         return {"user": None}
     return {"user": public_account(user)}
 
 
 @app.post("/api/auth/resend")
-def auth_resend(request: Request) -> dict:
-    from .accounts import require_user, resend_verification
+def auth_resend(request: Request, payload: ResendIn | None = None) -> dict:
+    from .accounts import optional_user, resend_verification, resend_with_password
 
-    return resend_verification(require_user(request))
+    body = payload or ResendIn()
+    user = optional_user(request)
+    if user:
+        return resend_verification(user, request)
+    if body.username and body.password:
+        return resend_with_password(body.username, body.password, request)
+    raise HTTPException(401, "Entrá con tu usuario y contraseña para reenviar el mail")
 
 
 @app.post("/api/auth/delete")
@@ -313,8 +421,116 @@ def auth_import_pins(payload: PinsImportIn, request: Request) -> dict:
 
 
 @app.get("/admin")
-def admin(request: Request) -> FileResponse:
+async def admin(request: Request) -> FileResponse:
     return _html_page(request)
+
+
+@app.get("/flujo")
+async def flujo_page() -> FileResponse:
+    return FileResponse(STATIC / "flujo.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/tablero")
+async def tablero_page(request: Request) -> Response:
+    from .matomo_gate import has_access, login_page
+
+    if not has_access(request):
+        return login_page(next_url="/tablero")
+    return FileResponse(
+        STATIC / "tablero.html",
+        headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"},
+    )
+
+
+def _stamp_ops_if_password(request: Request, password: str, data: dict):
+    from .matomo_gate import _stamp, has_access
+    from .search_auth import password_matches
+
+    if password_matches(password) and not has_access(request):
+        return _stamp(JSONResponse(data), request)
+    return data
+
+
+def _require_ops(request: Request, password: str = "") -> None:
+    from .matomo_gate import has_access
+    from .search_auth import password_matches
+
+    if has_access(request):
+        return
+    got = (password or "").strip() or (request.headers.get("x-propmap-ops") or "")
+    if password_matches(got):
+        return
+    raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+
+
+@app.get("/api/ops")
+async def ops_dashboard(request: Request) -> dict:
+    _require_ops(request)
+    from .ops import dashboard
+
+    return await asyncio.to_thread(dashboard)
+
+
+@app.post("/api/ops")
+async def ops_dashboard_post(payload: AdminStatsIn, request: Request) -> dict:
+    _require_ops(request, payload.password)
+    from .ops import dashboard
+
+    data = await asyncio.to_thread(dashboard)
+    return _stamp_ops_if_password(request, payload.password, data)
+
+
+@app.get("/api/ops/metrics")
+def ops_metrics(request: Request) -> Response:
+    _require_ops(request)
+    from .ops import prometheus
+
+    return Response(prometheus(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.post("/api/lineage")
+def lineage_graph(payload: AdminStatsIn, request: Request) -> dict:
+    from .matomo_gate import has_access
+
+    if not has_access(request):
+        require_search_password(payload.password)
+    from .lineage import blueprint
+
+    return _stamp_ops_if_password(request, payload.password, blueprint())
+
+
+@app.get("/stats")
+async def stats_root(request: Request) -> Response:
+    from .matomo_gate import has_access, login_page
+
+    if not has_access(request):
+        return login_page()
+    return RedirectResponse("/stats/", status_code=308)
+
+
+@app.get("/stats/")
+async def stats_home(request: Request) -> Response:
+    from .matomo_gate import has_access, login_page, proxy
+
+    if not has_access(request):
+        return login_page()
+    return await proxy(request, "")
+
+
+@app.post("/stats/login")
+async def stats_login(request: Request) -> Response:
+    from .matomo_gate import handle_login
+
+    return await handle_login(request)
+
+
+@app.api_route("/stats/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def stats_proxy(path: str, request: Request) -> Response:
+    from .matomo_gate import handle_login, proxy
+
+    if path == "login":
+        return await handle_login(request)
+    return await proxy(request, path)
 
 
 @app.get("/px.gif")
@@ -338,6 +554,15 @@ def tracking_pixel(request: Request, p: str = "/") -> Response:
         ua=request.headers.get("user-agent") or "",
         header_ref=request.headers.get("referer") or "",
     )
+    from .matomo import queue_visit
+
+    queue_visit(
+        request,
+        vid=vid,
+        path=path[:180],
+        referrer=request.headers.get("referer") or "",
+        name="pageview",
+    )
     response = Response(content=PIXEL_GIF, media_type="image/gif")
     response.headers["Cache-Control"] = "no-store"
     stamp_cookie(response, vid)
@@ -356,46 +581,135 @@ def track_event(payload: TrackIn, request: Request) -> JSONResponse:
     if not data.get("q"):
         data["q"] = request.url.query
     record(data, ua=request.headers.get("user-agent") or "", header_ref=request.headers.get("referer") or "")
+    from .matomo import queue_visit
+
+    queue_visit(
+        request,
+        vid=vid,
+        path=str(data.get("p") or "/"),
+        referrer=str(data.get("r") or ""),
+        query=str(data.get("q") or ""),
+        name=str(data.get("n") or "pageview"),
+    )
     response = JSONResponse({"ok": True})
     stamp_cookie(response, vid)
     return response
 
 
-class AdminStatsIn(BaseModel):
-    password: str = ""
-    days: int = 14
+def _with_timing(name: str, t0: float, result, extra: dict | None = None):
+    from .http_timing import note
+
+    ms = (time.perf_counter() - t0) * 1000
+    note(name, ms, extra)
+    if isinstance(result, dict):
+        result = JSONResponse(result)
+    if isinstance(result, Response):
+        result.headers["Server-Timing"] = f"{name};dur={ms:.1f}"
+    return result
 
 
 @app.post("/api/admin/stats")
 def admin_stats(payload: AdminStatsIn) -> dict:
     require_search_password(payload.password)
     from .analytics import summary
+    from .http_timing import snapshot
 
-    return summary(payload.days)
+    data = summary(payload.days)
+    data["perf"] = snapshot()
+    if payload.client:
+        data["client_perf"] = payload.client
+    return data
+
+
+def _wants_gzip(request: Request) -> bool:
+    return "gzip" in (request.headers.get("accept-encoding") or "").lower()
 
 
 @app.get("/api/listings")
-def listings(request: Request, live: bool = Query(False), city: str = Query(""), since: int = Query(-1)):
+def listings(
+    request: Request,
+    live: bool = Query(False),
+    city: str = Query(""),
+    since: int = Query(-1),
+    pins: bool = Query(False),
+):
     from .accounts import optional_user, overlay_pins
-    from .listings_cache import disk_response_bytes
+    from .jsoncodec import gunzip_bytes, loads as json_loads
+    from .listings_cache import listings_body, listings_pins_body, request_city_bytes, unchanged_listings, warming_payload
 
+    t0 = time.perf_counter()
+    extra = {"city": city or "", "pins": int(bool(pins))}
     user = optional_user(request)
-    if not user:
-        raw = disk_response_bytes(city or None)
-        if raw:
-            if city and not live:
-                from .pipeline import _kick_llm_enrich
+    request_city_bytes(city or None)
+    from .http_timing import note
 
-                _kick_llm_enrich(city)
-            return Response(content=raw, media_type="application/json")
-    data = listings_payload(live=live, city=city or None, since=None if since < 0 else since)
-    encoded = data.pop("encoded", None)
+    note("listings.warm", (time.perf_counter() - t0) * 1000, extra)
+    want_gzip = (not user) and _wants_gzip(request)
+    if pins:
+        raw, encoding = listings_pins_body(city or None, gzip=want_gzip)
+        if raw:
+            headers = {"Cache-Control": "public, max-age=45, stale-while-revalidate=120"}
+            if encoding:
+                headers["Content-Encoding"] = encoding
+                headers["Vary"] = "Accept-Encoding"
+            return _with_timing("listings", t0, Response(content=raw, media_type="application/json", headers=headers), extra)
+        return _with_timing("listings", t0, warming_payload(city or None), extra)
+    if not user:
+        stale = unchanged_listings(city or None, since)
+        if stale:
+            return _with_timing("listings", t0, Response(content=stale, media_type="application/json"), extra)
+    raw, encoding = listings_body(city or None, gzip=want_gzip)
+    if raw:
+        if user:
+            body = gunzip_bytes(raw) if encoding == "gzip" else raw
+            data = json_loads(body)
+            data["listings"] = overlay_pins(data.get("listings") or [], user)
+            data["live"] = bool(live)
+            return _with_timing("listings", t0, data, extra)
+        headers = {"Cache-Control": "public, max-age=45, stale-while-revalidate=120"}
+        if encoding:
+            headers["Content-Encoding"] = encoding
+            headers["Vary"] = "Accept-Encoding"
+        return _with_timing("listings", t0, Response(content=raw, media_type="application/json", headers=headers), extra)
     if user:
+        data = listings_payload(live=live, city=city or None, since=None if since < 0 else since)
+        data.pop("encoded", None)
         data["listings"] = overlay_pins(data.get("listings") or [], user)
-        return data
-    if encoded:
-        return Response(content=encoded, media_type="application/json")
-    return data
+        return _with_timing("listings", t0, data, extra)
+    return _with_timing("listings", t0, warming_payload(city or None), extra)
+
+
+@app.get("/api/pois")
+def pois(city: str = Query(""), summary: bool = Query(True)) -> dict:
+    from .osm_poi import CAT_LABEL, city_pois, ensure_city_pois, origin_for_city, pending
+
+    cid = (city or "").strip()
+    ensure_city_pois(cid, blocking=False)
+    cats = city_pois(cid)
+    origin = origin_for_city(cid) if cid else None
+    payload = {
+        "city": cid,
+        "pending": pending(cid),
+        "origin": {"lat": origin[0], "lon": origin[1]} if origin else None,
+        "labels": CAT_LABEL,
+        "counts": {key: len(cats.get(key) or []) for key in cats},
+    }
+    if not summary:
+        payload["categories"] = cats
+    return payload
+
+
+@app.get("/api/near")
+def near(
+    city: str = Query(""),
+    lat: float = Query(...),
+    lon: float = Query(...),
+    listing_id: str = Query(""),
+) -> dict:
+    """Cercanías del pin. El proceso de fondo las guarda; acá se leen."""
+    from .access import near_payload
+
+    return near_payload(listing_id=listing_id, city=city, lat=lat, lon=lon)
 
 
 @app.get("/api/places")
@@ -409,26 +723,29 @@ def places(q: str = Query("", min_length=0)) -> dict:
 def pick_place(payload: PlaceIn) -> dict:
     store.init()
     load_custom_places()
-    city_id = ensure_place(
-        payload.city,
-        query=payload.query or payload.city,
-        label=payload.label,
-        lat=payload.lat,
-        lon=payload.lon,
-        province=payload.province,
-    )
-    from .pipeline import maybe_daily_refresh
-    from .schedule import note_search
+    try:
+        city_id = place_from_suggestion(
+            payload.city,
+            query=payload.query or payload.city,
+            label=payload.label,
+            lat=payload.lat,
+            lon=payload.lon,
+            province=payload.province,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    from .pipeline import refresh
 
-    note_search(city_id)
-    threading.Thread(target=maybe_daily_refresh, daemon=True, name="kick-schedule").start()
-    return {"ok": True, "city": public_place(city_id)}
+    status = refresh(city_id, fast=True, interactive=True)
+    from .pipeline import eta_minutes
+
+    return {"ok": True, "city": public_place(city_id), "eta_min": eta_minutes(city_id), **status}
 
 
 @app.get("/api/status")
-def scrape_status() -> dict:
-    store.init()
-    return status()
+def scrape_status():
+    t0 = time.perf_counter()
+    return _with_timing("status", t0, status())
 
 
 @app.post("/api/refresh")
@@ -436,15 +753,18 @@ def scrape_now(payload: RefreshIn = RefreshIn()) -> dict:
     require_search_password(payload.password)
     store.init()
     load_custom_places()
-    city_id = ensure_place(
-        payload.city,
-        query=payload.query or payload.city,
-        label=payload.label,
-        lat=payload.lat,
-        lon=payload.lon,
-        province=payload.province,
-    )
-    return {**refresh(city_id, fast=True), "city": city_id, "place": public_place(city_id)}
+    try:
+        city_id = place_from_suggestion(
+            payload.city,
+            query=payload.query or payload.city,
+            label=payload.label,
+            lat=payload.lat,
+            lon=payload.lon,
+            province=payload.province,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**refresh(city_id, fast=True, interactive=True), "city": city_id, "place": public_place(city_id)}
 
 
 @app.post("/api/crawl")
@@ -477,41 +797,74 @@ def pin(payload: PinIn, request: Request) -> dict:
     return {"ok": True, **saved}
 
 
+@app.get("/api/favorites-report")
+def favorites_report(request: Request) -> Response:
+    from .accounts import favorite_entries, require_user
+    from .fav_report import MAX_FAVORITES, build_report
+
+    user = require_user(request, verified=True)
+    store.init()
+    entries, total = favorite_entries(user, MAX_FAVORITES)
+    if not entries:
+        raise HTTPException(400, "No tenés favoritos para armar el reporte")
+    rows: list[dict] = []
+    for listing_id, pin in entries:
+        item = store.get_listing(listing_id)
+        public = item.to_public_dict() if item else {
+            "id": listing_id,
+            "title": "Este aviso ya no está en el mapa",
+            "url": "",
+        }
+        public["notes"] = str(pin.get("notes") or "")[:2000]
+        public["contacted"] = bool(pin.get("contacted"))
+        public["favorite"] = True
+        rows.append(public)
+    pdf = build_report(rows, username=user.username, total=total)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="favoritos-propmap.pdf"'},
+    )
+
+
 @app.post("/api/listing")
 def listing_edit(payload: ListingEditIn, request: Request) -> dict:
-    from .accounts import require_user, save_pin
+    from .accounts import overlay_pins, require_user, save_pin
+    from .store import EDIT_FIELDS
 
     user = require_user(request, verified=True)
     store.init()
     body = payload.model_dump(exclude_unset=True)
+    listing_id = str(body.pop("id") or "")
     notes = body.pop("notes", None)
     contacted = body.pop("contacted", None)
-    item = None
+    edits = {key: body[key] for key in EDIT_FIELDS if key in body}
     try:
-        if any(k != "id" for k in body):
-            item = edit_listing(body)
-        if notes is not None or contacted is not None:
-            save_pin(user, payload.id, notes=notes, contacted=contacted)
-    except ValueError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        save_pin(
+            user,
+            listing_id,
+            notes=notes,
+            contacted=contacted,
+            edits=edits or None,
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+    item = store.get_listing(listing_id)
     if item is None:
-        return {"ok": True, "id": payload.id, "notes": notes or "", "contacted": bool(contacted)}
-    public = item.to_public_dict()
-    if notes is not None:
-        public["notes"] = notes
-    if contacted is not None:
-        public["contacted"] = bool(contacted)
+        raise HTTPException(404, "No está ese aviso")
+    public = overlay_pins([item.to_public_dict()], user)[0]
     return {"ok": True, "listing": public}
 
 
 @app.get("/api/market")
-def market(city: str = Query("caba"), type: str = Query("")) -> dict:
+def market(city: str = Query("caba"), type: str = Query("")):
+    t0 = time.perf_counter()
     store.init()
     from .market import market_payload
 
-    return market_payload(city, type)
+    return _with_timing("market", t0, market_payload(city, type), {"city": city or "", "type": type or ""})
 
 
 @app.get("/api/listing-history")
@@ -522,6 +875,16 @@ def listing_price_history(id: str = Query(..., min_length=3)) -> dict:
     return listing_history(id)
 
 
+@app.get("/api/alive")
+async def alive() -> dict:
+    return {"ok": True}
+
+
 @app.get("/api/health")
-def health() -> dict:
-    return {"ok": True, "city": "multi"}
+async def health() -> dict:
+    from .watchdog import snapshot
+
+    beat = snapshot()
+    if os.environ.get("PROPMAP_TEST") != "1" and not beat["ok"]:
+        raise HTTPException(503, "watchdog")
+    return {"ok": True, "city": "multi", "watchdog": beat}

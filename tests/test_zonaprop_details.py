@@ -1,6 +1,6 @@
 from app.models import Listing
 from app.scrapers import locate_item
-from app.scrapers.details import _from_zonaprop_state
+from app.scrapers.details import _from_zonaprop_state, listing_page_is_gone
 
 
 CHIQUI_LAT = -42.7838439
@@ -109,3 +109,78 @@ def test_zonaprop_list_keeps_visibility_and_full_address():
     attach_location_facts(item)
     assert item.extra.get("street_number") == 600
     assert item.extra.get("between") or item.extra.get("intersection")
+
+
+def test_listing_page_is_gone_detects_unpublished_copy():
+    assert listing_page_is_gone("Esta propiedad ya no está disponible en ZonaProp") is True
+    assert listing_page_is_gone("Lo sentimos, esta publicación inactiva ya no se puede ver") is True
+    assert listing_page_is_gone("<html><body>Casa en venta 3 ambientes Palermo</body></html>") is False
+    assert listing_page_is_gone("") is False
+
+
+def test_title_buenos_aires_does_not_become_the_street():
+    from app.scrapers import attach_location_facts
+
+    item = Listing(
+        source="zonaprop",
+        source_id="59738305",
+        url="https://www.zonaprop.com.ar/propiedades/clasificado/veclapin-departamento-a-refaccionar-oportunidad-inversion-en-59738305.html",
+        title="Departamento a Refaccionar Oportunidad Inversión en Saavedra, Capital Federal, Buenos Aires",
+        property_type="departamento",
+        address="Correa 3500",
+        city="caba",
+        description="Departamento a refaccionar en Saavedra",
+        lat=-34.548332,
+        lon=-58.483468,
+        has_exact_location=True,
+        extra={"search_city": "caba", "portal_exact": True},
+    )
+    attach_location_facts(item)
+    assert (item.extra.get("street") or "").lower() == "correa"
+    assert int(item.extra.get("street_number") or 0) == 3500
+    assert "aires" not in (item.extra.get("street") or "").lower()
+
+
+def test_portal_exact_pin_wins_if_geocode_jumps_across_caba(monkeypatch):
+    from app.scrapers import locate_item
+
+    def fake_validate(street, number, city=""):
+        return {
+            "ok": True,
+            "approx": False,
+            "street": street,
+            "number": number,
+            "lat": -34.6291228,
+            "lon": -58.3514477,
+            "label": f"{street} {number}",
+        }
+
+    monkeypatch.setattr("app.geo_tools.validate_address", fake_validate)
+    item = Listing(
+        source="zonaprop",
+        source_id="59738305",
+        url="https://www.zonaprop.com.ar/propiedades/clasificado/veclapin-x-59738305.html",
+        title="Departamento a Refaccionar Oportunidad Inversión en Saavedra, Capital Federal, Buenos Aires",
+        property_type="departamento",
+        address="Correa 3500",
+        city="caba",
+        barrio="La Boca",
+        lat=-34.6291228,
+        lon=-58.3514477,
+        has_exact_location=True,
+        extra={
+            "search_city": "caba",
+            "portal_exact": True,
+            "portal_approx": False,
+            "portal_lat": -34.548332,
+            "portal_lon": -58.483468,
+            "street": "Aires Correa",
+            "street_number": 3500,
+            "location_kind": "exact",
+            "pin_kind": "address",
+        },
+    )
+    locate_item(item)
+    assert abs(item.lat + 34.548332) < 0.002
+    assert abs(item.lon + 58.483468) < 0.002
+    assert "boca" not in (item.barrio or "").lower()

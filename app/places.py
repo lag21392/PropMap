@@ -7,22 +7,28 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from . import store
 from .geo import (
+    CABA_IDS,
     CABA_LAT,
     CABA_LON,
     CITIES,
     DEFAULT_CITY,
     apply_city_extent,
+    city_outline_rings,
     distance_km,
     fold,
+    remember_city_outline,
     register_city,
     resolve_city,
     slug_place,
+    _extent_radius_km,
+    _point_in_rings,
 )
 from .place_api import lookup_place, province_slug, search_localidades
 
@@ -33,6 +39,7 @@ _search_mem: dict[str, tuple[float, list[dict]]] = {}
 PRIORITY_PLACE_QUERIES = ("Puerto Madryn", "CABA")
 
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 OVERPASS = "https://overpass-api.de/api/interpreter"
 OVERPASS_URLS = (
     "https://overpass-api.de/api/interpreter",
@@ -45,6 +52,194 @@ HEADERS = {
 }
 ARG_LAT = -38.4161
 ARG_LON = -63.6167
+_LISTED_SKIP = {"fuera", "otros", "argentina", "buenos-aires", ""}
+MIN_CATALOG_LISTINGS = 8
+MIN_SCRAPE_LISTINGS = 100
+_SEARCHABLE_KINDS = {
+    "localidad",
+    "localidade",
+    "city",
+    "town",
+}
+_BLOCKED_KINDS = {
+    "suburb",
+    "neighbourhood",
+    "neighborhood",
+    "quarter",
+    "hamlet",
+    "village",
+    "isolated_dwelling",
+    "asentamiento",
+    "departamento",
+    "provincia",
+    "state",
+    "county",
+    "region",
+    "administrative",
+    "peak",
+    "river",
+    "natural",
+    "road",
+}
+_NOT_CITY_CATEGORIAS = {"paraje", "pje"}
+_PLACE_META_KEYS = ("kind", "addresstype", "municipio", "localidad_censal", "categoria")
+_purged_unofficial = False
+
+
+def is_cache_artifact_id(city_id: str | None) -> bool:
+    """Nombres que salieron de archivos de cache (caba-pins, foo.pins), no de un lugar."""
+    token = fold(city_id or "")
+    if not token:
+        return True
+    compact = token.replace(" ", "-")
+    return compact.endswith("-pins") or compact.endswith(".pins") or "-pins-" in compact or ".pins" in compact
+
+
+def _norm_place_name(value: str) -> str:
+    return fold(value).replace("-", " ")
+
+
+def _same_place_token(left: str, right: str) -> bool:
+    return bool(left) and bool(right) and _norm_place_name(left) == _norm_place_name(right)
+
+
+def _label_key(city_id: str, cfg: dict | None = None) -> str:
+    row = cfg or CITIES.get(city_id) or {}
+    return _norm_place_name(str(row.get("label") or city_id.replace("-", " ")))
+
+
+def _prefer_listed_id(left: str, right: str) -> bool:
+    if left == DEFAULT_CITY or left in CABA_IDS:
+        return True
+    if right == DEFAULT_CITY or right in CABA_IDS:
+        return False
+    left_cfg, right_cfg = CITIES.get(left) or {}, CITIES.get(right) or {}
+    if left_cfg.get("builtin") and not right_cfg.get("builtin"):
+        return True
+    if right_cfg.get("builtin") and not left_cfg.get("builtin"):
+        return False
+    return len(left) < len(right)
+
+
+def _search_hit_ok(row: dict | None) -> bool:
+    if not isinstance(row, dict) or row.get("lat") is None or row.get("lon") is None:
+        return False
+    cid = str(row.get("id") or "")
+    if not cid or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+        return False
+    kind = fold(str(row.get("addresstype") or row.get("kind") or "localidad"))
+    if kind in _BLOCKED_KINDS:
+        return False
+    label = fold(str(row.get("label") or ""))
+    if label.startswith("barrio ") or label.startswith("departamento "):
+        return False
+    return _is_city_place(row)
+
+
+def _is_city_place(row: dict) -> bool:
+    """Ciudad de provincia: city/town/municipio, o localidad censal (no barrio ni paraje).
+
+    Florida (Vicente López), Palermo (CABA) o Canning (Ezeiza) quedan afuera: son
+    barrios o entidades dentro de otra ciudad, no el lugar que se busca.
+    """
+    cid = str(row.get("id") or "")
+    if cid in CABA_IDS or cid == DEFAULT_CITY:
+        return True
+    kind = fold(str(row.get("addresstype") or row.get("kind") or "localidad"))
+    if kind in _BLOCKED_KINDS:
+        return False
+    cat = fold(str(row.get("categoria") or ""))
+    if cat in _NOT_CITY_CATEGORIAS or cat.startswith("paraje") or cat.startswith("pje"):
+        return False
+    if kind in {"city", "town"}:
+        return True
+    name = _norm_place_name(str(row.get("label") or row.get("name") or cid.replace("-", " ")))
+    censal = _norm_place_name(str(row.get("localidad_censal") or ""))
+    mun = _norm_place_name(str(row.get("municipio") or ""))
+    prov = _norm_place_name(str(row.get("province") or ""))
+    if censal and ("ciudad autonoma" in censal or censal in {"caba", "capital federal"}):
+        return name in {"caba", "capital federal", "ciudad autonoma de buenos aires"}
+    if "ciudad autonoma" in prov or prov in {"caba", "capital federal"}:
+        return name in {"caba", "capital federal", "ciudad autonoma de buenos aires"}
+    if censal or mun:
+        return bool(name) and (name == censal or name == mun)
+    return kind in _SEARCHABLE_KINDS
+
+
+def _place_has_city_scope(place: dict | None) -> bool:
+    if not isinstance(place, dict):
+        return False
+    kind = fold(str(place.get("kind") or place.get("addresstype") or ""))
+    if kind in {"city", "town", "municipio"}:
+        return True
+    return bool(place.get("localidad_censal") or place.get("municipio"))
+
+
+def official_place(query: str | None) -> dict | None:
+    """El nombre existe como ciudad (localidad / city / town) en Georef o Nominatim."""
+    raw = (query or "").strip()
+    if len(raw) < 2:
+        return None
+    if is_cache_artifact_id(slug_place(raw)):
+        return None
+    q = raw.replace("-", " ")
+    remote = os.environ.get("PROPMAP_TEST") != "1"
+    place = lookup_place(q, remote=remote)
+    parsed = _from_georef_place(place) if place else None
+    if parsed and _search_hit_ok(parsed) and _official_name_matches(raw, parsed):
+        if os.environ.get("PROPMAP_TEST") == "1" or _place_has_city_scope(place):
+            return parsed
+    if not remote:
+        return None
+    for row in _search_places_remote(q, limit=8):
+        if _search_hit_ok(row) and _official_name_matches(raw, row):
+            return row
+    return None
+
+
+def _official_name_matches(query: str, hit: dict) -> bool:
+    names = [str(hit.get("id") or ""), str(hit.get("label") or "")]
+    return any(_same_place_token(query, name) or slug_place(query) == slug_place(name) for name in names if name)
+
+
+def can_list_place(city_id: str | None, *, label: str | None = None, query: str | None = None) -> bool:
+    raw = (query or label or city_id or "").strip()
+    cid = slug_place((city_id or raw).strip()) if (city_id or raw).strip() else ""
+    if not cid or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+        return False
+    if cid in CABA_IDS or cid == DEFAULT_CITY:
+        return True
+    cfg = CITIES.get(cid) or CITIES.get(resolve_city(raw) if raw else "")
+    if cfg and cfg.get("builtin") and _has_map_coords(cfg):
+        return True
+    return official_place(raw or cid) is not None
+
+
+def _listed_row_is_city(cid: str, cfg: dict) -> bool:
+    """Filtro local: no pega a la red. La limpieza con API corre en purge_unofficial_places."""
+    if not cid or cid in CABA_IDS or cid == DEFAULT_CITY or cfg.get("builtin"):
+        return True
+    if _junk_place_row(cid, cfg):
+        return False
+    cached = lookup_place(str(cfg.get("label") or cid), remote=False)
+    parsed = _from_georef_place(cached) if cached else None
+    if parsed:
+        return _search_hit_ok(parsed)
+    row = {
+        "id": cid,
+        "label": cfg.get("label") or cid,
+        "lat": cfg.get("lat"),
+        "lon": cfg.get("lon"),
+        "kind": cfg.get("kind") or "localidad",
+        "addresstype": cfg.get("kind") or "localidad",
+        "municipio": cfg.get("municipio") or "",
+        "localidad_censal": cfg.get("localidad_censal") or "",
+        "categoria": cfg.get("categoria") or "",
+        "province": cfg.get("province") or "",
+    }
+    if row["municipio"] or row["localidad_censal"]:
+        return _is_city_place(row)
+    return True
 
 
 _PLACE_PREFIX = re.compile(
@@ -115,14 +310,16 @@ def search_places(query: str, limit: int = 8) -> list[dict]:
 
     def add(row: dict) -> None:
         cid = row.get("id")
-        if not cid or cid in seen:
+        if not cid or cid in seen or not _search_hit_ok(row):
             return
         seen.add(cid)
         out.append(row)
 
-    for city_id, cfg in CITIES.items():
+    for city_id, cfg in list(CITIES.items()):
+        if not cfg.get("builtin") and city_id not in catalog_place_ids():
+            continue
         names = [cfg["label"], city_id, *(cfg.get("aliases") or [])]
-        if _name_hit(folded, names):
+        if _name_hit(folded, names) and _listed_row_is_city(city_id, cfg):
             add(_public_city(cfg))
     cached = _read_search_cache(folded)
     if cached:
@@ -154,7 +351,7 @@ def _search_places_remote(q: str, limit: int) -> list[dict]:
             if not parsed:
                 continue
             parsed["id"] = _adopt_existing_city(parsed)
-            if parsed["id"] in seen:
+            if parsed["id"] in seen or not _search_hit_ok(parsed):
                 continue
             seen.add(parsed["id"])
             out.append(parsed)
@@ -166,7 +363,7 @@ def _search_places_remote(q: str, limit: int) -> list[dict]:
         if not parsed:
             continue
         parsed["id"] = _adopt_existing_city(parsed)
-        if parsed["id"] in seen:
+        if parsed["id"] in seen or not _search_hit_ok(parsed):
             continue
         seen.add(parsed["id"])
         out.append(parsed)
@@ -223,6 +420,134 @@ def _write_search_cache(key: str, places: list[dict]) -> None:
         pass
 
 
+def _commit_listed_place(city_id: str, **kwargs) -> str:
+    if not can_list_place(city_id, label=kwargs.get("label"), query=kwargs.get("query")):
+        raise ValueError("elegí un lugar de las sugerencias")
+    cid = ensure_place(city_id, **kwargs)
+    remember_listed_place(cid)
+    return cid
+
+
+def place_from_suggestion(
+    city: str | None = None,
+    *,
+    query: str | None = None,
+    label: str | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
+    province: str | None = None,
+) -> str:
+    """Solo un lugar de las sugerencias (Georef/Nominatim o ya cargado). No inventa texto libre."""
+    from .geo import resolve_city
+
+    city_id = (city or "").strip()
+    raw = (query or label or city_id).strip()
+    if is_cache_artifact_id(slug_place(city_id or raw)):
+        raise ValueError("elegí un lugar de las sugerencias")
+    if lat is None and lon is None and not city_id and not raw:
+        raise ValueError("elegí un lugar de las sugerencias")
+    if lat is not None and lon is not None and (city_id or raw):
+        if not can_list_place(city_id or raw, label=label, query=raw):
+            raise ValueError("elegí un lugar de las sugerencias")
+        return _commit_listed_place(
+            city_id or raw,
+            query=raw,
+            label=label or raw,
+            lat=lat,
+            lon=lon,
+            province=province,
+        )
+    resolved = resolve_city(city_id or raw) if (city_id or raw) else ""
+    if resolved and resolved in CITIES:
+        cfg = CITIES.get(resolved) or {}
+        if cfg.get("builtin") or resolved in catalog_place_ids():
+            return _commit_listed_place(resolved, query=raw or resolved)
+    if len(raw) < 2:
+        raise ValueError("elegí un lugar de las sugerencias")
+    found = search_places(raw, limit=8)
+    folded = fold(raw)
+    hit = next(
+        (
+            row
+            for row in found
+            if fold(row.get("id") or "") == folded
+            or fold(row.get("label") or "") == folded
+            or (city_id and row.get("id") == city_id)
+        ),
+        None,
+    )
+    if hit is None and len(found) == 1:
+        hit = found[0]
+    if not hit or hit.get("lat") is None or hit.get("lon") is None:
+        raise ValueError("elegí un lugar de las sugerencias")
+    return _commit_listed_place(
+        hit["id"],
+        query=hit.get("label") or raw,
+        label=hit.get("label"),
+        lat=hit.get("lat"),
+        lon=hit.get("lon"),
+        province=hit.get("province"),
+    )
+
+
+def _caba_coords(lat: float, lon: float) -> bool:
+    return abs(float(lat) - CABA_LAT) < 0.08 and abs(float(lon) - CABA_LON) < 0.08
+
+
+def _apply_place_meta(city_id: str, src: dict | None) -> None:
+    cfg = CITIES.get(city_id)
+    if not cfg or not isinstance(src, dict):
+        return
+    for key in _PLACE_META_KEYS:
+        val = src.get(key)
+        if val:
+            cfg[key] = val
+    if cfg.get("kind") and not cfg.get("addresstype"):
+        cfg["addresstype"] = cfg["kind"]
+    if cfg.get("addresstype") and not cfg.get("kind"):
+        cfg["kind"] = cfg["addresstype"]
+
+
+def _register_view_city(
+    city_id: str,
+    *,
+    label: str,
+    lat: float,
+    lon: float,
+    province: str = "",
+    zoom: int = 13,
+    aliases: list[str] | None = None,
+    slug: str | None = None,
+    bbox=None,
+    radius_km: float | None = None,
+    meta: dict | None = None,
+) -> str:
+    if not city_id or city_id in _LISTED_SKIP or is_cache_artifact_id(city_id):
+        return city_id
+    if city_id not in CABA_IDS and _caba_coords(lat, lon):
+        return city_id
+    if abs(float(lat) - ARG_LAT) < 0.2 and abs(float(lon) - ARG_LON) < 0.2:
+        return city_id
+    register_city(
+        city_id,
+        label=label,
+        lat=float(lat),
+        lon=float(lon),
+        province=province or "",
+        barrios=[],
+        zoom=int(zoom or 13),
+        aliases=aliases or [fold(label), fold(city_id)],
+        slug=slug,
+        bbox=bbox,
+        radius_km=radius_km,
+    )
+    _apply_place_meta(city_id, meta)
+    if os.environ.get("PROPMAP_TEST") != "1":
+        _persist()
+        _save_extents()
+    return city_id
+
+
 def ensure_place(
     city: str | None = None,
     *,
@@ -235,9 +560,39 @@ def ensure_place(
     from .geo import resolve_city
 
     raw = (query or city or label or "").strip()
+    requested = slug_place((city or "").strip()) if (city or "").strip() else ""
+    if requested in _LISTED_SKIP or is_cache_artifact_id(requested):
+        requested = ""
     city_id = resolve_city(raw or city)
-    cfg = CITIES.get(city_id)
-    if cfg and (cfg.get("builtin") or (cfg.get("lat") is not None and lat is None)):
+    cfg = CITIES.get(city_id) or (CITIES.get(requested) if requested else None)
+
+    def _keep_requested(official_id: str, official_label: str) -> bool:
+        return bool(
+            requested
+            and requested not in CITIES
+            and not is_cache_artifact_id(requested)
+            and (
+                _same_place_token(requested, official_id)
+                or _same_place_token(requested, official_label)
+            )
+        )
+
+    if cfg and _has_map_coords(cfg) and (cfg.get("builtin") or (cfg.get("lat") is not None and lat is None)):
+        if _keep_requested(city_id, str(cfg.get("label") or "")):
+            _register_view_city(
+                requested,
+                label=str(cfg.get("label") or label or requested),
+                lat=float(cfg["lat"]),
+                lon=float(cfg["lon"]),
+                province=str(cfg.get("province") or ""),
+                zoom=int(cfg.get("zoom") or 13),
+                aliases=[fold(requested), fold(cfg.get("label") or "")],
+                slug=cfg.get("slug"),
+                bbox=cfg.get("bbox"),
+                radius_km=cfg.get("radius_km"),
+                meta=cfg,
+            )
+            city_id = requested
         threading.Thread(
             target=hydrate_place_extent,
             args=(city_id, raw),
@@ -245,11 +600,13 @@ def ensure_place(
             name=f"hydrate-{city_id}",
         ).start()
         ensure_osm_barrios(city_id, blocking=False)
-        return city_id
+        return requested if requested in CITIES else city_id
     hit = None
     if lat is None or lon is None:
         found = search_places(raw or city_id, limit=5)
-        hit = next((row for row in found if row["id"] == city_id), None) or (found[0] if found else None)
+        hit = next((row for row in found if row["id"] in {city_id, requested}), None) or (
+            found[0] if found else None
+        )
         if hit:
             city_id = hit["id"]
             label = label or hit["label"]
@@ -257,7 +614,7 @@ def ensure_place(
             lon = hit["lon"] if lon is None else lon
             province = province or hit.get("province")
             cfg = CITIES.get(city_id)
-            if cfg:
+            if cfg and _has_map_coords(cfg):
                 apply_city_extent(
                     city_id,
                     bbox=hit.get("bbox"),
@@ -266,9 +623,27 @@ def ensure_place(
                     slug=hit.get("slug"),
                 )
                 _save_extents()
+                if _keep_requested(city_id, str(label or "")):
+                    _register_view_city(
+                        requested,
+                        label=label or requested,
+                        lat=float(lat),
+                        lon=float(lon),
+                        province=str(province or cfg.get("province") or ""),
+                        zoom=int(hit.get("zoom") or cfg.get("zoom") or 13),
+                        aliases=[fold(requested), fold(label or "")],
+                        slug=hit.get("slug"),
+                        bbox=hit.get("bbox") or cfg.get("bbox"),
+                        radius_km=hit.get("radius_km") or cfg.get("radius_km"),
+                        meta=hit,
+                    )
+                    ensure_osm_barrios(requested, blocking=False)
+                    return requested
                 ensure_osm_barrios(city_id, blocking=False)
                 return city_id
-    if city_id in CITIES and lat is None:
+    if requested:
+        city_id = requested
+    if city_id in CITIES and lat is None and _has_map_coords(CITIES.get(city_id)):
         ensure_osm_barrios(city_id, blocking=False)
         return city_id
     label = label or (hit or {}).get("label") or city_id.replace("-", " ").title()
@@ -277,24 +652,54 @@ def ensure_place(
         zoom = 5
     else:
         zoom = int((hit or {}).get("zoom") or (14 if abs(float(lat) - ARG_LAT) > 1 else 5))
-    lat_f, lon_f = float(lat), float(lon)
-    register_city(
+    _register_view_city(
         city_id,
         label=label,
-        lat=lat_f,
-        lon=lon_f,
+        lat=float(lat),
+        lon=float(lon),
         province=province or (hit or {}).get("province") or "",
-        barrios=[],
         zoom=zoom,
         aliases=[fold(label), fold(raw)] if raw else [fold(label)],
         slug=(hit or {}).get("slug"),
         bbox=(hit or {}).get("bbox"),
         radius_km=(hit or {}).get("radius_km"),
+        meta=hit,
     )
-    _persist()
-    _save_extents()
     ensure_osm_barrios(city_id, blocking=False)
     return city_id
+
+
+def ensure_view_city(city_id: str | None) -> str:
+    """Deja el lugar de la vista en CITIES solo si existe en Georef/Nominatim.
+
+    Ver un aviso no lo agrega al pool de scrape: eso es place_from_suggestion.
+    """
+    cid = slug_place((city_id or "").strip()) if (city_id or "").strip() else ""
+    if not cid or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+        return cid or ""
+    load_custom_places()
+    cfg = CITIES.get(cid) or {}
+    if _has_map_coords(cfg) and (cfg.get("builtin") or can_list_place(cid, label=str(cfg.get("label") or cid))):
+        city_outline_rings(cid)
+        return cid
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return cid
+    query = str(cfg.get("label") or cid).replace("-", " ")
+    hit = official_place(query) or official_place(cid)
+    if not hit:
+        return cid
+    got = ensure_place(
+        city=hit["id"],
+        query=hit.get("label") or query,
+        label=hit.get("label"),
+        lat=hit.get("lat"),
+        lon=hit.get("lon"),
+        province=hit.get("province"),
+    )
+    if _has_map_coords(CITIES.get(got) or {}):
+        city_outline_rings(got)
+        return got
+    return got or cid
 
 
 def public_place(city_id: str) -> dict:
@@ -302,49 +707,413 @@ def public_place(city_id: str) -> dict:
     return _public_city(cfg)
 
 
-def listed_cities(listings: list | None = None) -> list[dict]:
-    load_custom_places()
-    rows = listings
-    if rows is None:
-        rows = []
-    used: set[str] = set()
-    fallback: dict[str, dict] = {}
-    for item in rows or []:
-        cid = _canonical_listed_id(getattr(item, "city", None) or "")
-        if not cid or cid in {"fuera", "otros", "argentina"}:
-            continue
-        used.add(cid)
-        if cid not in fallback:
-            fallback[cid] = {
-                "id": cid,
-                "label": cid.replace("-", " ").title(),
-                "lat": getattr(item, "lat", None) or ARG_LAT,
-                "lon": getattr(item, "lon", None) or ARG_LON,
-                "zoom": 13,
-                "province": "",
-                "place_ids": [cid],
-            }
-    wanted = set(used)
-    wanted.add(DEFAULT_CITY)
+def listing_count_for_catalog(n: int | None) -> bool:
     try:
-        from .schedule import searched_ids
+        return int(n or 0) >= MIN_CATALOG_LISTINGS
+    except (TypeError, ValueError):
+        return False
 
-        for cid in searched_ids():
+
+def listing_count_for_scrape(n: int | None) -> bool:
+    try:
+        return int(n or 0) >= MIN_SCRAPE_LISTINGS
+    except (TypeError, ValueError):
+        return False
+
+
+def _ids_with_saved_listings() -> set[str]:
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return set()
+    try:
+        store.init()
+        bundled: dict[str, int] = {}
+        for cid, n in store.city_listing_counts().items():
             token = _canonical_listed_id(cid) or cid
-            if token and token not in {"fuera", "otros", "argentina"}:
-                wanted.add(token)
+            if not token or token in _LISTED_SKIP:
+                continue
+            bundled[token] = bundled.get(token, 0) + int(n or 0)
+        return {cid for cid, n in bundled.items() if listing_count_for_catalog(n)}
+    except Exception:
+        return set()
+
+
+def _ids_with_scrape_listings() -> set[str]:
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return set()
+    try:
+        store.init()
+        bundled: dict[str, int] = {}
+        for cid, n in store.city_listing_counts().items():
+            token = _canonical_listed_id(cid) or cid
+            if not token or token in _LISTED_SKIP:
+                continue
+            bundled[token] = bundled.get(token, 0) + int(n or 0)
+        return {cid for cid, n in bundled.items() if listing_count_for_scrape(n)}
+    except Exception:
+        return set()
+
+
+_listed_lock = threading.Lock()
+_listed_mem: list[str] | None = None
+
+
+def reset_listed_places() -> None:
+    global _listed_mem
+    with _listed_lock:
+        _listed_mem = [] if os.environ.get("PROPMAP_TEST") == "1" else None
+
+
+def listed_place_ids() -> list[str]:
+    with _listed_lock:
+        return [cid for cid in _listed_ids_locked() if cid not in _LISTED_SKIP and not is_cache_artifact_id(cid)]
+
+
+def _listed_ids_locked() -> list[str]:
+    global _listed_mem
+    if _listed_mem is not None:
+        return list(_listed_mem)
+    ids: list[str] = []
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            store.init()
+            raw = store.get_meta("listed_places")
+            parsed = json.loads(raw) if raw else []
+            if isinstance(parsed, list):
+                ids = [str(cid) for cid in parsed if cid and not is_cache_artifact_id(str(cid))]
+            if ids != [str(cid) for cid in (parsed if isinstance(parsed, list) else []) if cid]:
+                store.set_meta("listed_places", json.dumps(ids, ensure_ascii=False))
+        except Exception:
+            ids = []
+    _listed_mem = list(dict.fromkeys(ids))
+    return list(_listed_mem)
+
+
+def remember_listed_place(city_id: str | None) -> str:
+    global _listed_mem
+    cid = _canonical_listed_id(city_id or "") or (city_id or "").strip()
+    if not cid or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+        return ""
+    cfg = CITIES.get(cid) or {}
+    if not can_list_place(cid, label=str(cfg.get("label") or cid)):
+        return ""
+    token = _label_key(cid, cfg)
+    with _listed_lock:
+        ids = _listed_ids_locked()
+        for other in ids:
+            if other != cid and _label_key(other) == token:
+                return other
+        if cid not in ids:
+            ids.append(cid)
+            _listed_mem = list(ids)
+            if os.environ.get("PROPMAP_TEST") != "1":
+                try:
+                    store.init()
+                    store.set_meta("listed_places", json.dumps(_listed_mem, ensure_ascii=False))
+                except Exception:
+                    pass
+        return cid
+
+
+def unlist_place(city_id: str | None) -> str:
+    """Saca del pool de scrape sin borrar el lugar ni los avisos."""
+    global _listed_mem
+    cid = (city_id or "").strip()
+    if not cid or cid == DEFAULT_CITY or cid in CABA_IDS:
+        return ""
+    cfg = CITIES.get(cid) or {}
+    if cfg.get("builtin"):
+        return ""
+    with _listed_lock:
+        ids = [item for item in _listed_ids_locked() if item != cid]
+        _listed_mem = list(ids)
+        if os.environ.get("PROPMAP_TEST") != "1":
+            try:
+                store.init()
+                store.set_meta("listed_places", json.dumps(_listed_mem, ensure_ascii=False))
+            except Exception:
+                pass
+    return cid
+
+
+def scrape_place_ok(city_id: str | None) -> bool:
+    """Solo ciudades de provincia con búsqueda del usuario, catálogo o prioridad."""
+    cid = (city_id or "").strip()
+    if not cid or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+        return False
+    if cid in CABA_IDS or cid == DEFAULT_CITY:
+        return True
+    cfg = CITIES.get(cid) or {}
+    if cfg.get("builtin"):
+        return True
+    if _junk_place_row(cid, cfg) or not _listed_row_is_city(cid, cfg):
+        return False
+    if cid in priority_place_ids():
+        return True
+    try:
+        from . import schedule
+
+        schedule.load()
+        if cid in schedule.searched_ids() or cid in schedule.viewed_ids():
+            return True
     except Exception:
         pass
-    seen: dict[str, dict] = {}
-    for cfg in CITIES.values():
-        cid = cfg["id"]
-        if _canonical_listed_id(cid) != cid:
+    return cid in _ids_with_scrape_listings()
+
+
+def _ghost_listed_place(cid: str, cfg: dict) -> bool:
+    if cid in CABA_IDS or cid == DEFAULT_CITY or cfg.get("builtin"):
+        return False
+    if cid in priority_place_ids():
+        return False
+    try:
+        from . import schedule
+
+        schedule.load()
+        if cid in schedule.searched_ids() or cid in schedule.viewed_ids():
+            return False
+    except Exception:
+        return False
+    return cid not in _ids_with_scrape_listings()
+
+
+def forget_place(city_id: str | None) -> str:
+    """Saca del catálogo un id que no es un lugar real."""
+    from .geo import CITY_ALIASES
+
+    global _listed_mem
+    cid = (city_id or "").strip()
+    if not cid or cid == DEFAULT_CITY or cid in CABA_IDS:
+        return ""
+    cfg = CITIES.get(cid) or {}
+    if cfg.get("builtin"):
+        return ""
+    with _listed_lock:
+        ids = [item for item in _listed_ids_locked() if item != cid]
+        _listed_mem = list(ids)
+        if os.environ.get("PROPMAP_TEST") != "1":
+            try:
+                store.init()
+                store.set_meta("listed_places", json.dumps(_listed_mem, ensure_ascii=False))
+            except Exception:
+                pass
+    CITIES.pop(cid, None)
+    for token, owner in list(CITY_ALIASES.items()):
+        if owner == cid or token == cid:
+            CITY_ALIASES.pop(token, None)
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            _persist()
+        except Exception:
+            pass
+        try:
+            from .listings_cache import drop_city_snap
+
+            drop_city_snap(cid)
+        except Exception:
+            pass
+        try:
+            from . import schedule
+
+            schedule.forget(cid)
+        except Exception:
+            pass
+    return cid
+
+
+def _junk_place_row(city_id: str, cfg: dict | None = None) -> bool:
+    if is_cache_artifact_id(city_id):
+        return True
+    row = cfg or CITIES.get(city_id) or {}
+    label = fold(row.get("label") or city_id.replace("-", " "))
+    if label.startswith("barrio ") or label.startswith("departamento "):
+        return True
+    kind = fold(str(row.get("kind") or row.get("addresstype") or ""))
+    if kind in _BLOCKED_KINDS:
+        return True
+    cat = fold(str(row.get("categoria") or ""))
+    return cat in _NOT_CITY_CATEGORIAS or cat.startswith("paraje") or cat.startswith("pje")
+
+
+def _drop_artifact_cache_files() -> None:
+    folder = Path(store.DATA_DIR) / "city_cache"
+    if not folder.is_dir():
+        return
+    for path in folder.iterdir():
+        name = path.name
+        if name.endswith(".pins.json.gz") or name.endswith(".pins.json"):
+            stem = name.replace(".pins.json.gz", "").replace(".pins.json", "")
+        elif name.endswith(".meta.json"):
+            stem = name[: -len(".meta.json")]
+        elif name.endswith(".json.gz"):
+            stem = name[: -len(".json.gz")]
+        elif name.endswith(".json"):
+            stem = name[: -len(".json")]
+        else:
             continue
-        if cid in wanted:
-            seen[cid] = _public_city(cfg)
-    for cid, row in fallback.items():
-        seen.setdefault(cid, row)
-    return sorted(seen.values(), key=lambda row: fold(row["label"]))
+        if is_cache_artifact_id(stem):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _purge_duplicate_labels() -> list[str]:
+    dropped: list[str] = []
+    kept: dict[str, str] = {}
+    for cid in list(listed_place_ids()):
+        key = _label_key(cid)
+        if not key:
+            continue
+        prev = kept.get(key)
+        if prev is None:
+            kept[key] = cid
+            continue
+        drop, keep = (cid, prev) if _prefer_listed_id(prev, cid) else (prev, cid)
+        kept[key] = keep
+        if drop != keep and forget_place(drop):
+            dropped.append(drop)
+    return dropped
+
+
+def purge_unofficial_places() -> list[str]:
+    """Tira ids inventados, barrios/parajes, y pueblos que nadie buscó ni tienen catálogo."""
+    if os.environ.get("PROPMAP_TEST") != "1":
+        _drop_artifact_cache_files()
+    dropped: list[str] = []
+    if os.environ.get("PROPMAP_TEST") != "1":
+        for cid in list(listed_place_ids()):
+            if cid == DEFAULT_CITY or cid in CABA_IDS:
+                continue
+            cfg = CITIES.get(cid) or {}
+            if cfg.get("builtin") or _junk_place_row(cid, cfg):
+                continue
+            if _ghost_listed_place(cid, cfg) and unlist_place(cid):
+                dropped.append(cid)
+    seen: set[str] = set()
+    candidates = list(listed_place_ids())
+    for cfg in list(CITIES.values()):
+        cid = str(cfg.get("id") or "")
+        if cid and not cfg.get("builtin"):
+            candidates.append(cid)
+    for cid in candidates:
+        if cid in seen or cid == DEFAULT_CITY or cid in CABA_IDS:
+            continue
+        seen.add(cid)
+        cfg = CITIES.get(cid) or {}
+        if cfg.get("builtin"):
+            continue
+        junk = _junk_place_row(cid, cfg)
+        if not junk and os.environ.get("PROPMAP_TEST") != "1":
+            junk = official_place(str(cfg.get("label") or cid)) is None
+        if junk and forget_place(cid):
+            dropped.append(cid)
+    dropped.extend(_purge_duplicate_labels())
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            from .listings_cache import rewrite_snap_cities
+
+            rewrite_snap_cities()
+        except Exception:
+            log.exception("no pude actualizar el listado de ciudades en cache")
+    return dropped
+
+
+def _kick_unofficial_purge() -> None:
+    global _purged_unofficial
+    if _purged_unofficial or os.environ.get("PROPMAP_TEST") == "1":
+        return
+    _purged_unofficial = True
+
+    def _job() -> None:
+        try:
+            purge_unofficial_places()
+        except Exception:
+            log.exception("no pude limpiar lugares que no existen")
+
+    threading.Thread(target=_job, daemon=True, name="purge-places").start()
+
+
+def catalog_place_ids(*, extra_have: set[str] | None = None) -> set[str]:
+    """CABA y lugares con avisos de verdad. Uno o dos pines no entran al desplegable."""
+    have = _ids_with_saved_listings()
+    if extra_have:
+        have |= {cid for cid in extra_have if cid}
+    wanted = {DEFAULT_CITY}
+    for cid in listed_place_ids():
+        token = _canonical_listed_id(cid) or cid
+        if not token or token in _LISTED_SKIP:
+            continue
+        if token == DEFAULT_CITY or token in have:
+            wanted.add(token)
+    return wanted
+
+
+def _has_map_coords(cfg: dict | None) -> bool:
+    if not cfg:
+        return False
+    try:
+        lat = float(cfg.get("lat"))
+        lon = float(cfg.get("lon"))
+    except (TypeError, ValueError):
+        return False
+    if abs(lat - ARG_LAT) < 0.05 and abs(lon - ARG_LON) < 0.05:
+        return False
+    return True
+
+
+def listed_cities(listings: list | None = None) -> list[dict]:
+    load_custom_places()
+    extra_counts: dict[str, int] = {}
+    for item in listings or []:
+        cid = _canonical_listed_id(getattr(item, "city", None) or "")
+        if cid and cid not in _LISTED_SKIP:
+            extra_counts[cid] = extra_counts.get(cid, 0) + 1
+    extra_have = {cid for cid, n in extra_counts.items() if listing_count_for_catalog(n)}
+    wanted = catalog_place_ids(extra_have=extra_have or None)
+    counts: dict[str, int] = dict(extra_counts)
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            store.init()
+            for cid, n in store.city_listing_counts().items():
+                token = _canonical_listed_id(cid) or cid
+                if token:
+                    counts[token] = counts.get(token, 0) + int(n or 0)
+        except Exception:
+            pass
+    seen: dict[str, dict] = {}
+
+    def take(cid: str, cfg: dict) -> None:
+        if not cid or cid in seen or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+            return
+        if _canonical_listed_id(cid) != cid:
+            return
+        label = fold(cfg.get("label") or "")
+        if label.startswith("barrio ") or label.startswith("departamento "):
+            return
+        if not _has_map_coords(cfg):
+            return
+        if cid != DEFAULT_CITY and cid not in CABA_IDS and not _listed_row_is_city(cid, cfg):
+            return
+        row = _public_city(cfg)
+        row["n"] = int(counts.get(cid) or 0)
+        seen[cid] = row
+
+    for cfg in list(CITIES.values()):
+        if cfg.get("id") in wanted:
+            take(str(cfg.get("id") or ""), cfg)
+    for cid in wanted:
+        cfg = CITIES.get(cid)
+        if cfg:
+            take(cid, cfg)
+    unique: dict[str, dict] = {}
+    for row in seen.values():
+        key = _norm_place_name(str(row.get("label") or row.get("id") or ""))
+        if not key:
+            continue
+        prev = unique.get(key)
+        if prev is None or _prefer_listed_id(str(row["id"]), str(prev["id"])):
+            unique[key] = row
+    return sorted(unique.values(), key=lambda row: fold(row["label"]))
 
 
 def ensure_default_city() -> str:
@@ -417,6 +1186,9 @@ def ensure_default_city() -> str:
 
 
 def load_custom_places() -> None:
+    if os.environ.get("PROPMAP_TEST") == "1":
+        ensure_default_city()
+        return
     _load_extents()
     _load_extra_slugs()
     raw = store.get_meta("custom_places")
@@ -426,8 +1198,12 @@ def load_custom_places() -> None:
         except json.JSONDecodeError:
             rows = []
         if isinstance(rows, list):
+            skipped = False
             for row in rows:
                 if not isinstance(row, dict) or not row.get("id"):
+                    continue
+                if _junk_place_row(str(row["id"]), row):
+                    skipped = True
                     continue
                 if row["id"] in CITIES and CITIES[row["id"]].get("builtin"):
                     continue
@@ -445,13 +1221,19 @@ def load_custom_places() -> None:
                     bbox=row.get("bbox"),
                     radius_km=row.get("radius_km"),
                 )
+                _apply_place_meta(str(row["id"]), row)
+            if skipped and os.environ.get("PROPMAP_TEST") != "1":
+                _persist()
     ensure_default_city()
+    _kick_unofficial_purge()
 
 
 def _persist() -> None:
     rows = []
-    for cfg in CITIES.values():
+    for cfg in list(CITIES.values()):
         if cfg.get("builtin"):
+            continue
+        if is_cache_artifact_id(cfg.get("id")):
             continue
         rows.append(
             {
@@ -466,6 +1248,11 @@ def _persist() -> None:
                 "slug": cfg.get("slug") or cfg["id"],
                 "radius_km": cfg.get("radius_km"),
                 "bbox": list(cfg["bbox"]) if cfg.get("bbox") else None,
+                "kind": cfg.get("kind") or "",
+                "addresstype": cfg.get("addresstype") or cfg.get("kind") or "",
+                "municipio": cfg.get("municipio") or "",
+                "localidad_censal": cfg.get("localidad_censal") or "",
+                "categoria": cfg.get("categoria") or "",
             }
         )
     store.set_meta("custom_places", json.dumps(rows, ensure_ascii=False))
@@ -529,11 +1316,15 @@ def _from_georef_place(place: dict) -> dict | None:
         "bbox": None,
         "radius_km": 16 if province == "capital-federal" else 25,
         "addresstype": str(place.get("kind") or "localidad"),
+        "kind": str(place.get("kind") or "localidad"),
+        "municipio": str(place.get("municipio") or ""),
+        "localidad_censal": str(place.get("localidad_censal") or ""),
+        "categoria": str(place.get("categoria") or ""),
         "hint": f"{name}, {place.get('province') or 'Argentina'}",
     }
 
 
-_SUBURB_TYPES = {"suburb", "neighbourhood", "neighborhood", "quarter", "hamlet"}
+_SUBURB_TYPES = {"suburb", "neighbourhood", "neighborhood", "quarter", "hamlet", "village"}
 
 
 def _nominatim_bbox(row: dict):
@@ -567,6 +1358,8 @@ def _zoom_from_bbox(bbox) -> int:
 def _from_nominatim(row: dict) -> dict | None:
     addr = row.get("address") or {}
     addresstype = fold(str(row.get("addresstype") or row.get("type") or ""))
+    if addresstype in _BLOCKED_KINDS:
+        return None
     name = (
         addr.get("village")
         or addr.get("town")
@@ -612,22 +1405,49 @@ def _from_nominatim(row: dict) -> dict | None:
     }
 
 
+def _place_names(city_id: str, cfg: dict | None = None, extra: list[str] | None = None) -> set[str]:
+    row = cfg if cfg is not None else (CITIES.get(city_id) or {})
+    names = {fold(city_id), fold(row.get("label") or "")}
+    for alias in row.get("aliases") or []:
+        names.add(fold(alias))
+    for item in extra or []:
+        names.add(fold(item))
+    return {name for name in names if name}
+
+
+def _names_overlap(left: set[str], right: set[str]) -> bool:
+    if left & right:
+        return True
+    for a in left:
+        for b in right:
+            if len(a) >= 5 and len(b) >= 5 and (a in b or b in a):
+                return True
+    return False
+
+
 def _adopt_existing_city(parsed: dict) -> str:
+    """Reusa un id ya cargado solo si es el mismo lugar, no un vecino homónimo o un loteo al lado."""
     addresstype = parsed.get("addresstype") or ""
     if addresstype in _SUBURB_TYPES:
         return parsed["id"]
+    parsed_id = parsed.get("id") or ""
+    parsed_names = _place_names(parsed_id, extra=[str(parsed.get("label") or "")])
     best = None
     best_d = 1e9
-    for city_id, cfg in CITIES.items():
+    for city_id, cfg in list(CITIES.items()):
+        if not _names_overlap(parsed_names, _place_names(city_id, cfg)):
+            continue
         dist = distance_km(parsed["lat"], parsed["lon"], cfg["lat"], cfg["lon"])
         limit = min(float(cfg.get("radius_km") or 15), 14)
         if dist <= limit and dist < best_d:
             best, best_d = city_id, dist
-    return best or parsed["id"]
+    return best or parsed_id
 
 
 def hydrate_place_extent(city_id: str, query: str = "") -> None:
     cfg = CITIES.get(city_id) or {}
+    if not _has_map_coords(cfg):
+        return
     box = cfg.get("bbox")
     if box:
         from .geo import _extent_radius_km
@@ -665,7 +1485,7 @@ def hydrate_place_extent(city_id: str, query: str = "") -> None:
 
 def _save_extents() -> None:
     data = {}
-    for city_id, cfg in CITIES.items():
+    for city_id, cfg in list(CITIES.items()):
         if not cfg.get("bbox") and not cfg.get("extent_from_api"):
             continue
         data[city_id] = {
@@ -678,7 +1498,7 @@ def _save_extents() -> None:
 
 
 def _load_extra_slugs() -> None:
-    for city_id, cfg in CITIES.items():
+    for city_id, cfg in list(CITIES.items()):
         raw = store.get_meta(f"extra_slugs:{city_id}")
         if not raw:
             continue
@@ -776,9 +1596,86 @@ def _nominatim(params: dict[str, Any]) -> list[dict]:
         return []
 
 
+_WATER_TYPES = {
+    "river",
+    "stream",
+    "canal",
+    "drain",
+    "dock",
+    "basin",
+    "harbour",
+    "harbor",
+    "bay",
+    "lagoon",
+    "reservoir",
+    "pond",
+    "water",
+    "wetland",
+    "coastline",
+    "strait",
+    "sea",
+    "ocean",
+    "shoal",
+    "oxbow",
+}
+_rev_mem: dict[str, dict[str, Any] | None] = {}
+
+
+def reverse_is_water(lat: float, lon: float) -> bool | None:
+    """Nominatim reverse: True si el punto es agua. None si no se pudo consultar."""
+    key = f"{round(float(lat), 5)}:{round(float(lon), 5)}"
+    if key in _rev_mem:
+        row = _rev_mem[key]
+        return None if row is None else bool(row.get("water"))
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return None
+    try:
+        raw = store.get_meta(f"nom:rev:{key}")
+        cached = json.loads(raw) if raw else None
+        if isinstance(cached, dict) and "water" in cached:
+            _rev_mem[key] = cached
+            return bool(cached["water"])
+    except Exception:
+        pass
+    try:
+        with httpx.Client(headers=HEADERS, timeout=18.0) as client:
+            response = client.get(
+                NOMINATIM_REVERSE,
+                params={
+                    "lat": f"{lat:.6f}",
+                    "lon": f"{lon:.6f}",
+                    "format": "json",
+                    "zoom": 18,
+                    "addressdetails": 1,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        time.sleep(1.05)
+    except Exception:
+        _rev_mem[key] = None
+        return None
+    if not isinstance(data, dict):
+        _rev_mem[key] = None
+        return None
+    cls = str(data.get("class") or data.get("category") or "").lower()
+    typ = str(data.get("type") or data.get("addresstype") or "").lower()
+    extra = data.get("extratags") if isinstance(data.get("extratags"), dict) else {}
+    wet = cls == "waterway" or typ in _WATER_TYPES or (cls == "natural" and typ in _WATER_TYPES)
+    if extra.get("natural") == "water" or extra.get("waterway"):
+        wet = True
+    payload = {"water": wet, "class": cls, "type": typ}
+    _rev_mem[key] = payload
+    try:
+        store.set_meta(f"nom:rev:{key}", json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        pass
+    return wet
+
+
 def _overpass(query: str) -> dict | None:
     try:
-        with httpx.Client(headers=HEADERS, timeout=55.0) as client:
+        with httpx.Client(headers=HEADERS, timeout=90.0) as client:
             last = None
             for url in OVERPASS_URLS:
                 try:
@@ -798,6 +1695,8 @@ def _overpass(query: str) -> dict | None:
 _osm_lock = threading.Lock()
 _osm_inflight: set[str] = set()
 _osm_tried: set[str] = set()
+_outline_lock = threading.Lock()
+_outline_inflight: set[str] = set()
 
 
 def osm_pending(city_id: str | None) -> bool:
@@ -807,12 +1706,280 @@ def osm_pending(city_id: str | None) -> bool:
         return city_id in _osm_inflight
 
 
+def _lonlat_to_latlon(coords: list) -> list[list[float]]:
+    ring: list[list[float]] = []
+    for point in coords or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            lon, lat = float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            continue
+        ring.append([lat, lon])
+    if len(ring) >= 4 and ring[0] != ring[-1]:
+        ring.append(ring[0])
+    return ring
+
+
+def rings_from_geojson(geom: dict | None) -> list[list[list[float]]]:
+    if not isinstance(geom, dict):
+        return []
+    kind = str(geom.get("type") or "")
+    coords = geom.get("coordinates")
+    if kind == "Feature":
+        return rings_from_geojson(geom.get("geometry") if isinstance(geom.get("geometry"), dict) else None)
+    if kind == "GeometryCollection":
+        out: list[list[list[float]]] = []
+        for part in geom.get("geometries") or []:
+            if isinstance(part, dict):
+                out.extend(rings_from_geojson(part))
+        return out
+    if kind == "Polygon" and isinstance(coords, list) and coords:
+        ring = _lonlat_to_latlon(coords[0])
+        return [ring] if len(ring) >= 4 else []
+    if kind == "MultiPolygon" and isinstance(coords, list):
+        out = []
+        for poly in coords:
+            if isinstance(poly, list) and poly:
+                ring = _lonlat_to_latlon(poly[0])
+                if len(ring) >= 4:
+                    out.append(ring)
+        return out
+    return []
+
+
+def _rings_extent_km(rings: list[list[list[float]]], lat: float, lon: float) -> float:
+    lats: list[float] = []
+    lons: list[float] = []
+    for ring in rings:
+        for point in ring:
+            if len(point) >= 2:
+                lats.append(float(point[0]))
+                lons.append(float(point[1]))
+    if len(lats) < 4:
+        return 0.0
+    return _extent_radius_km((min(lats), min(lons), max(lats), max(lons)), lat, lon)
+
+
+def _outline_queries(city_id: str) -> list[str]:
+    cfg = CITIES.get(city_id) or {}
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in (
+        cfg.get("label"),
+        *(cfg.get("aliases") or []),
+        city_id.replace("-", " "),
+    ):
+        text = str(raw or "").strip()
+        if len(text) < 3:
+            continue
+        key = fold(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    out.sort(key=lambda item: (-len(item), item))
+    return out
+
+
+def _outline_from_nominatim(city_id: str, lat: float, lon: float) -> list[list[list[float]]] | None:
+    cfg = CITIES.get(city_id) or {}
+    target = float(cfg.get("radius_km") or 16)
+    hi = min(80.0, max(40.0, target * 2.5))
+    best: list[list[list[float]]] | None = None
+    best_span = -1.0
+    for q in _outline_queries(city_id)[:6]:
+        rows = _nominatim(
+            {
+                "q": q,
+                "countrycodes": "ar",
+                "format": "json",
+                "addressdetails": 1,
+                "polygon_geojson": 1,
+                "limit": 5,
+            }
+        )
+        for row in rows:
+            parsed = _from_nominatim(row)
+            if not parsed:
+                continue
+            addresstype = fold(str(row.get("addresstype") or row.get("type") or parsed.get("addresstype") or ""))
+            if addresstype in _SUBURB_TYPES:
+                continue
+            rings = rings_from_geojson(row.get("geojson") if isinstance(row.get("geojson"), dict) else None)
+            if not rings:
+                continue
+            if distance_km(parsed["lat"], parsed["lon"], lat, lon) > 45:
+                continue
+            if not _point_in_rings(lat, lon, rings):
+                continue
+            span = _rings_extent_km(rings, lat, lon)
+            if span < 3 or span > hi:
+                continue
+            if span > best_span:
+                best, best_span = rings, span
+        if best:
+            break
+    return best
+
+
+def _outline_from_overpass(lat: float, lon: float, city_id: str) -> list[list[list[float]]] | None:
+    cfg = CITIES.get(city_id) or {}
+    target = float(cfg.get("radius_km") or 16)
+    hi = min(80.0, max(40.0, target * 2.5))
+    query = f"""
+[out:json][timeout:40];
+is_in({lat},{lon})->.a;
+rel(pivot.a)["boundary"="administrative"]["admin_level"~"4|6|7|8"];
+out geom;
+"""
+    data = _overpass(query)
+    if not isinstance(data, dict):
+        return None
+    best: list[list[list[float]]] | None = None
+    best_span = -1.0
+    for el in data.get("elements") or []:
+        outers: list[list[list[float]]] = []
+        geom = el.get("geometry") or []
+        if geom:
+            pts = [[float(p["lat"]), float(p["lon"])] for p in geom if "lat" in p and "lon" in p]
+            if len(pts) >= 4:
+                outers.append(pts)
+        for member in el.get("members") or []:
+            if member.get("type") != "way" or member.get("role") not in {"outer", ""}:
+                continue
+            mgeom = member.get("geometry") or []
+            pts = [[float(p["lat"]), float(p["lon"])] for p in mgeom if "lat" in p and "lon" in p]
+            if len(pts) >= 2:
+                outers.append(pts)
+        if not outers:
+            continue
+        ring = _simplify_ring(_stitch_ways(outers)[0], max_pts=240)
+        if len(ring) < 8:
+            continue
+        rings = [ring]
+        if not _point_in_rings(lat, lon, rings):
+            continue
+        span = _rings_extent_km(rings, lat, lon)
+        if span < 3 or span > hi:
+            continue
+        if span > best_span:
+            best, best_span = rings, span
+    return best
+
+
+def fetch_city_outline(city_id: str) -> list[list[list[float]]] | None:
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return city_outline_rings(city_id) or None
+    cfg = CITIES.get(city_id) or {}
+    lat = cfg.get("lat")
+    lon = cfg.get("lon")
+    if lat is None or lon is None:
+        from .geo import city_center
+
+        lat, lon = city_center(city_id)
+    rings = _outline_from_nominatim(city_id, float(lat), float(lon))
+    if not rings:
+        rings = _outline_from_overpass(float(lat), float(lon), city_id)
+    if not rings:
+        return None
+    return [_simplify_ring(ring, max_pts=240) for ring in rings if len(ring) >= 4]
+
+
+def _sync_barrios_to_outline(city_id: str) -> None:
+    from .geo import city_polygons, remember_city_polygons
+
+    rings = city_outline_rings(city_id)
+    if not rings:
+        return
+    rows = city_polygons(city_id)
+    if not rows:
+        return
+    kept = []
+    for row in rows:
+        try:
+            lat = float(row.get("lat"))
+            lon = float(row.get("lon"))
+        except (TypeError, ValueError):
+            ring = row.get("ring") or []
+            if len(ring) < 4:
+                continue
+            lat, lon = float(ring[0][0]), float(ring[0][1])
+        if _point_in_rings(lat, lon, rings):
+            kept.append(row)
+    if len(kept) == len(rows):
+        return
+    store.set_meta(f"osm_barrios:{city_id}", json.dumps(kept, ensure_ascii=False))
+    remember_city_polygons(city_id, kept)
+
+
+def _save_city_outline(city_id: str, rings: list[list[list[float]]]) -> None:
+    remember_city_outline(city_id, rings)
+    if not city_outline_rings(city_id):
+        return
+    store.set_meta(
+        f"osm_outline:{city_id}",
+        json.dumps({"rings": rings, "source": "nominatim"}, ensure_ascii=False),
+    )
+    _sync_barrios_to_outline(city_id)
+    try:
+        from .listings_cache import invalidate_city_geo
+
+        invalidate_city_geo(city_id)
+    except Exception:
+        pass
+
+
+def ensure_city_outline(city_id: str | None, *, blocking: bool = False) -> list[list[list[float]]]:
+    if not city_id or city_id in {"fuera", "otros"}:
+        return []
+    have = city_outline_rings(city_id)
+    if have:
+        return have
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return []
+
+    def _job() -> None:
+        try:
+            rings = fetch_city_outline(city_id)
+            if rings:
+                _save_city_outline(city_id, rings)
+        except Exception:
+            log.exception("city outline %s", city_id)
+        finally:
+            with _outline_lock:
+                _outline_inflight.discard(city_id)
+
+    start = False
+    with _outline_lock:
+        if city_id in _outline_inflight:
+            if not blocking:
+                return []
+        else:
+            _outline_inflight.add(city_id)
+            start = True
+    if blocking:
+        if start:
+            _job()
+        else:
+            while True:
+                with _outline_lock:
+                    if city_id not in _outline_inflight:
+                        break
+                time.sleep(0.05)
+        return city_outline_rings(city_id)
+    if start:
+        threading.Thread(target=_job, daemon=True, name=f"city-outline-{city_id}").start()
+    return []
+
+
 def ensure_osm_barrios(city_id: str | None, *, blocking: bool = False) -> list[dict]:
     """Carga polígonos de barrios de OSM para cualquier ciudad y los cachea."""
     from .geo import CITIES, city_center, city_polygons, remember_city_polygons
 
     if not city_id or city_id in {"fuera", "otros"}:
         return []
+    ensure_city_outline(city_id, blocking=blocking)
     cached = city_polygons(city_id)
     have_slugs = (CITIES.get(city_id) or {}).get("extra_slugs") is not None
     if len(cached) >= 6 and have_slugs:
@@ -825,6 +1992,10 @@ def ensure_osm_barrios(city_id: str | None, *, blocking: bool = False) -> list[d
 
     def _job() -> None:
         try:
+            if not city_outline_rings(city_id):
+                rings = fetch_city_outline(city_id)
+                if rings:
+                    _save_city_outline(city_id, rings)
             rows = fetch_osm_barrio_polygons(
                 float(lat),
                 float(lon),
@@ -837,6 +2008,7 @@ def ensure_osm_barrios(city_id: str | None, *, blocking: bool = False) -> list[d
             if rows:
                 remember_city_polygons(city_id, rows)
                 _extent_from_rings(city_id, rows)
+            _sync_barrios_to_outline(city_id)
             _remember_locality_slugs(city_id, float(lat), float(lon))
         finally:
             with _osm_lock:
@@ -949,6 +2121,105 @@ out body geom;
             }
         )
     return out
+
+
+def fetch_osm_water_polygons(city_id: str) -> list[list[list[float]]] | None:
+    """Polígonos de agua OSM (ríos, dársenas) de la ciudad. No un catálogo local."""
+    cfg = CITIES.get(city_id or "") or {}
+    box = cfg.get("bbox")
+    if box:
+        south, west, north, east = box
+        area = f"({south},{west},{north},{east})"
+    else:
+        lat, lon = cfg.get("lat"), cfg.get("lon")
+        if lat is None or lon is None:
+            try:
+                from .geo import city_center
+
+                lat, lon = city_center(city_id)
+            except Exception:
+                return None
+        radius = int(min(max(float(cfg.get("radius_km") or 16) * 1000, 8000), 28000))
+        area = f"(around:{radius},{lat},{lon})"
+    query = f"""
+[out:json][timeout:50];
+(
+  way["natural"="water"]{area};
+  way["waterway"="riverbank"]{area};
+  way["waterway"="dock"]{area};
+  rel["natural"="water"]{area};
+);
+out body geom;
+"""
+    data = _overpass(query)
+    if data is None:
+        return None
+    rings: list[list[list[float]]] = []
+    for el in data.get("elements") or []:
+        geom = el.get("geometry") or []
+        pts = [[float(p["lat"]), float(p["lon"])] for p in geom if "lat" in p and "lon" in p]
+        if len(pts) >= 4:
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])
+            rings.append([[round(a, 5), round(b, 5)] for a, b in pts])
+            continue
+        outers = []
+        for member in el.get("members") or []:
+            if member.get("type") != "way" or member.get("role") not in {"outer", ""}:
+                continue
+            mgeom = member.get("geometry") or []
+            mpts = [[float(p["lat"]), float(p["lon"])] for p in mgeom if "lat" in p and "lon" in p]
+            if len(mpts) >= 2:
+                outers.append(mpts)
+        if not outers:
+            continue
+        for ring in _stitch_ways(outers):
+            if len(ring) < 4:
+                continue
+            closed = ring if ring[0] == ring[-1] else ring + [ring[0]]
+            rings.append([[round(a, 5), round(b, 5)] for a, b in closed])
+    return rings
+
+
+def ensure_osm_water(city_id: str | None, *, blocking: bool = False) -> list[list[list[float]]]:
+    from .geo import remember_water_rings
+
+    if not city_id or city_id in {"fuera", "otros"}:
+        return []
+    store.init()
+    raw = store.get_meta(f"osm_water:{city_id}")
+    if raw:
+        try:
+            rings = json.loads(raw)
+        except json.JSONDecodeError:
+            rings = []
+        if isinstance(rings, list) and rings:
+            remember_water_rings(city_id, rings)
+            return rings
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return []
+
+    def _job() -> None:
+        try:
+            rows = fetch_osm_water_polygons(city_id)
+            if rows is None:
+                return
+            store.set_meta(f"osm_water:{city_id}", json.dumps(rows, ensure_ascii=False))
+            if rows:
+                remember_water_rings(city_id, rows)
+        except Exception:
+            log.exception("osm water %s", city_id)
+
+    if blocking:
+        _job()
+        raw = store.get_meta(f"osm_water:{city_id}")
+        try:
+            rings = json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            rings = []
+        return rings if isinstance(rings, list) else []
+    threading.Thread(target=_job, daemon=True, name=f"osm-water-{city_id}").start()
+    return []
 
 
 def _almost(a: list[float], b: list[float]) -> bool:

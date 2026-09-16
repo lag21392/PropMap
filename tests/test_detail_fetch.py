@@ -89,6 +89,23 @@ def test_needs_llm_skips_current_schema():
     assert needs_llm(item) is False
 
 
+def test_workers_scale_with_egress_lanes(monkeypatch):
+    from app import detail_fetch, egress
+
+    monkeypatch.delenv("DETAIL_WORKERS", raising=False)
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    egress.reset()
+    assert detail_fetch.workers() == detail_fetch.MAX_WORKERS
+    monkeypatch.setenv("SCRAPE_PROXIES", "http://127.0.0.1:18080,http://127.0.0.1:18081")
+    egress.reset()
+    assert detail_fetch.workers() == 6
+    monkeypatch.setenv("DETAIL_WORKERS", "2")
+    assert detail_fetch.workers() == 2
+    monkeypatch.delenv("DETAIL_WORKERS", raising=False)
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    egress.reset()
+
+
 def test_detail_queue_prioritizes_missing_address(monkeypatch):
     from app import detail_fetch
 

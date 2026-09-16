@@ -65,7 +65,10 @@ def needs_detail_fetch(item: Listing, now: datetime | None = None) -> bool:
 
     parser = extra.get("details_parser")
     if parser and parser != DETAILS_PARSER:
-        return True
+        source = (item.source or "").lower()
+        if source == "argenprop" and extra.get("portal_lat") is None:
+            return True
+        return False
     if same_local_day(extra.get("details_at"), now=now):
         return False
     listed_price = item.price
@@ -85,3 +88,11 @@ def needs_detail_fetch(item: Listing, now: datetime | None = None) -> bool:
     except (TypeError, ValueError):
         pass
     return False
+
+
+def has_usable_listing_text(item: Listing) -> bool:
+    """Hay texto de lista o ficha para la LLM; no hace falta esperar otra bajada HTTP."""
+    extra = item.extra or {}
+    if item.details_scraped or extra.get("details_at"):
+        return True
+    return len((item.description or "").strip()) >= 160
