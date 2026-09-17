@@ -441,7 +441,7 @@ def _locate_item(item: Listing) -> Listing:
     item.extra = extra
     item.has_exact_location = exact
     _keep_portal_map_pin(item)
-    pin_listing_city(item)
+    pin_listing_city(item, remote=False)
     apply_recovered_location(item)
     _keep_portal_map_pin(item)
     from ..geo import drop_water_pin

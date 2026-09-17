@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -46,15 +47,21 @@ def generic_barrios(lat: float, lon: float) -> list[dict]:
 
 def barrios_for(city: str | None) -> list[dict]:
     """Nombres de barrio: polígonos OSM, lo aprendido de los avisos y lo que Nominatim haya guardado."""
+    cid = city or ""
+    hit = _BARRIOS_FOR.get(cid)
+    if hit is not None:
+        return hit
     by: dict[str, dict] = {}
-    for row in city_polygons(city or ""):
+    for row in city_polygons(cid):
         _index_barrio(by, row)
-    for row in learned_barrios(city or ""):
+    for row in learned_barrios(cid):
         _index_barrio(by, row, overwrite=False)
-    cfg = CITIES.get(city or "") or {}
+    cfg = CITIES.get(cid) or {}
     for row in cfg.get("barrios") or []:
         _index_barrio(by, row, overwrite=False)
-    return list(by.values())
+    rows = list(by.values())
+    _BARRIOS_FOR[cid] = rows
+    return rows
 
 
 def _index_barrio(by: dict[str, dict], row: dict, *, overwrite: bool = True) -> None:
@@ -74,6 +81,10 @@ def _index_barrio(by: dict[str, dict], row: dict, *, overwrite: bool = True) -> 
 
 
 _POLY_CACHE: dict[str, list[dict]] = {}
+_BARRIOS_FOR: dict[str, list[dict]] = {}
+_OWN_BARRIO_NAMES: dict[str, set[str]] = {}
+_OFFICIAL_BARRIO_NAMES: dict[str, set[str]] = {}
+_OWN_PLACE_NAMES: dict[str, set[str]] = {}
 _OUTLINE_CACHE: dict[str, list[list[list[float]]]] = {}
 _OUTLINE_MISS: set[str] = set()
 _POINT_BOXES: list[tuple[str, float, float, float, float, float, float]] | None = None
@@ -106,8 +117,23 @@ _WEAK_CITY_ALIAS = {
 }
 
 
+def _invalidate_barrio_lists(city: str | None = None) -> None:
+    """El índice de barrios se arma una vez por ciudad, no por cada aviso."""
+    if city:
+        _BARRIOS_FOR.pop(city, None)
+        _OWN_BARRIO_NAMES.pop(city, None)
+        _OFFICIAL_BARRIO_NAMES.pop(city, None)
+        _OWN_PLACE_NAMES.pop(city, None)
+        return
+    _BARRIOS_FOR.clear()
+    _OWN_BARRIO_NAMES.clear()
+    _OFFICIAL_BARRIO_NAMES.clear()
+    _OWN_PLACE_NAMES.clear()
+
+
 def remember_city_polygons(city: str, rows: list[dict]) -> None:
     _POLY_CACHE[city] = rows
+    _invalidate_barrio_lists(city)
 
 
 def outline_matches_city(city: str | None, rings: list[list[list[float]]]) -> bool:
@@ -141,11 +167,13 @@ def clear_city_polygons(city: str | None = None) -> None:
         _POLY_CACHE.pop(city, None)
         _OUTLINE_CACHE.pop(city, None)
         _OUTLINE_MISS.discard(city)
+        _invalidate_barrio_lists(city)
         _invalidate_point_boxes()
         return
     _POLY_CACHE.clear()
     _OUTLINE_CACHE.clear()
     _OUTLINE_MISS.clear()
+    _invalidate_barrio_lists()
     _invalidate_point_boxes()
 
 
@@ -762,6 +790,9 @@ def _listing_blob(item) -> str:
 
 
 def own_place_names(city: str) -> set[str]:
+    hit = _OWN_PLACE_NAMES.get(city)
+    if hit is not None:
+        return hit
     cfg = CITIES.get(city) or {}
     names = [
         cfg.get("label"),
@@ -771,7 +802,9 @@ def own_place_names(city: str) -> set[str]:
         cfg.get("slug"),
         *(cfg.get("aliases") or []),
     ]
-    return {fold(n) for n in names if n and fold(n)}
+    out = {fold(n) for n in names if n and fold(n)}
+    _OWN_PLACE_NAMES[city] = out
+    return out
 
 
 def _barrio_name_tokens(rows: list[dict]) -> set[str]:
@@ -788,12 +821,22 @@ def _barrio_name_tokens(rows: list[dict]) -> set[str]:
 
 
 def official_barrio_names(city: str) -> set[str]:
+    hit = _OFFICIAL_BARRIO_NAMES.get(city)
+    if hit is not None:
+        return hit
     cfg = CITIES.get(city) or {}
-    return _barrio_name_tokens(list(city_polygons(city)) + list(cfg.get("barrios") or []))
+    names = _barrio_name_tokens(list(city_polygons(city)) + list(cfg.get("barrios") or []))
+    _OFFICIAL_BARRIO_NAMES[city] = names
+    return names
 
 
 def own_barrio_names(city: str) -> set[str]:
-    return _barrio_name_tokens(barrios_for(city))
+    hit = _OWN_BARRIO_NAMES.get(city)
+    if hit is not None:
+        return hit
+    names = _barrio_name_tokens(barrios_for(city))
+    _OWN_BARRIO_NAMES[city] = names
+    return names
 
 
 def _is_own_phrase(phrase: str, own: set[str]) -> bool:
@@ -955,20 +998,27 @@ def listing_fits_city(item, city: str, *, remote: bool = True, require_radius: b
     lat = getattr(item, "lat", None)
     lon = getattr(item, "lon", None)
     in_radius = lat is not None and lon is not None and in_city_radius(lat, lon, city)
-    mentioned = listing_mentions_city(item, city)
     portal_here = portal_pin_in_city(item, city)
     searched_here = bool(search) and (search == city or search in wanted)
     if portal_outside_city(item, city):
         return False
-    from .place_tags import is_narrower_place_query, listing_matches_city, listing_place_tags
+    from .place_tags import is_narrower_place_query, listing_place_tags, matches_place_query
 
     place_tags = listing_place_tags(item, remote=False)
-    tags_hit = listing_matches_city(item, city)
+    tags_hit = matches_place_query(place_tags, city)
     if place_tags and not tags_hit and is_narrower_place_query(place_tags, city):
         return False
     if tags_hit:
         tagged = True
-    if not tagged and not in_radius and not mentioned:
+    mentioned: bool | None = None
+
+    def mentions() -> bool:
+        nonlocal mentioned
+        if mentioned is None:
+            mentioned = listing_mentions_city(item, city)
+        return mentioned
+
+    if not tagged and not in_radius and not mentions():
         return False
     if lat is not None and lon is not None and not in_radius:
         if city_outline_rings(city) and not portal_here:
@@ -977,10 +1027,14 @@ def listing_fits_city(item, city: str, *, remote: bool = True, require_radius: b
         if sit and sit not in wanted and sit != city and not portal_here:
             return False
     # Pin adentro de la ciudad buscada: un topónimo homónimo (Hudson, Córdoba) no lo esconde.
-    if foreign_locality(item, city, remote=remote) and not portal_here and not (in_radius and searched_here):
+    skip_foreign = portal_here or (in_radius and searched_here)
+    if (
+        not skip_foreign
+        and foreign_locality(item, city, remote=remote)
+        and not portal_here
+        and not (in_radius and searched_here)
+    ):
         return False
-    if in_radius and mentioned:
-        return True
     if in_radius or portal_here:
         return True
     if city_outline_rings(city):
@@ -989,7 +1043,7 @@ def listing_fits_city(item, city: str, *, remote: bool = True, require_radius: b
         has_cfg = any(CITIES.get(alias) for alias in (wanted or {city}))
         if has_cfg:
             return False
-    return tagged or mentioned
+    return tagged or mentions()
 
 
 def public_row_fits_city(row: dict, city: str) -> bool:
@@ -1019,9 +1073,21 @@ def public_row_fits_city(row: dict, city: str) -> bool:
 
 
 def fold(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text or "")
+    raw = text or ""
+    if len(raw) <= 96:
+        return _fold_short(raw)
+    return _fold_raw(raw)
+
+
+def _fold_raw(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+@functools.lru_cache(maxsize=16384)
+def _fold_short(text: str) -> str:
+    return _fold_raw(text)
 
 
 CITY_ALIASES: dict[str, str] = {}
@@ -1109,6 +1175,7 @@ def register_city(
         CITIES[city_id]["bbox"] = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
         CITIES[city_id]["radius_km"] = float(radius_km or _extent_radius_km(CITIES[city_id]["bbox"], lat, lon))
     _invalidate_point_boxes()
+    _invalidate_barrio_lists(city_id)
     def _alias(name: str) -> None:
         token = fold(name)
         if not token:
@@ -1293,6 +1360,7 @@ def remember_barrio(city: str | None, name: str | None, lat: float | None = None
             }
         )
     _LEARNED[city] = rows
+    _invalidate_barrio_lists(city)
     try:
         from .place_api import forget_barrio_index
 

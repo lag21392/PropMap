@@ -657,7 +657,7 @@ def _scrape_one_city(
                     extra = dict(item.extra or {})
                     extra["search_city"] = city_id
                     item.extra = extra
-                pin_listing_city(item)
+                pin_listing_city(item, remote=False)
                 if item.price and not item.price_usd:
                     item.price_usd = to_usd(item.price, item.currency, rate)
                 apply_unit_price(item, rate)
@@ -731,7 +731,7 @@ def _scrape_one_city(
                                 from .llm_enrich import mark_await_llm
 
                                 mark_await_llm(item)
-                            pin_listing_city(item)
+                            pin_listing_city(item, remote=False)
                         store.upsert_many(items)
                     if not stop():
                         dropped = _retire_unseen(city_id, name, seen_ids.get(name) or set())

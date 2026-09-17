@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import time
@@ -8,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, local
 
+from .jsoncodec import dumps_text, loads as json_loads
 from .models import Listing
 from .text_quality import address_quality, title_quality
 
@@ -22,10 +22,63 @@ _counts_at = 0.0
 COUNTS_TTL_SEC = 25.0
 # 4 MB por hilo. -80000 (80 MB) × el pool de uvicorn se iba a varios GB y no volvía.
 CACHE_KB = 4000
+_SQL_IN_CHUNK = 400
 EDIT_FIELDS = (
     "title", "price", "currency", "address", "covered_m2", "total_m2",
     "bedrooms", "bathrooms", "description", "property_type",
 )
+
+
+_MAP_EXTRA_SQL = (
+    "json_remove(IFNULL(extra_json, '{}'), "
+    "'$.profile.axes', '$.profile.access', '$.access', "
+    "'$.photos', '$.llm', '$.pdf_text')"
+)
+
+
+def _loads_extra(raw, *, map_row: bool = False) -> dict:
+    """Hidratar extra_json. En el mapa se tiran ejes/POIs/fotos que no pintan el pin."""
+    if not raw:
+        extra: dict = {}
+    else:
+        loaded = json_loads(raw)
+        extra = loaded if isinstance(loaded, dict) else {}
+    if not map_row:
+        return extra
+    extra.pop("access", None)
+    extra.pop("photos", None)
+    extra.pop("llm", None)
+    extra.pop("pdf_text", None)
+    prof = extra.get("profile")
+    if not isinstance(prof, dict):
+        return extra
+    axes_in = prof.get("axes") if isinstance(prof.get("axes"), dict) else {}
+    axes: dict = {}
+    for key, val in axes_in.items():
+        if not isinstance(val, dict):
+            continue
+        axes[str(key)] = {
+            "score": val.get("score"),
+            "confidence": val.get("confidence"),
+            "note": val.get("note"),
+        }
+    extra["profile"] = {
+        "axes": axes,
+        "pin_grade": prof.get("pin_grade") or extra.get("pin_grade") or "",
+        "total": prof.get("total"),
+        "total_n": prof.get("total_n"),
+        "pending": prof.get("pending") or [],
+        "labels": prof.get("labels") or {},
+        "version": prof.get("version"),
+    }
+    return extra
+
+
+def _listing_sql(where: str, *, map_row: bool) -> str:
+    extra = f"{_MAP_EXTRA_SQL} AS extra_map" if map_row else "extra_json"
+    if map_row:
+        return f"SELECT listings.*, {extra} FROM listings WHERE {where}"
+    return f"SELECT * FROM listings WHERE {where}"
 
 
 class _TlsConn:
@@ -299,7 +352,7 @@ def replace_portal_listings(source: str, listings: list[Listing]) -> None:
 
 
 def _merge_existing(item: Listing, row: sqlite3.Row) -> None:
-    old_extra = json.loads(row["extra_json"] or "{}")
+    old_extra = _loads_extra(row["extra_json"] if "extra_json" in row.keys() else "{}")
     if len(item.description or "") < len(row["description"] or ""):
         item.description = row["description"] or ""
     if not item.image and row["image"]:
@@ -324,7 +377,9 @@ def _merge_existing(item: Listing, row: sqlite3.Row) -> None:
         and not (street and number)
         and not extra.get("intersection")
     )
-    if keep_old and item.city not in {"fuera", "otros"} and not foreign_locality(item, item.city or ""):
+    if keep_old and item.city not in {"fuera", "otros"} and not foreign_locality(
+        item, item.city or "", remote=False
+    ):
         item.lat = row["lat"]
         item.lon = row["lon"]
         item.has_exact_location = True
@@ -502,60 +557,108 @@ def _backfill_listing_query_flags(conn: sqlite3.Connection, schema: int) -> None
     )
 
 
+_UPSERT_SQL = """
+INSERT OR REPLACE INTO listings (
+    id, source, source_id, url, title, property_type, price, currency,
+    price_usd, address, barrio, zona, lat, lon, covered_m2, total_m2,
+    rooms, bedrooms, bathrooms, parking, age_years, image, publisher,
+    description, published_at, price_m2, score, deal_label, vs_barrio_pct,
+    fingerprint, extra_json, scraped_at, has_exact_location, city,
+    quality_score, quality_label, details_scraped,
+    needs_llm, is_hidden, llm_ready, llm_ver, llm_partial, llm_await, llm_fix
+) VALUES (
+    :id, :source, :source_id, :url, :title, :property_type, :price, :currency,
+    :price_usd, :address, :barrio, :zona, :lat, :lon, :covered_m2, :total_m2,
+    :rooms, :bedrooms, :bathrooms, :parking, :age_years, :image, :publisher,
+    :description, :published_at, :price_m2, :score, :deal_label, :vs_barrio_pct,
+    :fingerprint, :extra_json, :scraped_at, :has_exact_location, :city,
+    :quality_score, :quality_label, :details_scraped,
+    :needs_llm, :is_hidden, :llm_ready, :llm_ver, :llm_partial, :llm_await, :llm_fix
+)
+"""
+
+
+def _rows_by_ids(conn: sqlite3.Connection, ids: list[str]) -> dict[str, sqlite3.Row]:
+    out: dict[str, sqlite3.Row] = {}
+    if not ids:
+        return out
+    for i in range(0, len(ids), _SQL_IN_CHUNK):
+        chunk = ids[i : i + _SQL_IN_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(f"SELECT * FROM listings WHERE id IN ({marks})", chunk):
+            out[row["id"]] = row
+    return out
+
+
+def _upsert_params(item: Listing, now: str) -> dict:
+    flags = _listing_query_flags(item)
+    return {
+        "id": item.id,
+        "source": item.source,
+        "source_id": item.source_id,
+        "url": item.url,
+        "title": item.title,
+        "property_type": item.property_type,
+        "price": item.price,
+        "currency": item.currency,
+        "price_usd": item.price_usd,
+        "address": item.address,
+        "barrio": item.barrio,
+        "zona": item.zona,
+        "lat": item.lat,
+        "lon": item.lon,
+        "covered_m2": item.covered_m2,
+        "total_m2": item.total_m2,
+        "rooms": item.rooms,
+        "bedrooms": item.bedrooms,
+        "bathrooms": item.bathrooms,
+        "parking": item.parking,
+        "age_years": item.age_years,
+        "image": item.image,
+        "publisher": item.publisher,
+        "description": item.description,
+        "published_at": item.published_at,
+        "price_m2": item.price_m2,
+        "score": item.score,
+        "deal_label": item.deal_label,
+        "vs_barrio_pct": item.vs_barrio_pct,
+        "fingerprint": item.fingerprint,
+        "city": item.city,
+        "quality_score": item.quality_score,
+        "quality_label": item.quality_label,
+        "extra_json": dumps_text(item.extra or {}),
+        "scraped_at": now,
+        "has_exact_location": 1 if item.has_exact_location else 0,
+        "details_scraped": 1 if item.details_scraped else 0,
+        **flags,
+    }
+
+
 def upsert_listings(listings: list[Listing], delete_source: str | None = None, *, notify: bool = True) -> None:
+    if not listings and not delete_source:
+        return
     now = datetime.now(timezone.utc).isoformat()
+    unique: dict[str, Listing] = {}
+    for item in listings:
+        unique[item.id] = item
+    batch = list(unique.values())
     with _write:
         with connect() as conn:
             if delete_source:
                 conn.execute("DELETE FROM listings WHERE source = ?", (delete_source,))
-            for item in listings:
-                row = conn.execute("SELECT * FROM listings WHERE id = ?", (item.id,)).fetchone()
-                if row:
-                    _merge_existing(item, row)
-                data = item.to_dict()
-                flags = _listing_query_flags(item)
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO listings (
-                        id, source, source_id, url, title, property_type, price, currency,
-                        price_usd, address, barrio, zona, lat, lon, covered_m2, total_m2,
-                        rooms, bedrooms, bathrooms, parking, age_years, image, publisher,
-                        description, published_at, price_m2, score, deal_label, vs_barrio_pct,
-                        fingerprint, extra_json, scraped_at, has_exact_location, city,
-                        quality_score, quality_label, details_scraped,
-                        needs_llm, is_hidden, llm_ready, llm_ver, llm_partial, llm_await, llm_fix
-                    ) VALUES (
-                        :id, :source, :source_id, :url, :title, :property_type, :price, :currency,
-                        :price_usd, :address, :barrio, :zona, :lat, :lon, :covered_m2, :total_m2,
-                        :rooms, :bedrooms, :bathrooms, :parking, :age_years, :image, :publisher,
-                        :description, :published_at, :price_m2, :score, :deal_label, :vs_barrio_pct,
-                        :fingerprint, :extra_json, :scraped_at, :has_exact_location, :city,
-                        :quality_score, :quality_label, :details_scraped,
-                        :needs_llm, :is_hidden, :llm_ready, :llm_ver, :llm_partial, :llm_await, :llm_fix
-                    )
-                    """,
-                    {
-                        **{k: data.get(k) for k in [
-                            "id", "source", "source_id", "url", "title", "property_type", "price",
-                            "currency", "price_usd", "address", "barrio", "zona", "lat", "lon",
-                            "covered_m2", "total_m2", "rooms", "bedrooms", "bathrooms", "parking",
-                            "age_years", "image", "publisher", "description", "published_at",
-                            "price_m2", "score", "deal_label", "vs_barrio_pct", "fingerprint",
-                            "city", "quality_score", "quality_label",
-                        ]},
-                        "extra_json": json.dumps(data.get("extra") or {}, ensure_ascii=False),
-                        "scraped_at": now,
-                        "has_exact_location": 1 if data.get("has_exact_location") else 0,
-                        "details_scraped": 1 if data.get("details_scraped") else 0,
-                        **flags,
-                    },
-                )
+            if batch:
+                existing = {} if delete_source else _rows_by_ids(conn, [item.id for item in batch])
+                for item in batch:
+                    row = existing.get(item.id)
+                    if row:
+                        _merge_existing(item, row)
+                conn.executemany(_UPSERT_SQL, [_upsert_params(item, now) for item in batch])
             conn.commit()
     from .market import sync_listing_prices
 
-    sync_listing_prices(listings)
+    sync_listing_prices(batch)
     if notify:
-        _notify_listings(listings)
+        _notify_listings(batch)
 
 
 def upsert_one(item: Listing) -> None:
@@ -578,8 +681,13 @@ def _pins_map(conn: sqlite3.Connection) -> dict:
     return pins
 
 
-def _listing_from_row(row: sqlite3.Row, pin) -> Listing:
-    extra = json.loads(row["extra_json"] or "{}")
+def _listing_from_row(row: sqlite3.Row, pin, *, map_row: bool = False) -> Listing:
+    keys = row.keys()
+    raw = row["extra_json"] if "extra_json" in keys else "{}"
+    slim = map_row
+    if map_row and "extra_map" in keys and row["extra_map"] is not None:
+        raw = row["extra_map"]
+    extra = _loads_extra(raw, map_row=slim)
     return Listing(
         source=row["source"],
         source_id=row["source_id"],
@@ -655,15 +763,21 @@ def fetch_by_cities(cities: set[str] | list[str]) -> list[Listing]:
     if not wanted:
         return []
     marks = ",".join("?" * len(wanted))
+    where = f"city IN ({marks}) ORDER BY price_usd IS NULL, price_usd ASC"
     with connect() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM listings WHERE city IN ({marks}) ORDER BY price_usd IS NULL, price_usd ASC",
-            tuple(wanted),
-        ).fetchall()
+        try:
+            rows = conn.execute(_listing_sql(where, map_row=True), tuple(wanted)).fetchall()
+            map_row = True
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                f"SELECT * FROM listings WHERE {where}",
+                tuple(wanted),
+            ).fetchall()
+            map_row = False
         pins = _pins_map(conn)
     items = []
     for i, row in enumerate(rows):
-        items.append(_listing_from_row(row, pins.get(row["id"])))
+        items.append(_listing_from_row(row, pins.get(row["id"]), map_row=map_row))
         if os.environ.get("PROPMAP_TEST") != "1" and i % 80 == 0:
             time.sleep(0)
     for item in items:
@@ -679,17 +793,21 @@ def fetch_for_city(city_id: str) -> list[Listing]:
     if not wanted:
         return []
     marks = ",".join("?" * len(wanted))
-    sql = (
-        f"SELECT * FROM listings WHERE city IN ({marks}) "
-        "ORDER BY price_usd IS NULL, price_usd ASC"
-    )
+    where = f"city IN ({marks}) ORDER BY price_usd IS NULL, price_usd ASC"
     with connect() as conn:
-        rows = list(conn.execute(sql, tuple(wanted)).fetchall())
+        try:
+            rows = list(conn.execute(_listing_sql(where, map_row=True), tuple(wanted)).fetchall())
+            map_row = True
+        except sqlite3.OperationalError:
+            rows = list(
+                conn.execute(f"SELECT * FROM listings WHERE {where}", tuple(wanted)).fetchall()
+            )
+            map_row = False
         pins = _pins_map(conn)
     items = []
     seen: set[str] = set()
     for i, row in enumerate(rows):
-        item = _listing_from_row(row, pins.get(row["id"]))
+        item = _listing_from_row(row, pins.get(row["id"]), map_row=map_row)
         if item.id in seen:
             continue
         seen.add(item.id)
@@ -776,58 +894,63 @@ def _notify_listings(listings: list[Listing] | None) -> None:
         pass
 
 
+_SCORE_SQL = """
+UPDATE listings
+SET barrio = ?, zona = ?, lat = ?, lon = ?, price_usd = ?, price_m2 = ?,
+    score = ?, deal_label = ?, vs_barrio_pct = ?, fingerprint = ?,
+    has_exact_location = ?, quality_score = ?, quality_label = ?,
+    extra_json = ?, description = ?, details_scraped = ?, city = ?,
+    price = ?, currency = ?, covered_m2 = ?, total_m2 = ?,
+    property_type = ?, address = ?,
+    needs_llm = ?, is_hidden = ?, llm_ready = ?, llm_ver = ?,
+    llm_partial = ?, llm_await = ?, llm_fix = ?
+WHERE id = ?
+"""
+
+
+def _score_params(item: Listing) -> tuple:
+    flags = _listing_query_flags(item)
+    return (
+        item.barrio,
+        item.zona,
+        item.lat,
+        item.lon,
+        item.price_usd,
+        item.price_m2,
+        item.score,
+        item.deal_label,
+        item.vs_barrio_pct,
+        item.fingerprint,
+        1 if item.has_exact_location else 0,
+        item.quality_score,
+        item.quality_label,
+        dumps_text(item.extra or {}),
+        item.description,
+        1 if item.details_scraped else 0,
+        item.city,
+        item.price,
+        item.currency,
+        item.covered_m2,
+        item.total_m2,
+        item.property_type,
+        item.address,
+        flags["needs_llm"],
+        flags["is_hidden"],
+        flags["llm_ready"],
+        flags["llm_ver"],
+        flags["llm_partial"],
+        flags["llm_await"],
+        flags["llm_fix"],
+        item.id,
+    )
+
+
 def update_scores(listings: list[Listing]) -> None:
+    if not listings:
+        return
     with _write:
         with connect() as conn:
-            for item in listings:
-                flags = _listing_query_flags(item)
-                conn.execute(
-                    """
-                    UPDATE listings
-                    SET barrio = ?, zona = ?, lat = ?, lon = ?, price_usd = ?, price_m2 = ?,
-                        score = ?, deal_label = ?, vs_barrio_pct = ?, fingerprint = ?,
-                        has_exact_location = ?, quality_score = ?, quality_label = ?,
-                        extra_json = ?, description = ?, details_scraped = ?, city = ?,
-                        price = ?, currency = ?, covered_m2 = ?, total_m2 = ?,
-                        property_type = ?, address = ?,
-                        needs_llm = ?, is_hidden = ?, llm_ready = ?, llm_ver = ?,
-                        llm_partial = ?, llm_await = ?, llm_fix = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        item.barrio,
-                        item.zona,
-                        item.lat,
-                        item.lon,
-                        item.price_usd,
-                        item.price_m2,
-                        item.score,
-                        item.deal_label,
-                        item.vs_barrio_pct,
-                        item.fingerprint,
-                        1 if item.has_exact_location else 0,
-                        item.quality_score,
-                        item.quality_label,
-                        json.dumps(item.extra or {}, ensure_ascii=False),
-                        item.description,
-                        1 if item.details_scraped else 0,
-                        item.city,
-                        item.price,
-                        item.currency,
-                        item.covered_m2,
-                        item.total_m2,
-                        item.property_type,
-                        item.address,
-                        flags["needs_llm"],
-                        flags["is_hidden"],
-                        flags["llm_ready"],
-                        flags["llm_ver"],
-                        flags["llm_partial"],
-                        flags["llm_await"],
-                        flags["llm_fix"],
-                        item.id,
-                    ),
-                )
+            conn.executemany(_SCORE_SQL, [_score_params(item) for item in listings])
             conn.commit()
     from .market import sync_listing_prices
 
@@ -907,7 +1030,7 @@ def update_extras(listings: list[Listing]) -> None:
             conn.executemany(
                 "UPDATE listings SET extra_json = ? WHERE id = ?",
                 [
-                    (json.dumps(item.extra or {}, ensure_ascii=False), item.id)
+                    (dumps_text(item.extra or {}), item.id)
                     for item in listings
                 ],
             )
@@ -1009,7 +1132,7 @@ def fetch_rentals(city: str | None = None) -> list[dict]:
                 return []
     out = []
     for row in rows:
-        extra = json.loads(row["extra_json"] or "{}")
+        extra = _loads_extra(row["extra_json"] if "extra_json" in row.keys() else "{}")
         out.append(
             {
                 "id": row["id"],
@@ -1082,7 +1205,7 @@ def replace_city_rentals(city: str, rows: list[dict]) -> None:
                         row.get("covered_m2"),
                         row.get("bedrooms"),
                         row.get("city") or city,
-                        json.dumps(row.get("extra") or {}, ensure_ascii=False),
+                        dumps_text(row.get("extra") or {}),
                         now,
                     ),
                 )

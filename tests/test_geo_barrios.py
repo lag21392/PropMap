@@ -185,3 +185,36 @@ def test_overlays_stretch_to_neighbor_barrio():
     east_lons = [p[1] for p in overlays["Güemes"]["ring"][:-1]]
     assert len(overlays["Nueva Córdoba"]["ring"]) >= 4
     assert abs(max(west_lons) - min(east_lons)) < 0.006
+
+
+def test_barrios_for_is_cached_until_polygons_change():
+    from app.geo import barrios_for, remember_city_polygons
+
+    remember_city_polygons(
+        "ciudad-cache-test",
+        [{"name": "Alpha", "zona": "Norte", "lat": 0.0, "lon": 0.0}],
+    )
+    first = barrios_for("ciudad-cache-test")
+    second = barrios_for("ciudad-cache-test")
+    assert first is second
+    remember_city_polygons(
+        "ciudad-cache-test",
+        [
+            {"name": "Alpha", "zona": "Norte", "lat": 0.0, "lon": 0.0},
+            {"name": "Beta", "zona": "Sur", "lat": 1.0, "lon": 1.0},
+        ],
+    )
+    third = barrios_for("ciudad-cache-test")
+    assert third is not first
+    assert {row["name"] for row in third} == {"Alpha", "Beta"}
+
+
+def test_fold_short_cache_matches_raw():
+    from app.geo import _fold_raw, _fold_short, fold
+
+    _fold_short.cache_clear()
+    assert fold("Palermo") == "palermo"
+    assert fold("Palermo") == _fold_raw("Palermo")
+    long = ("áéí " * 40)
+    assert len(long) > 96
+    assert fold(long) == _fold_raw(long)

@@ -23,6 +23,16 @@ def dumps(obj: Any) -> bytes:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def dumps_text(obj: Any) -> str:
+    """Mismo JSON que dumps(), para columnas TEXT de SQLite."""
+    raw = dumps(obj)
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("utf-8")
+    return str(raw)
+
+
 def loads(raw: bytes | str | bytearray) -> Any:
     if orjson is not None:
         return orjson.loads(raw)

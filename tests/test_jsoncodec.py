@@ -1,6 +1,6 @@
 import gzip
 
-from app.jsoncodec import dumps, gunzip_bytes, gzip_bytes, loads
+from app.jsoncodec import dumps, dumps_text, gunzip_bytes, gzip_bytes, loads
 
 
 def test_dumps_roundtrip_unicode():
@@ -29,3 +29,11 @@ def test_gzip_bytes_chunked_roundtrip():
     assert packed[:2] == b"\x1f\x8b"
     assert gunzip_bytes(packed) == payload
     assert gzip.decompress(packed) == payload
+
+
+def test_dumps_text_roundtrip_unicode():
+    text = dumps_text({"title": "Palermo, CABA", "n": 2})
+    assert isinstance(text, str)
+    data = loads(text)
+    assert data["title"] == "Palermo, CABA"
+    assert data["n"] == 2
