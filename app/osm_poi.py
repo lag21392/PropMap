@@ -532,7 +532,7 @@ out center;
     try:
         from .access import kick_access_later
 
-        kick_access_later(city_id)
+        kick_access_later(city_id, now=True)
     except Exception:
         pass
     return payload

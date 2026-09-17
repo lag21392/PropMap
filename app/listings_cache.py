@@ -46,6 +46,7 @@ _persist_queued: set[str] = set()
 _encode_queued: set[str] = set()
 _loading: set[str] = set()
 _warm_queued: set[str] = set()
+_warmed: set[str] = set()
 _encode_at: dict[str, float] = {}
 _disk_preloaded = False
 _force_cache_dir: Path | None = None
@@ -54,6 +55,9 @@ _db_loaded: set[str] = set()
 _catalog_keep_fp = ""
 _build_depth = 0
 _build_gate = threading.Lock()
+_meta_at = 0.0
+_meta_gate = threading.Lock()
+META_REFRESH_SEC = 20.0
 CITY_CACHE_TTL_SEC = 48 * 3600
 KEEP_CITY_GAP_SEC = 1.2
 MAX_RAM_SNAPS = 4
@@ -341,7 +345,7 @@ def _snap_ver_ok_bytes(raw: bytes, *, head: bytes | None = None, tail: bytes | N
 
 
 def reset() -> None:
-    global _rev, _ready, _warming, _usd, _last_run, _disk_preloaded, _force_cache_dir, _catalog_keep_fp, _build_depth
+    global _rev, _ready, _warming, _usd, _last_run, _disk_preloaded, _force_cache_dir, _catalog_keep_fp, _build_depth, _meta_at
     with _lock:
         _rev = 0
         _by_id.clear()
@@ -356,6 +360,7 @@ def reset() -> None:
         _encode_queued.clear()
         _loading.clear()
         _warm_queued.clear()
+        _warmed.clear()
         _encode_at.clear()
         _disk_preloaded = False
         _force_cache_dir = None
@@ -363,6 +368,8 @@ def reset() -> None:
         _catalog_keep_fp = ""
     with _build_gate:
         _build_depth = 0
+    with _meta_gate:
+        _meta_at = 0.0
 
 
 def cache_ready() -> bool:
@@ -573,7 +580,7 @@ def city_counts() -> dict[str, int]:
 
 
 def refresh_city_catalog() -> None:
-    _refresh_meta()
+    _refresh_meta(force=True)
 
 
 def start_warmup() -> None:
@@ -941,6 +948,7 @@ def _warm_city_extras(view_city: str) -> None:
     finally:
         with _lock:
             _warm_queued.discard(view_city)
+            _warmed.add(view_city)
 
 
 def _schedule_city_warm(view_city: str) -> None:
@@ -949,9 +957,10 @@ def _schedule_city_warm(view_city: str) -> None:
         return
     start = False
     with _lock:
-        if view_city not in _warm_queued:
-            _warm_queued.add(view_city)
-            start = True
+        if view_city in _warmed or view_city in _warm_queued:
+            return
+        _warm_queued.add(view_city)
+        start = True
     if start:
         threading.Thread(
             target=_warm_city_extras,
@@ -980,6 +989,14 @@ def request_city_bytes(city: str | None, *, refresh: bool = False) -> None:
         n = len(snap.get("listings") or [])
         incomplete = n < MIN_TRUSTED_SNAP and view_city not in _db_loaded
         if not refresh:
+            if view_city in _db_loaded and not incomplete:
+                if n == 0:
+                    return
+                if snap.get("encoded") and not snap.get("warming"):
+                    return
+                if n and not snap.get("warming"):
+                    _schedule_encode(view_city)
+                    return
             if snap.get("encoded") and not snap.get("warming") and not incomplete:
                 return
             trusted = n >= MIN_TRUSTED_SNAP or view_city in _db_loaded
@@ -2133,11 +2150,19 @@ def _rev_bump_locked() -> None:
     _rev += 1
 
 
-def _refresh_meta() -> None:
-    global _last_run, _usd
+def _refresh_meta(force: bool = False) -> None:
+    """El catálogo de ciudades no cambia por aviso: recalcularlo en cada ingest
+    deja el candado tomado y el watchdog mata el proceso."""
+    global _last_run, _usd, _meta_at
     from .places import listed_cities
     from . import store
 
+    if not force and os.environ.get("PROPMAP_TEST") != "1":
+        now = time.monotonic()
+        with _meta_gate:
+            if now - _meta_at < META_REFRESH_SEC:
+                return
+            _meta_at = now
     try:
         cities = listed_cities([])
         last_run = store.get_meta("last_run", timeout=0.4) or ""

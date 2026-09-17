@@ -53,9 +53,33 @@ def same_local_day(raw: str | None, now: datetime | None = None) -> bool:
     return when.astimezone(_AR).date() == current.astimezone(_AR).date()
 
 
+def city_lookup_already_ran(item: Listing) -> bool:
+    """Hubo una pasada de la LLM para ubicar la ciudad. No cuenta el scrape crudo."""
+    extra = item.extra or {}
+    if extra.get("skip_details") or extra.get("llm_city_ok") or extra.get("llm_ready"):
+        return True
+    if extra.get("llm_at"):
+        return True
+    if extra.get("llm_partial") and extra.get("llm_ver"):
+        return True
+    return False
+
+
+def skip_detail_for_unknown_city(item: Listing) -> bool:
+    """Sin ciudad después de la primera pasada: no gastar otra bajada de ficha."""
+    from .llm_fields import city_is_unassigned
+
+    extra = item.extra or {}
+    if extra.get("skip_details"):
+        return True
+    return city_is_unassigned(item.city) and city_lookup_already_ran(item)
+
+
 def needs_detail_fetch(item: Listing, now: datetime | None = None) -> bool:
     """Ficha HTTP only if we never got it, or a later day and something actually changed."""
     if not item.url:
+        return False
+    if skip_detail_for_unknown_city(item):
         return False
     extra = item.extra or {}
     scraped = bool(item.details_scraped) or bool(extra.get("details_at"))

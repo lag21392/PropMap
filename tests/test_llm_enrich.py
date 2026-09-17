@@ -123,6 +123,12 @@ def test_apply_analysis_keeps_local_listing():
 
 
 def test_apply_analysis_stores_province_from_place_api():
+    from app import place_api
+
+    place_api.remember(
+        "trelew",
+        {"name": "Trelew", "kind": "localidad", "province": "Chubut", "lat": -43.25, "lon": -65.31},
+    )
     item = Listing(
         source="zonaprop",
         source_id="llm-prov",
@@ -137,6 +143,32 @@ def test_apply_analysis_stores_province_from_place_api():
     llm = item.extra.get("llm") or {}
     assert "chubut" in str(place.get("province") or "").lower()
     assert "chubut" in str(llm.get("province") or "").lower()
+
+
+def test_apply_analysis_copies_province_from_city_record():
+    from app.geo import CITIES
+
+    CITIES["ciudad-prov-test"] = {
+        "id": "ciudad-prov-test",
+        "label": "Rawson",
+        "lat": -43.3,
+        "lon": -65.1,
+        "province": "chubut",
+        "barrios": [],
+    }
+    item = Listing(
+        source="zonaprop",
+        source_id="llm-prov-city",
+        url="https://example.com",
+        title="Casa",
+        property_type="casa",
+        city="ciudad-prov-test",
+        extra={"search_city": "ciudad-prov-test"},
+    )
+    apply_analysis(item, {"property_type": "casa", "notes": ""})
+    llm = item.extra.get("llm") or {}
+    place = item.extra.get("llm_place") or {}
+    assert "chubut" in str(llm.get("province") or place.get("province") or "").lower()
 
 
 def test_apply_analysis_does_not_keep_a_pin_in_the_river():
@@ -861,6 +893,66 @@ def test_needs_improve_prioritizes_missing_location_but_also_stale_schema():
     assert needs_improve(broken) is False
 
 
+def test_commit_llm_ok_disables_ficha_when_city_stays_unknown(monkeypatch):
+    from app import llm_enrich
+    from app.models import Listing
+
+    item = Listing(
+        source="zonaprop",
+        source_id="no-place",
+        url="https://example.com/no-place",
+        title="Casa",
+        property_type="casa",
+        city="fuera",
+    )
+    saved = []
+    monkeypatch.setattr(llm_enrich, "apply_analysis", lambda *a, **k: None)
+    monkeypatch.setattr(llm_enrich, "_save_llm_item", lambda row: saved.append(row))
+    monkeypatch.setattr(llm_enrich, "_ops_note", lambda *a, **k: None)
+    llm_enrich._commit_llm_ok(item, {})
+    assert item.extra.get("skip_details") is True
+    assert saved == [item]
+
+
+def test_commit_llm_ok_keeps_ficha_when_city_is_known(monkeypatch):
+    from app import llm_enrich
+    from app.models import Listing
+
+    item = Listing(
+        source="zonaprop",
+        source_id="trelew-ok",
+        url="https://example.com/trelew",
+        title="Casa",
+        property_type="casa",
+        city="trelew",
+    )
+    monkeypatch.setattr(llm_enrich, "apply_analysis", lambda *a, **k: None)
+    monkeypatch.setattr(llm_enrich, "_save_llm_item", lambda row: None)
+    monkeypatch.setattr(llm_enrich, "_ops_note", lambda *a, **k: None)
+    llm_enrich._commit_llm_ok(item, {})
+    assert not item.extra.get("skip_details")
+
+
+def test_commit_llm_fail_disables_ficha_when_city_unknown(monkeypatch):
+    from app import llm_enrich
+    from app.models import Listing
+
+    item = Listing(
+        source="zonaprop",
+        source_id="no-place-fail",
+        url="https://example.com/no-place-fail",
+        title="Casa",
+        property_type="casa",
+        city="fuera",
+        extra={"llm_tries": llm_enrich.MAX_TRIES - 1},
+    )
+    monkeypatch.setattr(llm_enrich, "_save_llm_item", lambda row: None)
+    monkeypatch.setattr(llm_enrich, "_ops_note", lambda *a, **k: None)
+    llm_enrich._commit_llm_fail(item.id, item)
+    assert item.extra.get("skip_details") is True
+    assert item.extra.get("llm_city_ok") is True
+
+
 def test_analyze_listing_one_shot_without_tools(monkeypatch):
     from app import llm_enrich
     from app.geo import remember_city_polygons
@@ -1156,3 +1248,205 @@ def test_assign_city_skips_remote_ensure_place(monkeypatch):
     monkeypatch.setattr("app.place_api.lookup_place", lambda *_a, **_k: None)
     monkeypatch.setattr(llm_enrich, "_city_from_label", lambda _label: None)
     assert llm_enrich._ensure_assigned_city("Chacras del Lago") is None
+
+
+def test_save_llm_item_does_not_rebuild_city_cache(monkeypatch):
+    from app import llm_enrich
+
+    kicked = []
+    monkeypatch.setattr("app.store.upsert_listings", lambda rows, **k: None)
+    monkeypatch.setattr("app.listings_cache.request_city_bytes", lambda *a, **k: kicked.append(a))
+    item = Listing(
+        source="zonaprop",
+        source_id="llm-save",
+        url="https://example.com/llm-save",
+        title="Depto",
+        property_type="departamento",
+        city="villa-canto",
+    )
+    llm_enrich._save_llm_item(item)
+    assert kicked == []
+
+
+def test_commit_llm_ok_is_deferred_in_production(monkeypatch):
+    import threading
+    import time
+
+    from app import llm_enrich
+    from app.models import Listing
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    monkeypatch.setattr(llm_enrich, "enabled", lambda: True)
+    item = Listing(
+        source="zonaprop",
+        source_id="async-ok",
+        url="https://example.com/async-ok",
+        title="Depto",
+        property_type="departamento",
+        city="caba",
+        description="Departamento en venta con living comedor y dos dormitorios. " * 3,
+        extra={"search_city": "caba"},
+    )
+    applied = threading.Event()
+
+    def slow_commit(row, data):
+        time.sleep(0.25)
+        applied.set()
+
+    monkeypatch.setattr("app.store.get_listing", lambda listing_id: item)
+    monkeypatch.setattr("app.freshness.needs_detail_fetch", lambda _row: False)
+    monkeypatch.setattr(llm_enrich, "analyze_listing", lambda row: {"property_type": "departamento"})
+    monkeypatch.setattr(llm_enrich, "_commit_llm_ok", slow_commit)
+    started = time.time()
+    llm_enrich._enrich_id_inner(item.id)
+    assert time.time() - started < 0.2
+    assert applied.wait(1)
+
+
+def test_prepare_builds_prompt_without_touching_the_gpu(monkeypatch):
+    from app import llm_enrich
+
+    item = Listing(
+        source="zonaprop",
+        source_id="prep-only",
+        url="https://example.com/prep-only",
+        title="Depto 2 amb",
+        property_type="departamento",
+        city="caba",
+        description="Departamento en venta con living comedor y dos dormitorios. " * 3,
+        details_scraped=True,
+        extra={"search_city": "caba"},
+    )
+
+    def boom(*_a, **_k):
+        raise AssertionError("el prompt se arma sin pedirle nada a la GPU")
+
+    monkeypatch.setattr(llm_enrich, "enabled", lambda: True)
+    monkeypatch.setattr("app.store.get_listing", lambda listing_id: item)
+    monkeypatch.setattr("app.freshness.needs_detail_fetch", lambda _row: False)
+    monkeypatch.setattr(llm_enrich, "_chat", boom)
+    llm_enrich._busy.clear()
+    job = llm_enrich._prepare_id(item.id)
+    assert job is not None
+    listing_id, row, prep = job
+    assert listing_id == item.id
+    assert row is item
+    assert "lugar_buscado:" in prep["prompt"]
+    assert item.id in llm_enrich._busy
+    llm_enrich._busy.clear()
+
+
+def test_finish_job_saves_and_frees_the_listing(monkeypatch):
+    import time
+
+    from app import llm_enrich
+
+    item = Listing(
+        source="zonaprop",
+        source_id="finish-job",
+        url="https://example.com/finish-job",
+        title="Casa 3 amb",
+        property_type="casa",
+        city="caba",
+        extra={"search_city": "caba"},
+    )
+    saved = []
+    monkeypatch.setattr(llm_enrich, "enabled", lambda: True)
+    monkeypatch.setattr(llm_enrich, "_save_llm_item", lambda row: saved.append(row.id))
+    prep = {"search": "caba", "blob": "Casa 3 amb", "places": [], "need_geo": False}
+    with llm_enrich._lock:
+        llm_enrich._busy[item.id] = time.time()
+        llm_enrich._seen.add(item.id)
+    llm_enrich._finish_job(item.id, item, prep, '{"property_type":"casa","rooms":3}')
+    assert saved == [item.id]
+    assert item.extra.get("llm_ready") is True
+    assert item.id not in llm_enrich._busy
+    assert item.id not in llm_enrich._seen
+
+
+def test_finish_async_uses_one_saving_thread(monkeypatch):
+    import threading
+
+    from app import llm_enrich
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    seen: list[str] = []
+    done = threading.Event()
+
+    def note() -> None:
+        seen.append(threading.current_thread().name)
+        if len(seen) == 2:
+            done.set()
+
+    llm_enrich._finish_async(note)
+    llm_enrich._finish_async(note)
+    assert done.wait(5)
+    assert seen == ["llm-apply", "llm-apply"]
+
+
+def test_queue_stats_reports_prepared_jobs(monkeypatch):
+    from app import llm_enrich
+
+    monkeypatch.setattr(llm_enrich, "llama_status", lambda: {"ok": True, "gpu": True, "n_ctx": 2048})
+    llm_enrich._ready.clear()
+    llm_enrich._ready.append(("zonaprop:x", None, {}))
+    try:
+        assert llm_enrich.queue_stats()["ready"] == 1
+    finally:
+        llm_enrich._ready.clear()
+
+
+def test_pop_keeps_same_city_for_prompt_cache():
+    from app import llm_enrich
+
+    llm_enrich._urgent.clear()
+    llm_enrich._queue.clear()
+    llm_enrich._seen.clear()
+    llm_enrich._id_city.clear()
+    llm_enrich._busy.clear()
+    llm_enrich._skip_until.clear()
+    llm_enrich._last_prompt_city = "cordoba"
+    llm_enrich._id_city["zonaprop:caba"] = "caba"
+    llm_enrich._id_city["zonaprop:cba"] = "cordoba"
+    llm_enrich._queue.extend(["zonaprop:caba", "zonaprop:cba"])
+    assert llm_enrich._pop() == "zonaprop:cba"
+    assert list(llm_enrich._queue) == ["zonaprop:caba"]
+
+
+def test_maybe_queue_province_uses_city_label(monkeypatch):
+    from app import llm_enrich
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    monkeypatch.setattr(llm_enrich, "_ensure_prov_workers_locked", lambda: None)
+    llm_enrich._prov_q.clear()
+    llm_enrich._prov_ids.clear()
+    item = Listing(
+        source="zonaprop",
+        source_id="prov-q",
+        url="https://example.com/prov-q",
+        title="Casa",
+        property_type="casa",
+        city="fuera",
+        extra={"llm": {"city_label": "Trelew"}},
+    )
+    llm_enrich._maybe_queue_province(item)
+    assert llm_enrich._prov_q[0][1] == "Trelew"
+
+
+def test_maybe_queue_province_uses_city_id_if_no_label(monkeypatch):
+    from app import llm_enrich
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    monkeypatch.setattr(llm_enrich, "_ensure_prov_workers_locked", lambda: None)
+    llm_enrich._prov_q.clear()
+    llm_enrich._prov_ids.clear()
+    item = Listing(
+        source="zonaprop",
+        source_id="prov-slug",
+        url="https://example.com/prov-slug",
+        title="Casa",
+        property_type="casa",
+        city="localidad-sin-catalogo-xyz",
+    )
+    llm_enrich._maybe_queue_province(item)
+    assert llm_enrich._prov_q[0][1] == "localidad sin catalogo xyz"

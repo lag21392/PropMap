@@ -44,7 +44,12 @@ services:
       TOR_SOCKS: "${TOR_SOCKS:-socks5h://tor:9050}"
       TOR_CIRCUITS: "${TOR_CIRCUITS:-4}"
       SCRAPE_PROXIES: "${SCRAPE_PROXIES:-}"
-      SCRAPE_USE_LOCAL: "${SCRAPE_USE_LOCAL:-0}"
+      # Último recurso cuando Tor y los proxys quedan bloqueados, con espera
+      # mínima entre salidas y tope por día para no exponer la IP de casa.
+      SCRAPE_USE_LOCAL: "${SCRAPE_USE_LOCAL:-1}"
+      SCRAPE_LOCAL_GAP_SEC: "${SCRAPE_LOCAL_GAP_SEC:-20}"
+      SCRAPE_LOCAL_PARALLEL: "${SCRAPE_LOCAL_PARALLEL:-4}"
+      SCRAPE_LOCAL_MAX_DAY: "${SCRAPE_LOCAL_MAX_DAY:-600}"
       MATOMO_INTERNAL_URL: "${MATOMO_INTERNAL_URL}"
       MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL}"
       MATOMO_SITE_ID: "${MATOMO_SITE_ID:-1}"

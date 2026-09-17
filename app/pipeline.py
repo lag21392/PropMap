@@ -669,8 +669,14 @@ def _scrape_one_city(
                         mark_await_llm(item)
             store.upsert_many(chunk)
             from .detail_fetch import enqueue as enqueue_details
+            from .freshness import has_usable_listing_text
+            from .llm_enrich import enqueue as enqueue_llm
 
             enqueue_details(chunk)
+            if not country:
+                ready = [item for item in chunk if has_usable_listing_text(item)]
+                if ready:
+                    enqueue_llm(ready, urgent=True)
         if source:
             try:
                 from .ops import note as ops_note
@@ -733,6 +739,12 @@ def _scrape_one_city(
                                 mark_await_llm(item)
                             pin_listing_city(item, remote=False)
                         store.upsert_many(items)
+                    from .freshness import has_usable_listing_text
+                    from .llm_enrich import enqueue as enqueue_llm
+
+                    ready = [item for item in items if has_usable_listing_text(item)]
+                    if ready:
+                        enqueue_llm(ready, urgent=True)
                     if not stop():
                         dropped = _retire_unseen(city_id, name, seen_ids.get(name) or set())
                         if dropped:
@@ -1215,7 +1227,7 @@ def _tick_background_upkeep(running: set[str] | None = None) -> None:
             break
         if store.get_meta(f"access_ver:{cid}") != f"{ACCESS_VERSION}:{POI_VERSION}":
             ensure_city_pois(cid, blocking=False)
-            kick_access_later(cid)
+            kick_access_later(cid, now=True)
             n_access += 1
     from .backfill import pump
 

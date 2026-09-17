@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -22,11 +23,26 @@ _RUN_META = f"llm_run:{LLM_SCHEMA}"
 _urgent: deque[str] = deque()
 _queue: deque[str] = deque()
 _seen: set[str] = set()
+_id_city: dict[str, str] = {}
+_last_prompt_city = ""
 _lock = threading.Lock()
+_ready: deque[tuple[str, Listing, dict[str, Any]]] = deque()
+_ready_cv = threading.Condition()
+_prep_workers = 0
+PREP_WORKERS = 2
+READY_CAP = 3
+_out_q: queue.Queue[Any] = queue.Queue(maxsize=16)
+_out_lock = threading.Lock()
+_out_worker: threading.Thread | None = None
+_prov_lock = threading.Lock()
+_prov_q: deque[tuple[str, str, str]] = deque()
+_prov_ids: set[str] = set()
+_prov_workers = 0
+MAX_PROV_WORKERS = 2
 _workers = 0
 MAX_TRIES = 2
 QUEUE_CAP = 48
-MAX_TOKENS = 192
+MAX_TOKENS = 96
 CHAT_TIMEOUT_SEC = 40.0
 CHAT_CONNECT_SEC = 3.0
 STUCK_SEC = 15.0
@@ -359,6 +375,8 @@ def queue_stats() -> dict[str, Any]:
             "pending": pending,
             "urgent": len(_urgent),
             "rest": len(_queue),
+            "ready": len(_ready),
+            "saving": _out_q.qsize(),
             "cleaning": len(_busy),
             "workers": llm_workers(),
             "cap": QUEUE_CAP,
@@ -448,9 +466,11 @@ def enqueue(listings: list[Listing] | None, *, urgent: bool = False) -> None:
                 if _queue:
                     dropped = _queue.pop()
                     _seen.discard(dropped)
+                    _id_city.pop(dropped, None)
                 else:
                     continue
             _seen.add(item.id)
+            _id_city[item.id] = _prompt_group(item)
             if (
                 location_incomplete(item)
                 or extra.get("await_llm")
@@ -497,6 +517,7 @@ def refill(prefer_city: str = "") -> int:
         take.append(item)
         if len(take) >= room:
             break
+    take.sort(key=lambda item: (_prompt_group(item), item.id))
     if take:
         enqueue(take)
     elif os.environ.get("PROPMAP_TEST") != "1":
@@ -515,21 +536,45 @@ def _promote(listing_id: str) -> None:
         _urgent.appendleft(listing_id)
 
 
+def _prompt_group(item: Listing) -> str:
+    from .llm_fields import city_is_unassigned
+
+    extra = item.extra or {}
+    cid = str(extra.get("search_city") or item.city or "").strip()
+    if city_is_unassigned(cid):
+        return ""
+    return cid
+
+
+def _pop_from(q: deque[str], now: float, prefer: str) -> str | None:
+    skipped: list[str] = []
+    other: list[str] = []
+    found = None
+    while q:
+        lid = q.popleft()
+        if lid in _busy or (_skip_until.get(lid) or 0) > now:
+            skipped.append(lid)
+            continue
+        if prefer and _id_city.get(lid, "") != prefer:
+            other.append(lid)
+            continue
+        found = lid
+        break
+    if found is None and other:
+        found = other.pop(0)
+    for lid in reversed(other):
+        q.appendleft(lid)
+    if skipped:
+        q.extend(skipped)
+    return found
+
+
 def _pop() -> str | None:
     now = time.time()
     with _lock:
+        prefer = _last_prompt_city
         for q in (_urgent, _queue):
-            skipped: list[str] = []
-            found = None
-            while q:
-                lid = q.popleft()
-                if lid in _busy or (_skip_until.get(lid) or 0) > now:
-                    skipped.append(lid)
-                    continue
-                found = lid
-                break
-            if skipped:
-                q.extend(skipped)
+            found = _pop_from(q, now, prefer)
             if found:
                 return found
     return None
@@ -540,46 +585,137 @@ def _has_work() -> bool:
 
 
 def _wanted_workers() -> int:
-    """Un hilo en la GPU y otro armando el aviso siguiente. Sigue habiendo 1 slot llama.cpp."""
-    want = llm_workers()
+    """Un hilo: Pascal tiene 1 slot. El segundo se pisa y alarga cada aviso."""
     if llm_provider() != "local":
-        return want
-    return min(want + 1, 2)
+        return llm_workers()
+    return 1
 
 
 def _ensure_workers_locked() -> None:
-    global _workers
+    global _workers, _prep_workers
     testing = os.environ.get("PROPMAP_TEST") == "1"
     want = _wanted_workers()
     while _workers < want and (not testing or _has_work()):
         _workers += 1
         threading.Thread(target=_drain, daemon=True, name=f"llm-enrich-{_workers}").start()
+    if testing:
+        return
+    while _prep_workers < PREP_WORKERS:
+        _prep_workers += 1
+        threading.Thread(target=_drain_prep, daemon=True, name=f"llm-prep-{_prep_workers}").start()
 
 
 def _drain() -> None:
+    """Turno de GPU: manda el prompt ya armado y suelta el resultado. No lee ni escribe SQLite."""
     global _workers
     testing = os.environ.get("PROPMAP_TEST") == "1"
     try:
         while True:
-            listing_id = _pop()
-            if listing_id:
+            if testing:
+                listing_id = _pop()
+                if not listing_id:
+                    return
                 try:
                     _enrich_id(listing_id)
                 except Exception:
                     pass
                 continue
-            if testing:
-                return
+            job = _take_prepared(0.4)
+            if job is None:
+                continue
+            listing_id, item, prep = job
             try:
-                if refill():
-                    continue
+                raw = _chat_json(str(prep.get("prompt") or ""))
             except Exception:
-                pass
-            time.sleep(0.4)
+                raw = ""
+            _finish_async(
+                lambda lid=listing_id, row=item, pre=prep, txt=raw: _finish_job(lid, row, pre, txt)
+            )
     finally:
         with _lock:
             _workers = max(0, _workers - 1)
             _ensure_workers_locked()
+
+
+def _take_prepared(timeout: float) -> tuple[str, Listing, dict[str, Any]] | None:
+    with _ready_cv:
+        if not _ready:
+            _ready_cv.wait(timeout)
+        if _ready:
+            job = _ready.popleft()
+            _ready_cv.notify_all()
+            return job
+    return None
+
+
+def _drain_prep() -> None:
+    """Etapa de entrada: SQLite y armado del prompt mientras la GPU trabaja en el anterior."""
+    global _prep_workers
+    try:
+        while True:
+            with _ready_cv:
+                while len(_ready) >= READY_CAP:
+                    _ready_cv.wait(1.0)
+            listing_id = _pop()
+            if not listing_id:
+                try:
+                    if refill():
+                        continue
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                continue
+            try:
+                job = _prepare_id(listing_id)
+            except Exception:
+                job = None
+                with _lock:
+                    _busy.pop(listing_id, None)
+                    _seen.discard(listing_id)
+            if job is None:
+                continue
+            with _ready_cv:
+                _ready.append(job)
+                _ready_cv.notify_all()
+    finally:
+        with _lock:
+            _prep_workers = max(0, _prep_workers - 1)
+            _ensure_workers_locked()
+
+
+def _prepare_id(listing_id: str) -> tuple[str, Listing, dict[str, Any]] | None:
+    item = store.get_listing(listing_id)
+    if not item or not needs_improve(item):
+        with _lock:
+            _seen.discard(listing_id)
+        return None
+    if _needs_details_first(listing_id, item):
+        return None
+    prep = _build_job(item)
+    if not prep:
+        with _lock:
+            _seen.discard(listing_id)
+        return None
+    with _lock:
+        _busy[listing_id] = time.time()
+    return listing_id, item, prep
+
+
+def _finish_job(listing_id: str, item: Listing, prep: dict[str, Any], raw: str) -> None:
+    """Etapa de salida: parseo, apply y SQLite ya con la GPU en el aviso siguiente."""
+    try:
+        data = _finish_analysis(item, prep, raw)
+        if not data:
+            _commit_llm_fail(listing_id, item)
+            return
+        with _lock:
+            _skip_until.pop(listing_id, None)
+            if listing_id not in _urgent and listing_id not in _queue:
+                _seen.discard(listing_id)
+        _commit_llm_ok(item, data)
+    finally:
+        with _lock:
+            _busy.pop(listing_id, None)
 
 
 def _enrich_id(listing_id: str) -> None:
@@ -618,65 +754,44 @@ def _enrich_id(listing_id: str) -> None:
 def _save_llm_item(item: Listing) -> None:
     """SQLite only: rebuild del mapa en este hilo traba la GPU."""
     store.upsert_listings([item], notify=False)
-    cid = str(item.city or "").strip()
-    if cid and cid not in {"fuera", "otros", "argentina"}:
-        try:
-            from .listings_cache import request_city_bytes
+    _maybe_queue_province(item)
 
-            request_city_bytes(cid)
+
+def _out_loop() -> None:
+    while True:
+        fn = _out_q.get()
+        try:
+            fn()
         except Exception:
             pass
+        finally:
+            _out_q.task_done()
 
 
-def _enrich_id_inner(listing_id: str) -> None:
-    item = store.get_listing(listing_id)
-    if not item:
-        with _lock:
-            _seen.discard(listing_id)
+def _finish_async(fn) -> None:
+    """Cola de salida: un solo hilo aplica y escribe, así no pelea el write lock de SQLite."""
+    global _out_worker
+    if os.environ.get("PROPMAP_TEST") == "1":
+        fn()
         return
+    with _out_lock:
+        if _out_worker is None or not _out_worker.is_alive():
+            _out_worker = threading.Thread(target=_out_loop, daemon=True, name="llm-apply")
+            _out_worker.start()
+    _out_q.put(fn)
+
+
+def _mark_no_city_skip_details(item: Listing) -> None:
+    """Si la pasada de ciudad no dio localidad, no reintentar la ficha."""
+    from .llm_fields import city_is_unassigned
+
     extra = dict(item.extra or {})
-    if not needs_improve(item):
-        with _lock:
-            _seen.discard(listing_id)
-        return
-    from .freshness import has_usable_listing_text, needs_detail_fetch
-    from . import detail_fetch
-
-    if needs_detail_fetch(item):
-        with detail_fetch._lock:
-            already = listing_id in detail_fetch._seen
-        detail_fetch.enqueue([item])
-        if not has_usable_listing_text(item) and not already:
-            with _lock:
-                _seen.discard(listing_id)
-            return
-    time.sleep(0)
-    data = analyze_listing(item)
-    if not data:
-        extra = dict(item.extra or {})
-        extra["llm_tries"] = int(extra.get("llm_tries") or 0) + 1
+    if city_is_unassigned(item.city):
+        extra["skip_details"] = True
         item.extra = extra
-        if extra["llm_tries"] >= MAX_TRIES:
-            extra["llm_ready"] = True
-            extra["llm_partial"] = True
-            extra["llm_ver"] = LLM_SCHEMA
-            extra["await_llm"] = False
-            extra["llm_city_ok"] = True
-            extra["llm_repair"] = True
-            extra["llm_at"] = _now_iso()
-            item.extra = extra
-            _save_llm_item(item)
-            _ops_note("llm", outcome="partial")
-            with _lock:
-                _seen.discard(listing_id)
-                _skip_until.pop(listing_id, None)
-        else:
-            _save_llm_item(item)
-            with _lock:
-                _seen.discard(listing_id)
-                _skip_until[listing_id] = time.time() + SKIP_FAIL_SEC
-            _ops_note("llm", outcome="retry")
-        return
+
+
+def _commit_llm_ok(item: Listing, data: dict[str, Any]) -> None:
     apply_analysis(item, data)
     extra = dict(item.extra or {})
     extra["llm_ready"] = True
@@ -687,12 +802,77 @@ def _enrich_id_inner(listing_id: str) -> None:
     extra["llm_repair"] = True
     extra["llm_at"] = _now_iso()
     item.extra = extra
+    _mark_no_city_skip_details(item)
     _save_llm_item(item)
     _ops_note("llm", outcome="ok")
+
+
+def _needs_details_first(listing_id: str, item: Listing) -> bool:
+    """True si el aviso todavía no tiene texto para analizar: primero baja la ficha."""
+    from . import detail_fetch
+    from .freshness import has_usable_listing_text, needs_detail_fetch
+
+    if not needs_detail_fetch(item):
+        return False
+    with detail_fetch._lock:
+        already = listing_id in detail_fetch._seen
+    detail_fetch.enqueue([item])
+    if has_usable_listing_text(item) or already:
+        return False
+    with _lock:
+        _seen.discard(listing_id)
+    return True
+
+
+def _commit_llm_fail(listing_id: str, item: Listing) -> None:
+    extra = dict(item.extra or {})
+    extra["llm_tries"] = int(extra.get("llm_tries") or 0) + 1
+    item.extra = extra
+    if extra["llm_tries"] >= MAX_TRIES:
+        extra["llm_ready"] = True
+        extra["llm_partial"] = True
+        extra["llm_ver"] = LLM_SCHEMA
+        extra["await_llm"] = False
+        extra["llm_city_ok"] = True
+        extra["llm_repair"] = True
+        extra["llm_at"] = _now_iso()
+        item.extra = extra
+        _mark_no_city_skip_details(item)
+        _save_llm_item(item)
+        _ops_note("llm", outcome="partial")
+        with _lock:
+            _seen.discard(listing_id)
+            _skip_until.pop(listing_id, None)
+        return
+    _save_llm_item(item)
+    with _lock:
+        _seen.discard(listing_id)
+        _skip_until[listing_id] = time.time() + SKIP_FAIL_SEC
+    _ops_note("llm", outcome="retry")
+
+
+def _enrich_id_inner(listing_id: str) -> None:
+    item = store.get_listing(listing_id)
+    if not item:
+        with _lock:
+            _seen.discard(listing_id)
+        return
+    if not needs_improve(item):
+        with _lock:
+            _seen.discard(listing_id)
+        return
+    if _needs_details_first(listing_id, item):
+        return
+    time.sleep(0)
+    data = analyze_listing(item)
+    if not data:
+        _commit_llm_fail(listing_id, item)
+        return
     with _lock:
         _skip_until.pop(listing_id, None)
         if listing_id not in _urgent and listing_id not in _queue:
             _seen.discard(listing_id)
+    _finish_async(lambda: _commit_llm_ok(item, data))
 
 
 def _scrub(text: str) -> str:
@@ -704,18 +884,19 @@ def _looks_like_intersection(text: str) -> bool:
     return looks_like_intersection(text)
 
 
-def analyze_listing(item: Listing) -> dict[str, Any] | None:
+def _build_job(item: Listing) -> dict[str, Any] | None:
+    """Todo el CPU previo al pedido: Georef cacheado, barrios y prompt."""
     if not enabled():
         return None
-    from .llm_fields import build_extract_prompt, city_is_unassigned, clamp_extracted, extract_json_obj
-    from .place_api import listing_places, place_conflicts_city
+    from .llm_fields import build_extract_prompt, city_is_unassigned
+    from .place_api import listing_places
 
     search = str((item.extra or {}).get("search_city") or item.city or "")
+    global _last_prompt_city
+    _last_prompt_city = _prompt_group(item)
     title = _scrub(item.title or "")
     address = _scrub(item.address or "")
     description = _scrub(item.description or "")
-    blob = " ".join(p for p in (title, address, description) if p)
-    need_geo = city_is_unassigned(search)
     places = listing_places(item, remote=False)
     known = []
     for place in places:
@@ -734,11 +915,26 @@ def analyze_listing(item: Listing) -> dict[str, Any] | None:
         known_places=known,
         fixes=list((item.extra or {}).get("data_fixes") or []),
     )
-    raw = _chat_json(prompt)
+    return {
+        "prompt": prompt,
+        "search": search,
+        "blob": " ".join(p for p in (title, address, description) if p),
+        "places": places,
+        "need_geo": city_is_unassigned(search),
+    }
+
+
+def _finish_analysis(item: Listing, prep: dict[str, Any], raw: str) -> dict[str, Any] | None:
+    from .llm_fields import clamp_extracted, extract_json_obj
+    from .place_api import place_conflicts_city
+
     data = extract_json_obj(raw)
     if not data:
         return None
-    data = clamp_extracted(data, city=search, blob=blob)
+    search = str(prep.get("search") or "")
+    places = list(prep.get("places") or [])
+    need_geo = bool(prep.get("need_geo"))
+    data = clamp_extracted(data, city=search, blob=str(prep.get("blob") or ""))
     for place in places:
         if search and place_conflicts_city(place, search):
             data["foreign"] = True
@@ -754,6 +950,13 @@ def analyze_listing(item: Listing) -> dict[str, Any] | None:
                 break
     data["geo_tools"] = {"found": {}, "checked": [], "geo": None}
     return data
+
+
+def analyze_listing(item: Listing) -> dict[str, Any] | None:
+    prep = _build_job(item)
+    if not prep:
+        return None
+    return _finish_analysis(item, prep, _chat_json(str(prep.get("prompt") or "")))
 
 
 def _chat_json(prompt: str) -> str:
@@ -1023,7 +1226,10 @@ def apply_analysis(item: Listing, data: dict[str, Any]) -> None:
     extra = dict(item.extra or {})
     _apply_place_api(item, data)
     extra = dict(item.extra or {})
-    if _maybe_assign_city(item, data):
+    moved = _maybe_assign_city(item, data)
+    _stamp_province_from_city(item, data)
+    extra = dict(item.extra or {})
+    if moved:
         return
     extra = dict(item.extra or {})
     llm_address = bool(address and not _looks_like_intersection(address)) or bool(street and number)
@@ -1137,6 +1343,152 @@ def _fill_number(item: Listing, field: str, value: Any, allow_float: bool = Fals
         setattr(item, field, number)
 
 
+def _extra_province(extra: dict | None) -> str:
+    extra = extra or {}
+    place = extra.get("llm_place") if isinstance(extra.get("llm_place"), dict) else {}
+    llm = extra.get("llm") if isinstance(extra.get("llm"), dict) else {}
+    return str(place.get("province") or llm.get("province") or "").strip()
+
+
+def _write_province(item: Listing, data: dict[str, Any], province: str, *, name: str = "") -> None:
+    raw = (province or "").strip()
+    if not raw:
+        return
+    extra = dict(item.extra or {})
+    llm = dict(extra.get("llm") or {})
+    place = dict(extra.get("llm_place") or {})
+    if not str(place.get("province") or "").strip():
+        place["province"] = raw
+        if name:
+            place.setdefault("name", name)
+        extra["llm_place"] = place
+    if not str(llm.get("province") or "").strip():
+        llm["province"] = raw
+        extra["llm"] = llm
+    if not str(data.get("province") or "").strip():
+        data["province"] = raw
+    item.extra = extra
+    cid = str(item.city or "").strip()
+    if cid:
+        from .places import apply_city_province
+
+        apply_city_province(cid, raw)
+
+
+def _province_for_city_id(city_id: str) -> str:
+    from .geo import same_place_ids
+    from .llm_fields import city_is_unassigned
+    from .places import _is_caba_province, _province_display
+
+    if not city_id or city_is_unassigned(city_id):
+        return ""
+    seen: set[str] = set()
+    for cid in (city_id, *(same_place_ids(city_id) or [])):
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        raw = str((CITIES.get(cid) or {}).get("province") or "").strip()
+        if not raw:
+            continue
+        pretty = _province_display(raw)
+        if pretty and not _is_caba_province(pretty):
+            return pretty
+        if not _is_caba_province(raw):
+            return raw
+    return ""
+
+
+def _stamp_province_from_city(item: Listing, data: dict[str, Any]) -> None:
+    extra = dict(item.extra or {})
+    if _extra_province(extra):
+        return
+    cid = str(item.city or extra.get("search_city") or "").strip()
+    pretty = _province_for_city_id(cid)
+    if not pretty:
+        from .place_api import lookup_place
+
+        label = str((CITIES.get(cid) or {}).get("label") or cid)
+        if label:
+            place = lookup_place(label, remote=False)
+            pretty = str((place or {}).get("province") or "").strip()
+    if not pretty:
+        return
+    name = str((extra.get("llm_place") or {}).get("name") or (CITIES.get(cid) or {}).get("label") or "")
+    _write_province(item, data, pretty, name=name)
+
+
+def _maybe_queue_province(item: Listing) -> None:
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return
+    extra = item.extra or {}
+    if _extra_province(extra):
+        return
+    llm = extra.get("llm") if isinstance(extra.get("llm"), dict) else {}
+    place = extra.get("llm_place") if isinstance(extra.get("llm_place"), dict) else {}
+    label = str(llm.get("city_label") or place.get("name") or "").strip()
+    cid = str(item.city or extra.get("search_city") or "").strip()
+    if not label:
+        label = str((CITIES.get(cid) or {}).get("label") or "").strip()
+    if not label and cid and cid not in {"fuera", "otros", "argentina"}:
+        label = cid.replace("-", " ").strip()
+    if not label:
+        return
+    lid = item.id
+    with _prov_lock:
+        if lid in _prov_ids:
+            return
+        _prov_ids.add(lid)
+        _prov_q.append((lid, label, cid))
+        _ensure_prov_workers_locked()
+
+
+def _ensure_prov_workers_locked() -> None:
+    global _prov_workers
+    while _prov_workers < MAX_PROV_WORKERS and _prov_q:
+        _prov_workers += 1
+        threading.Thread(target=_drain_province, daemon=True, name="llm-province").start()
+
+
+def _drain_province() -> None:
+    global _prov_workers
+    try:
+        while True:
+            with _prov_lock:
+                if not _prov_q:
+                    return
+                listing_id, label, city = _prov_q.popleft()
+            try:
+                _fill_province_remote(listing_id, label, city)
+            except Exception:
+                pass
+            finally:
+                with _prov_lock:
+                    _prov_ids.discard(listing_id)
+    finally:
+        with _prov_lock:
+            _prov_workers = max(0, _prov_workers - 1)
+            _ensure_prov_workers_locked()
+
+
+def _fill_province_remote(listing_id: str, label: str, city: str) -> None:
+    from .place_api import lookup_place
+
+    place = lookup_place(label, remote=True)
+    if not place:
+        cfg = CITIES.get(city) or {}
+        fallback = str(cfg.get("label") or "").strip()
+        if fallback and fallback != label:
+            place = lookup_place(fallback, remote=True)
+    province = str((place or {}).get("province") or "").strip()
+    if not province:
+        return
+    item = store.get_listing(listing_id)
+    if not item or _extra_province(item.extra):
+        return
+    _write_province(item, {}, province, name=str((place or {}).get("name") or label))
+    store.upsert_listings([item], notify=False)
+
+
 def _apply_place_api(item: Listing, data: dict[str, Any]) -> None:
     from .place_api import lookup_place, place_conflicts_city
     from .places import apply_city_province
@@ -1148,8 +1500,6 @@ def _apply_place_api(item: Listing, data: dict[str, Any]) -> None:
     if not label:
         return
     place = lookup_place(label, province_hint=hint or None, remote=False)
-    if not place or (hint and not str(place.get("province") or "").strip()):
-        place = lookup_place(label, province_hint=hint or None, remote=os.environ.get("PROPMAP_TEST") != "1") or place
     if not place:
         return
     province = str(place.get("province") or hint or "").strip()
@@ -1165,7 +1515,7 @@ def _apply_place_api(item: Listing, data: dict[str, Any]) -> None:
         extra["llm"] = llm
         data["province"] = province
     item.extra = extra
-    if item.city:
+    if item.city and province:
         apply_city_province(item.city, province)
     from .llm_fields import city_is_unassigned
 

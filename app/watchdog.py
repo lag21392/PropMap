@@ -21,6 +21,7 @@ LOCK_WAIT_SEC = 1.2
 HTTP_WAIT_SEC = 1.5
 STALE_SEC = 12.0
 SUICIDE_FAILS = 8
+DUMP_AT_FAILS = 3
 BOOT_GRACE_SEC = 40.0
 
 _started = 0.0
@@ -77,12 +78,6 @@ def _write(*, ok: bool) -> None:
         log.exception("watchdog no pudo escribir heartbeat")
 
 
-def _ping_locks() -> bool:
-    from . import listings_cache, pipeline
-
-    return pipeline.ping_lock(LOCK_WAIT_SEC) and listings_cache.ping_lock(LOCK_WAIT_SEC)
-
-
 def _http_ok() -> bool:
     port = os.environ.get("PORT") or "8000"
     url = f"http://127.0.0.1:{port}/api/alive"
@@ -94,25 +89,53 @@ def _http_ok() -> bool:
         return False
 
 
-def _healthy() -> bool:
-    from . import listings_cache
+def _dump_threads() -> None:
+    """Quién tiene el candado se ve en las pilas: sin esto solo queda adivinar."""
+    import sys
+    import traceback
+
+    frames = sys._current_frames()
+    names = {t.ident: t.name for t in threading.enumerate()}
+    for ident, frame in frames.items():
+        if names.get(ident) == "watchdog":
+            continue
+        stack = traceback.format_stack(frame)[-4:]
+        log.warning(
+            "watchdog: hilo %s\n%s",
+            names.get(ident) or ident,
+            "".join(stack).rstrip(),
+        )
+
+
+def _stuck_reason() -> str:
+    """Vacío si todo responde; si no, qué chequeo se trabó (para no adivinar en los logs)."""
+    from . import listings_cache, pipeline
 
     # cities_loading() no debe esperar el candado: si está tomado, ping_lock decide.
     if listings_cache.busy_building() or listings_cache.cities_loading():
-        return True
-    ok = _ping_locks()
-    if not ok:
-        return False
-    if time.time() - _started >= BOOT_GRACE_SEC:
-        return _http_ok()
-    return True
+        return ""
+    if not pipeline.ping_lock(LOCK_WAIT_SEC):
+        return "candado del pipeline"
+    if not listings_cache.ping_lock(LOCK_WAIT_SEC):
+        return "candado del cache de avisos"
+    if time.time() - _started < BOOT_GRACE_SEC:
+        return ""
+    if not _http_ok():
+        return "/api/alive no contestó a tiempo"
+    return ""
+
+
+def _healthy() -> bool:
+    return not _stuck_reason()
 
 
 def _loop() -> None:
     global _fails, _ok_once
     while not _stop.wait(INTERVAL_SEC):
+        why = ""
         try:
-            ok = _healthy()
+            why = _stuck_reason()
+            ok = not why
         except Exception:
             log.exception("watchdog ping")
             ok = False
@@ -122,7 +145,9 @@ def _loop() -> None:
             _write(ok=True)
             continue
         _fails += 1
-        log.warning("watchdog: API trabada (%s)", _fails)
+        log.warning("watchdog: API trabada (%s) · %s", _fails, why or "error en el chequeo")
+        if _fails == DUMP_AT_FAILS:
+            _dump_threads()
         if (
             _ok_once
             and _fails >= SUICIDE_FAILS

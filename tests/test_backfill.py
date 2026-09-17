@@ -35,8 +35,8 @@ def test_llm_backlog_skips_ready_and_prefers_await(tmp_path, monkeypatch):
     ids = [row.id for row in rows]
     assert "zonaprop:ready" not in ids
     assert "zonaprop:dup" not in ids
-    assert ids[0] == "zonaprop:wait"
-    assert "zonaprop:other" in ids
+    assert ids[0] == "zonaprop:other"
+    assert "zonaprop:wait" in ids
 
 
 def test_llm_backlog_prioritizes_new_errors_and_unassigned(tmp_path, monkeypatch):
@@ -92,8 +92,32 @@ def test_llm_backlog_prioritizes_new_errors_and_unassigned(tmp_path, monkeypatch
     ids = [row.id for row in store.fetch_llm_backlog(8, prefer_city="caba", schema=LLM_SCHEMA)]
     assert "zonaprop:ready" not in ids
     assert ids[0] == "zonaprop:new"
-    assert ids.index("zonaprop:broken") < ids.index("zonaprop:lost")
-    assert ids.index("zonaprop:lost") < ids.index("zonaprop:old")
+    assert ids.index("zonaprop:broken") < ids.index("zonaprop:old")
+    assert ids.index("zonaprop:new") < ids.index("zonaprop:lost")
+
+
+def test_llm_backlog_groups_same_city(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    now = datetime.now(timezone.utc).isoformat()
+    store.upsert_many(
+        [
+            _item("r1", city="rosario", details_scraped=True),
+            _item("m1", city="mendoza", details_scraped=True),
+            _item("r2", city="rosario", details_scraped=True),
+            _item("m2", city="mendoza", details_scraped=True),
+        ]
+    )
+    with store.connect() as conn:
+        conn.execute("UPDATE listings SET scraped_at = ?", (now,))
+        conn.commit()
+    cities = [row.city for row in store.fetch_llm_backlog(8, prefer_city="", schema=LLM_SCHEMA)]
+    assert cities.index("mendoza") < cities.index("rosario")
+    assert cities == sorted(cities)
 
 
 def test_detail_backlog_skips_downloaded(tmp_path, monkeypatch):
@@ -107,6 +131,36 @@ def test_detail_backlog_skips_downloaded(tmp_path, monkeypatch):
     rows = store.fetch_detail_backlog(8, prefer_city="caba")
     ids = [row.id for row in rows]
     assert ids == ["zonaprop:need"]
+
+
+def test_detail_backlog_skips_unknown_city_after_llm_pass(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    lost = _item("lost", city="fuera", extra={"llm_city_ok": True, "llm_at": "2026-09-01T12:00:00+00:00"})
+    fresh = _item("fresh", city="")
+    store.upsert_many([lost, fresh])
+    ids = [row.id for row in store.fetch_detail_backlog(8)]
+    assert "zonaprop:lost" not in ids
+    assert "zonaprop:fresh" in ids
+
+
+def test_init_marks_unknown_city_after_llm_pass(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    lost = _item("lost", city="fuera", extra={"llm_city_ok": True})
+    fresh = _item("fresh", city="")
+    store.upsert_many([lost, fresh])
+    with store.connect() as conn:
+        store._stamp_skip_details_unknown_city(conn, force=True)
+        conn.commit()
+    marked = store.get_listing("zonaprop:lost")
+    pending = store.get_listing("zonaprop:fresh")
+    assert marked and marked.extra.get("skip_details") is True
+    assert pending and not pending.extra.get("skip_details")
 
 
 def test_pump_is_idle_in_tests():
@@ -193,20 +247,21 @@ def test_llm_backlog_does_not_starve_detailed_behind_short_new_ads(tmp_path, mon
     assert n >= 1
 
 
-def test_llm_backlog_prioritizes_missing_province(tmp_path, monkeypatch):
+def test_llm_backlog_prefers_live_city_over_fuera(tmp_path, monkeypatch):
     from app import store
 
     monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
     store.init()
-    with_prov = _item(
-        "with-prov",
+    here = _item(
+        "here",
         details_scraped=True,
-        extra={"llm_place": {"name": "Trelew", "province": "Chubut"}},
+        extra={"llm_place": {"name": "Córdoba", "province": "Córdoba"}},
     )
-    no_prov = _item("no-prov", details_scraped=True)
-    store.upsert_many([with_prov, no_prov])
+    lost = _item("lost", city="fuera", details_scraped=True)
+    store.upsert_many([here, lost])
     ids = [row.id for row in store.fetch_llm_backlog(8, prefer_city="caba", schema=LLM_SCHEMA)]
-    assert ids.index("zonaprop:no-prov") < ids.index("zonaprop:with-prov")
+    assert ids[0] == "zonaprop:here"
+    assert ids.index("zonaprop:here") < ids.index("zonaprop:lost")
 
 
 def test_llm_backlog_uses_needs_llm_index(tmp_path, monkeypatch):

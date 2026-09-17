@@ -327,6 +327,8 @@ def _build_dashboard() -> dict[str, Any]:
             "partial": int(inv.get("llm_partial") or 0),
             "await_dir": int(inv.get("await_llm") or 0),
             "queue": int(llm_live.get("pending") or 0),
+            "ready": int(llm_live.get("ready") or 0),
+            "saving": int(llm_live.get("saving") or 0),
             "working": int(llm_live.get("cleaning") or 0),
             "workers": int(llm_live.get("workers") or 0),
             "cap": int(llm_live.get("cap") or 0),
@@ -342,6 +344,7 @@ def _build_dashboard() -> dict[str, Any]:
             "done": int(inv.get("details") or 0),
             "need": int(inv.get("details_need") or 0),
             "queue": int(details_live.get("pending") or 0),
+            "cooling": int(details_live.get("cooling") or 0),
             "working": int(details_live.get("downloading") or 0),
             "workers": int(details_live.get("workers") or 0),
             "pct": float(inv.get("details_pct") or 0),
@@ -508,6 +511,7 @@ def _outcome_pace(series: list[dict[str, Any]], field: str, *, prefix: str = "")
         "partial_24": partial_24,
         "fail_24": fail_24,
         "per_hour": round(per_hour, 1),
+        "per_min": round(per_hour / 60.0, 2) if per_hour else 0.0,
         "per_day": round(float(day_done), 1),
         "rate_scope": rate_scope,
     }
@@ -515,6 +519,7 @@ def _outcome_pace(series: list[dict[str, Any]], field: str, *, prefix: str = "")
         held = _pace_hold.get(field)
         if held and float(held.get("per_hour") or 0) > 0:
             result["per_hour"] = held["per_hour"]
+            result["per_min"] = round(float(held["per_hour"]) / 60.0, 2)
             result["rate_scope"] = "hold"
             result["held"] = True
     else:

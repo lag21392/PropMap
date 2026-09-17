@@ -1,3 +1,6 @@
+import threading
+import time
+
 from app.listings_cache import ingest, payload, reset
 from app.models import Listing
 
@@ -1212,4 +1215,125 @@ def test_rewrite_snap_cities_does_not_touch_disk(tmp_path, monkeypatch):
     assert listings_cache._cities[0]["id"] == "caba"
     reset()
 
+
+def test_request_city_bytes_skips_reload_after_empty_db_load(monkeypatch):
+    from app import listings_cache
+
+    monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
+    reset()
+    started = []
+    monkeypatch.setattr(
+        listings_cache,
+        "_load_city",
+        lambda cid: started.append(cid),
+    )
+    monkeypatch.setattr(listings_cache, "_schedule_city_warm", lambda cid: None)
+    monkeypatch.setattr(listings_cache, "_disk_http_ready", lambda cid, allow_stale=False: False)
+    listings_cache._db_loaded.add("villa-canto")
+    listings_cache._city_snaps["villa-canto"] = {"listings": [], "warming": False}
+    listings_cache.request_city_bytes("villa-canto")
+    assert started == []
+    assert "villa-canto" not in listings_cache._loading
+    reset()
+
+
+def test_kick_access_runs_one_city_at_a_time(monkeypatch):
+    from app import access
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    started = threading.Event()
+    hold = threading.Event()
+    runs = []
+
+    def slow_refresh(cid):
+        runs.append(cid)
+        started.set()
+        hold.wait(2)
+        return 0
+
+    monkeypatch.setattr(access, "refresh_city_access", slow_refresh)
+    monkeypatch.setattr(access, "ACCESS_TURN_SEC", 0.05)
+    access._access_at.clear()
+    access._access_inflight.clear()
+    try:
+        access.kick_access_later("caba")
+        assert started.wait(2)
+        access.kick_access_later("mendoza")
+        time.sleep(0.3)
+        assert runs == ["caba"]
+    finally:
+        hold.set()
+        time.sleep(0.2)
+        access._access_at.clear()
+        access._access_inflight.clear()
+
+
+def test_kick_access_waits_between_full_city_passes(monkeypatch):
+    from app import access
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    runs = []
+    done = threading.Event()
+
+    def fake_refresh(cid):
+        runs.append(cid)
+        done.set()
+        return 0
+
+    monkeypatch.setattr(access, "refresh_city_access", fake_refresh)
+    access._access_at.clear()
+    access._access_inflight.clear()
+    try:
+        access.kick_access_later("caba")
+        assert done.wait(2)
+        access.kick_access_later("caba")
+        assert runs == ["caba"]
+        done.clear()
+        access.kick_access_later("caba", now=True)
+        assert done.wait(2)
+        assert runs == ["caba", "caba"]
+    finally:
+        access._access_at.clear()
+        access._access_inflight.clear()
+
+
+def test_refresh_meta_is_throttled_in_production(monkeypatch):
+    from app import listings_cache
+
+    reset()
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    calls = []
+    monkeypatch.setattr("app.places.listed_cities", lambda _ids: calls.append(1) or [])
+    monkeypatch.setattr("app.store.get_meta", lambda *a, **k: "")
+    monkeypatch.setattr(listings_cache, "_read_rate", lambda: 1.0)
+    listings_cache._refresh_meta()
+    listings_cache._refresh_meta()
+    listings_cache._refresh_meta()
+    assert len(calls) == 1
+    listings_cache._refresh_meta(force=True)
+    assert len(calls) == 2
+    reset()
+
+
+def test_schedule_city_warm_runs_once(monkeypatch):
+    from app import listings_cache
+
+    monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
+    reset()
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    calls = []
+    done = threading.Event()
+
+    def fake_warm(cid):
+        calls.append(cid)
+        with listings_cache._lock:
+            listings_cache._warm_queued.discard(cid)
+            listings_cache._warmed.add(cid)
+        done.set()
+
+    monkeypatch.setattr(listings_cache, "_warm_city_extras", fake_warm)
+    listings_cache._schedule_city_warm("villa-canto")
+    assert done.wait(1)
+    listings_cache._schedule_city_warm("villa-canto")
+    assert calls == ["villa-canto"]
     reset()

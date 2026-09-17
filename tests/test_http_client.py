@@ -73,6 +73,19 @@ def test_proxy_html_looks_valid_needs_map_or_cards():
     assert proxy_html_looks_valid(body) is True
 
 
+def test_portal_way_routes_known_hosts():
+    from app.http_client import portal_way
+
+    assert portal_way("https://www.properati.com.ar/detalle/ficha") == "translate"
+    assert portal_way("https://www.zonaprop.com.ar/propiedades/clasificado/x.html") == "local"
+    assert portal_way("https://www.argenprop.com/casa-en-venta-en-trelew--19704628") == "local"
+    assert portal_way("https://www.zonaprop.com.ar/departamentos-venta-capital-federal.html") == "tor"
+    assert portal_way("https://www.mercadolibre.com.ar/MLA-123456789") == "tor"
+    assert portal_way(listing_id="zonaprop:1") == "local"
+    assert portal_way(listing_id="properati:1") == "translate"
+    assert portal_way(listing_id="mercadolibre:1") == "tor"
+
+
 def test_fetch_text_uses_translate_proxy_when_properati_returns_401(monkeypatch):
     listing = "https://www.properati.com.ar/detalle/ficha-oculta"
     html = (
@@ -199,3 +212,144 @@ def test_fetch_text_properati_list_still_uses_proxy_after_401(monkeypatch):
     assert "mapData" in text
     text2 = fetch_text(url, paced=False, retries=1)
     assert "mapData" in text2
+
+
+def test_fetch_text_marks_gone_on_410(monkeypatch):
+    from app.http_client import PageGone
+
+    reset_fetch_state()
+    url = "https://www.argenprop.com/casa-en-venta-en-trelew--19704628"
+    monkeypatch.setattr(
+        "app.http_client.httpx.Client",
+        lambda **kw: _Client({"https://www.argenprop.com/": _Resp(410, "Gone", url)}, **kw),
+    )
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client.crawl.note_http", lambda *a, **k: None)
+    try:
+        fetch_text(url, paced=False, retries=1)
+        raise AssertionError("un 410 tiene que cortar la cascada")
+    except PageGone as exc:
+        assert "410" in str(exc)
+    reset_fetch_state()
+
+
+def test_fetch_text_skips_tor_on_zonaprop_listing(monkeypatch):
+    from app import crawl, egress
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
+    monkeypatch.setenv("TOR_ENABLED", "1")
+    monkeypatch.setenv("TOR_SOCKS", "socks5h://127.0.0.1:19050")
+    monkeypatch.setenv("TOR_CIRCUITS", "8")
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.setattr(egress, "_socks_supported", lambda _url: True)
+    egress.reset()
+    url = "https://www.zonaprop.com.ar/propiedades/clasificado/vive.html"
+    html = "<html>ficha zonaprop" + ("." * 9000) + "</html>"
+    proxies = []
+
+    class _Client:
+        def __init__(self, **kw):
+            self.proxy = kw.get("proxy")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get(self, href: str):
+            proxies.append(self.proxy)
+            if self.proxy:
+                raise AssertionError("ZonaProp no debe salir por Tor")
+            return _Resp(200, html, href)
+
+    monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client(**kw))
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client._try_blocked_fallback", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.http_client._fetch_urllib",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no")),
+    )
+    text = fetch_text(url, paced=False, retries=1)
+    assert "ficha zonaprop" in text
+    assert proxies == [None]
+    assert egress.local_used_today() == 1
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()
+
+
+def test_fetch_text_drops_gone_from_local(monkeypatch):
+    from app import crawl, egress
+    from app.http_client import PageGone
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
+    monkeypatch.setenv("TOR_ENABLED", "1")
+    monkeypatch.setenv("TOR_SOCKS", "socks5h://127.0.0.1:19050")
+    monkeypatch.setenv("TOR_CIRCUITS", "2")
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.setattr(egress, "_socks_supported", lambda _url: True)
+    egress.reset()
+    url = "https://www.argenprop.com/casa-en-venta-en-trelew--19704628"
+
+    class _Client:
+        def __init__(self, **kw):
+            self.proxy = kw.get("proxy")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get(self, href: str):
+            if self.proxy:
+                raise AssertionError("Argenprop no debe salir por Tor")
+            return _Resp(410, "Gone", href)
+
+    monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client(**kw))
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client._try_blocked_fallback", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
+    try:
+        fetch_text(url, paced=False, retries=1)
+        raise AssertionError("un 410 local tiene que cortar")
+    except PageGone as exc:
+        assert "410" in str(exc)
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()
+
+
+def test_enrich_details_drops_listing_that_is_gone(monkeypatch):
+    from app.http_client import PageGone
+    from app.models import Listing
+    from app.scrapers import details
+
+    item = Listing(
+        source="argenprop",
+        source_id="19704628",
+        url="https://www.argenprop.com/casa-en-venta-en-trelew--19704628",
+        title="Casa",
+        property_type="casa",
+        city="trelew",
+    )
+    dropped = []
+    monkeypatch.setattr("app.store.drop_listings", lambda ids: dropped.extend(ids))
+    monkeypatch.setattr(details, "fetch_text", lambda *_a, **_k: (_ for _ in ()).throw(PageGone("HTTP 410")))
+    details.enrich_details(item)
+    assert dropped == [item.id]
+    assert item.extra.get("gone") is True
+    assert item.details_scraped is False

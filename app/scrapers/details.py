@@ -120,8 +120,12 @@ def enrich_details(item: Listing, should_stop=lambda: False) -> Listing:
 
     if not needs_detail_fetch(item):
         return analyze(item)
+    from ..http_client import PageGone
+
     try:
         html = fetch_text(item.url)
+    except PageGone:
+        return _drop_gone(item)
     except Exception as exc:
         msg = str(exc).lower()
         if "404" in msg or "410" in msg:

@@ -51,6 +51,23 @@ function kpi(label, value) {
   return `<div><dt>${label}</dt><dd>${value}</dd></div>`;
 }
 
+function tile(label, value, note) {
+  return `<div class="tablero-tile"><dt>${label}</dt><dd>${value}</dd>${note ? `<p>${note}</p>` : ""}</div>`;
+}
+
+function pctLabel(n) {
+  const v = Number(n || 0);
+  return `${v.toLocaleString("es-AR", { maximumFractionDigits: 1 })}%`;
+}
+
+function etaShort(hours) {
+  const h = Number(hours);
+  if (!Number.isFinite(h) || h <= 0) return "—";
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))} min`;
+  if (h < 40) return `${Math.round(h)} h`;
+  return `${(h / 24).toFixed(1)} días`;
+}
+
 function esc(text) {
   return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
@@ -90,15 +107,8 @@ function paint(data) {
   const llm = data.llm_pipe || {};
   const fichas = data.details_pipe || {};
   const running = Boolean(live.running);
-  const cities = (live.running_cities || []).join(", ") || "nadie";
-  const now = document.getElementById("nowStrip");
-  now.hidden = false;
-  document.getElementById("nowLead").textContent = running
-    ? `Scrape en curso · ${cities} · ${live.mode || "pasada"} · ${live.message || "trabajando"}`
-    : live.message && live.message !== "Todavía no se buscó nada."
-      ? live.message
-      : "El motor rota lugares sin parar. Enseguida arranca el próximo.";
 
+  paintSummary({ live, inv, tel, move, llm, fichas, egress, running });
   paintLanes(egress.tracks || [], tel, data.busy || [], egress);
   paintMove(move, tel.series || []);
   paintLlm(llm, tel.series || []);
@@ -137,11 +147,16 @@ function paintLanes(tracks, tel, busy, egress) {
   const lastUsed = LANE_ORDER.filter((k) => lastLanes[k]).map((k) => LANE[k].label);
   const extra = Number((egress || {}).tor_extra || 0);
   const circuits = Number((egress || {}).tor_circuits || 0);
-  const extraNote = extra
+  const localToday = Number((egress || {}).local_today || 0);
+  const localCap = Number((egress || {}).local_cap || 0);
+  const localNote = !(egress || {}).use_local
+    ? " La IP de casa está apagada."
+    : ` IP de casa (último recurso): ${fmt(localToday)} salidas hoy${localCap ? ` de ${fmt(localCap)}` : ""}.`;
+  const extraNote = (extra
     ? ` Abrió ${fmt(extra)} circuitos Tor extra (${fmt(circuits)} en total).`
     : circuits
       ? ` Tor: ${fmt(circuits)} circuitos.`
-      : "";
+      : "") + localNote;
   document.getElementById("laneNow").textContent = nowLabels.length
     ? `Ahora sale por ${joinEs(nowLabels)}.${extraNote}`
     : coolingN
@@ -247,6 +262,31 @@ function paceLabel(perHour, pipe) {
   return n;
 }
 
+function paceMinLabel(perMin, pipe) {
+  if (!perMin && !pipe.per_hour) return "—";
+  const n = Number(perMin || (Number(pipe.per_hour || 0) / 60) || 0);
+  if (!n) return "—";
+  const text = n.toLocaleString("es-AR", { maximumFractionDigits: 1, minimumFractionDigits: n < 10 ? 1 : 0 });
+  if (pipe.rate_scope === "day") return `${text} (hoy)`;
+  if (pipe.held) return `${text} (sostiene)`;
+  return text;
+}
+
+function paceKpis(pipe, extra) {
+  const okD = Number(pipe.ok_d || 0);
+  const failH = Number(pipe.fail_h || 0);
+  const rows = [
+    kpi("Este minuto", fmt(Number(pipe.this_min || 0))),
+    kpi("Última hora", fmt(Number(pipe.ok_h || 0) + Number(pipe.partial_h || 0))),
+    kpi("Hoy", fmt(okD)),
+  ];
+  for (const row of extra || []) {
+    if (row) rows.push(row);
+  }
+  if (failH) rows.push(kpi("Errores / h", fmt(failH)));
+  return rows.join("");
+}
+
 function etaCopy(hours, need, live) {
   if (!need) return "";
   const h = Number(hours);
@@ -260,21 +300,72 @@ function etaCopy(hours, need, live) {
   return `A este ritmo, unos ${(h / 24).toFixed(1)} días para vaciar lo que falta.`;
 }
 
+function paintSummary(ctx) {
+  const { live, inv, tel, move, llm, fichas, egress, running } = ctx;
+  document.getElementById("sumBlock").hidden = false;
+  const cities = (live.running_cities || []).join(", ");
+  document.getElementById("nowLead").textContent = running
+    ? `Scrape en curso · ${cities || "sin lugar"} · ${live.mode || "pasada"} · ${live.message || "trabajando"}`
+    : live.message && live.message !== "Todavía no se buscó nada."
+      ? live.message
+      : "El motor rota lugares sin parar. Enseguida arranca el próximo.";
+
+  const lanes = latestLanes(tel.series || []).lanes;
+  const reqMin = LANE_ORDER.reduce((sum, key) => sum + Number(lanes[key] || 0), 0);
+  const newToday = Number(move.new || 0) || Number(move.new_24h || 0);
+  const goneToday = Number(move.gone || 0) || Number(move.gone_24h || 0);
+  document.getElementById("sumKpis").innerHTML = [
+    tile("Avisos en base", fmt(inv.listings || 0), newToday || goneToday ? `+${fmt(newToday)} / −${fmt(goneToday)} hoy` : "sin altas ni bajas hoy"),
+    tile("Limpiados por LLM", pctLabel(llm.pct), `faltan ${fmt(llm.need || 0)}`),
+    tile("Ritmo LLM", `${paceMinLabel(Number(llm.per_min || 0), llm)} /min`, `≈ ${paceLabel(Number(llm.per_hour || 0), llm)} por hora`),
+    tile("Termina en", etaShort(llm.eta_h), "al ritmo actual"),
+    tile("Fichas bajadas", pctLabel(fichas.pct), `faltan ${fmt(fichas.need || 0)}`),
+    tile("Requests / min", fmt(reqMin), running ? "scrape activo" : "motor en pausa"),
+  ].join("");
+
+  const alerts = [];
+  if (llm.llama_ok === false) {
+    alerts.push(["bad", "llama.cpp no responde: el LLM está parado."]);
+  } else if (Number(llm.working || 0) && !llm.gpu && Number(llm.busy_s || 0) > 20) {
+    alerts.push(["bad", `El pedido a la GPU se colgó hace ${Math.round(Number(llm.busy_s || 0))} s.`]);
+  } else if (Number(llm.need || 0) && !Number(llm.queue || 0) && !Number(llm.ready || 0)) {
+    alerts.push(["warn", `Faltan ${fmt(llm.need)} avisos pero la cola está vacía: el refill no trae trabajo.`]);
+  }
+  if (Number(llm.fail_h || 0)) {
+    alerts.push(["warn", `${fmt(llm.fail_h)} errores del LLM en la última hora.`]);
+  }
+  const blocked = Object.entries((tel.http || {}).by_status || {})
+    .filter(([code]) => code === "403" || code === "401" || code === "429")
+    .reduce((sum, [, n]) => sum + Number(n || 0), 0);
+  if (blocked) {
+    alerts.push(["warn", `${fmt(blocked)} respuestas 401/403/429: algún portal está bloqueando.`]);
+  }
+  const down = (egress.tracks || []).filter((row) => Number(row.down_s || 0) > 8).length;
+  if (down) {
+    alerts.push(["warn", `${fmt(down)} carriles de salida caídos.`]);
+  }
+  if (!alerts.length) {
+    alerts.push(["ok", "Sin alertas: los dos procesos y la salida a internet andan bien."]);
+  }
+  document.getElementById("sumAlerts").innerHTML = alerts
+    .map(([level, text]) => `<li class="is-${level}">${esc(text)}</li>`)
+    .join("");
+}
+
 function paintLlm(pipe, series) {
   document.getElementById("llmBlock").hidden = false;
   const done = Number(pipe.done || 0);
   const need = Number(pipe.need || 0);
   const queue = Number(pipe.queue || 0);
   const working = Number(pipe.working || 0);
+  const ready = Number(pipe.ready || 0);
+  const saving = Number(pipe.saving || 0);
   const partial = Number(pipe.partial || 0);
   const awaitDir = Number(pipe.await_dir || 0);
-  const workers = Number(pipe.workers || 0);
   const cap = Number(pipe.cap || 0);
-  const perHour = Number(pipe.per_hour || 0);
   const thisMin = Number(pipe.this_min || 0);
   const okH = Number(pipe.ok_h || 0);
   const okD = Number(pipe.ok_d || 0);
-  const failH = Number(pipe.fail_h || 0);
   const gpu = Boolean(pipe.gpu);
   const llamaOk = pipe.llama_ok !== false;
   const busyS = Number(pipe.busy_s || 0);
@@ -286,16 +377,15 @@ function paintLlm(pipe, series) {
   } else if (stuck) {
     nowBits.push(`GPU quieta · el worker se trabó ${Math.round(busyS)} s en un aviso`);
   } else if (queue && working) {
-    nowBits.push(`preparando el próximo aviso${busyS ? ` (${Math.round(busyS)} s)` : ""}`);
+    nowBits.push(`armando el próximo prompt${busyS ? ` (${Math.round(busyS)} s)` : ""}`);
   } else if (queue) {
     nowBits.push("GPU libre y hay cola: debería arrancar ya");
   } else {
     nowBits.push("GPU libre");
   }
   if (!llamaOk) nowBits.push("llama.cpp no responde");
-  nowBits.push(`${fmt(queue)} en cola${cap ? ` (tope ${fmt(cap)}, se rellena sola)` : ""}`);
-  nowBits.push(`${fmt(thisMin)} listo${thisMin === 1 ? "" : "s"} este minuto`);
-  if (perHour && (thisMin || okH || okD || ok24 || pipe.held)) nowBits.push(`~${fmt(Math.round(perHour))}/hora`);
+  nowBits.push(ready ? `${fmt(ready)} prompt${ready === 1 ? "" : "s"} esperando turno` : "sin prompt de reserva");
+  if (saving) nowBits.push(`${fmt(saving)} esperando para guardarse`);
   document.getElementById("llmNow").textContent = `Ahora: ${nowBits.join(" · ")}.`;
   document.getElementById("llmLead").textContent = need
     ? (stuck
@@ -303,9 +393,10 @@ function paintLlm(pipe, series) {
         : `En la base faltan ${fmt(need)}. ${etaCopy(pipe.eta_h, need, gpu || working || thisMin || okH || okD || ok24)}`)
     : "No hay avisos pendientes de esta versión del LLM.";
   paintStack("llmNowStack", [
+    { label: "Prompts armados", n: ready, color: "#6a8f2e" },
     { label: "GPU generando", n: gpu ? 1 : 0, color: "#3d6f8a" },
+    { label: "Guardando", n: saving, color: "#a07a2e" },
     { label: "Worker trabado", n: stuck ? 1 : 0, color: "#c45c3a" },
-    { label: "En cola", n: queue, color: "#9a5a28" },
     { label: "Listos este minuto", n: thisMin, color: "#2a4a3c" },
   ]);
   paintStack("llmStack", [
@@ -313,21 +404,11 @@ function paintLlm(pipe, series) {
     { label: "Parciales", n: partial, color: "#6a8f2e" },
     { label: "Faltan", n: need, color: "#a07a2e" },
   ]);
-  document.getElementById("llmKpis").innerHTML = [
-    kpi("Este minuto", fmt(thisMin)),
-    kpi("Última hora", fmt(okH)),
-    kpi("Hoy", fmt(okD)),
-    kpi("24 h", fmt(ok24)),
-    kpi("Por hora", paceLabel(perHour, pipe)),
-    kpi("GPU", gpu ? "generando" : queue || working ? "quieta" : "libre"),
-    kpi("Worker", busyS ? `${Math.round(busyS)} s` : `${fmt(working)}/${fmt(workers || 1)}`),
-    kpi("En cola", fmt(queue)),
-    kpi("Errores / h", fmt(failH)),
-    kpi("Listos", `${fmt(done)} · ${pipe.pct || 0}%`),
-    kpi("Faltan", fmt(need)),
-    kpi("Parciales", fmt(partial)),
-    kpi("Sin dirección", fmt(awaitDir)),
-  ].join("");
+  document.getElementById("llmKpis").innerHTML = paceKpis(pipe, [
+    kpi("En cola", `${fmt(queue)}${cap ? ` / ${fmt(cap)}` : ""}`),
+    partial ? kpi("Parciales", fmt(partial)) : "",
+    awaitDir ? kpi("Sin dirección", fmt(awaitDir)) : "",
+  ]);
   outcomeBars(document.getElementById("llmChart"), series || [], "llm_by");
   document.getElementById("llmChartLegend").innerHTML = [
     ["#2a4a3c", "Listos"],
@@ -346,30 +427,29 @@ function paintFichas(pipe, series) {
   const queue = Number(pipe.queue || 0);
   const working = Number(pipe.working || 0);
   const thisMin = Number(pipe.this_min || 0);
-  const perHour = Number(pipe.per_hour || 0);
   const okH = Number(pipe.ok_h || 0);
   const okD = Number(pipe.ok_d || 0);
   const workers = Number(pipe.workers || 0);
-  document.getElementById("fichaNow").textContent = `Ahora: ${fmt(working)} bajando${workers ? ` / ${fmt(workers)}` : ""} · ${fmt(queue)} en cola · ${fmt(thisMin)} este minuto${perHour && (thisMin || okH || okD || pipe.held) ? ` · ~${fmt(Math.round(perHour))}/h` : ""}.`;
-  document.getElementById("fichaLead").textContent = need
-    ? `Faltan bajar ${fmt(need)} fichas. ${etaCopy(pipe.eta_h, need, working || thisMin || okH || okD)}`
-    : "Todas las fichas de la base ya se bajaron.";
+  const cooling = Number(pipe.cooling || 0);
+  const failH = Number(pipe.fail_h || 0);
+  document.getElementById("fichaNow").textContent =
+    `Ahora: ${fmt(working)} bajando${workers ? ` / ${fmt(workers)}` : ""} · ${fmt(queue)} en cola${cooling ? ` · ${fmt(cooling)} esperando reintento` : ""}.`;
+  document.getElementById("fichaLead").textContent = !need
+    ? "Todas las fichas de la base ya se bajaron."
+    : failH > Math.max(20, okH * 3)
+      ? `Faltan ${fmt(need)}, pero los portales están rechazando casi todo (${fmt(failH)} fallas en la última hora). Cada aviso que falla espera antes de reintentar.`
+      : `Faltan bajar ${fmt(need)} fichas. ${etaCopy(pipe.eta_h, need, working || thisMin || okH || okD)}`;
   paintStack("fichaStack", [
     { label: "Bajadas", n: done, color: "#2a4a3c" },
     { label: "Bajando", n: working, color: "#3d6f8a" },
     { label: "En cola", n: queue, color: "#9a5a28" },
     { label: "Faltan", n: Math.max(0, need - queue - working), color: "#a07a2e" },
   ]);
-  document.getElementById("fichaKpis").innerHTML = [
-    kpi("Bajadas", `${fmt(done)} · ${pipe.pct || 0}%`),
-    kpi("Faltan", fmt(need)),
+  document.getElementById("fichaKpis").innerHTML = paceKpis(pipe, [
     kpi("En cola", fmt(queue)),
-    kpi("Bajando", fmt(working)),
-    kpi("Este minuto", fmt(thisMin)),
-    kpi("Última hora", fmt(okH)),
-    kpi("Hoy", fmt(okD)),
-    kpi("Por hora", paceLabel(perHour, pipe)),
-  ].join("");
+    kpi("Bajando", `${fmt(working)}${workers ? ` / ${fmt(workers)}` : ""}`),
+    cooling ? kpi("Esperando reintento", fmt(cooling)) : "",
+  ]);
   const chart = document.getElementById("fichaChart");
   if (chart) outcomeBars(chart, series || [], "details_by");
 }

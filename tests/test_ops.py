@@ -121,7 +121,7 @@ def test_tablero_and_ops_api_need_admin(monkeypatch):
         assert "details_pipe" in body
         assert "need" in body["llm_pipe"]
         assert b"laneChart" in page.content
-        assert b"tablero.js?v=15" in page.content
+        assert b"tablero.js?v=19" in page.content
         prom = client.get("/api/ops/metrics")
         assert prom.status_code == 200
         assert "propmap_up 1" in prom.text
@@ -197,6 +197,7 @@ def test_snapshot_groups_vpn_and_movement(monkeypatch):
     assert dash["llm_pipe"]["ok_d"] == 1
     assert dash["llm_pipe"]["ok_24"] == 1
     assert dash["llm_pipe"]["per_hour"] == 1
+    assert dash["llm_pipe"]["per_min"] == 0.02
     assert dash["llm_pipe"]["rate_scope"] == "hour"
     assert dash["details_pipe"]["need"] == 6
     text = ops.prometheus()
@@ -310,6 +311,7 @@ def test_llm_and_details_survive_process_reset(tmp_path, monkeypatch):
     assert dash["llm_pipe"]["ok_24"] == 1
     assert dash["llm_pipe"]["fail_h"] == 1
     assert dash["llm_pipe"]["per_hour"] == 1
+    assert dash["llm_pipe"]["per_min"] == 0.02
     assert dash["llm_pipe"]["rate_scope"] == "hour"
     assert dash["details_pipe"]["this_min"] == 1
     assert dash["details_pipe"]["ok_h"] == 1
@@ -322,6 +324,7 @@ def test_outcome_pace_uses_hour_then_day_then_hold(monkeypatch):
     assert hour["ok_h"] == 12
     assert hour["ok_24"] == 12
     assert hour["per_hour"] == 12
+    assert hour["per_min"] == 0.2
     assert hour["rate_scope"] == "hour"
 
     ops.reset()
@@ -331,6 +334,7 @@ def test_outcome_pace_uses_hour_then_day_then_hold(monkeypatch):
     day = ops._outcome_pace(quiet, "llm_by", prefix="llm")
     assert day["ok_d"] == 48
     assert day["per_hour"] == 6.0
+    assert day["per_min"] == 0.1
     assert day["rate_scope"] == "day"
 
     ops.reset()
@@ -340,6 +344,7 @@ def test_outcome_pace_uses_hour_then_day_then_hold(monkeypatch):
     held = ops._outcome_pace(quiet, "llm_by", prefix="llm")
     assert held["held"] is True
     assert held["per_hour"] == 12
+    assert held["per_min"] == 0.2
     assert held["rate_scope"] == "hold"
 
 

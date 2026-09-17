@@ -8,17 +8,12 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui34" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui36" />
 </head>
 <body class="tablero-page">
   <header class="tablero-head">
     <p class="ops-kicker">Administración</p>
     <h1>Tablero de scrape</h1>
-    <p>
-      Por dónde sale cada request. Por defecto usa Tor (varios circuitos),
-      no tu IP. Las VPN gratis de internet no se enchufan: si tenés un
-      proxy propio, va en SCRAPE_PROXIES.
-    </p>
     <p class="tablero-nav">
       <a href="/admin">Mapa</a>
       · <a href="/flujo">Flujo</a>
@@ -28,16 +23,46 @@
 
   <p id="boardStatus" class="tablero-status" role="status">Cargando el tablero…</p>
 
-  <section class="tablero-now" id="nowStrip" hidden>
+  <!-- 1. Resumen: lo que hay que mirar primero -->
+  <section class="tablero-summary" id="sumBlock" hidden>
     <p id="nowLead" class="tablero-now-lead"></p>
+    <dl class="tablero-tiles" id="sumKpis"></dl>
+    <ul class="tablero-alerts" id="sumAlerts"></ul>
   </section>
 
-  <section class="tablero-block" id="visitBlock" hidden>
-    <h2>Visitas ahora</h2>
-    <p class="tablero-lead">Lo que Matomo vio hoy. Se refresca solo, sin recargar.</p>
-    <ol id="visits" class="tablero-logs"></ol>
-  </section>
+  <!-- 2. Los dos procesos que trabajan solos -->
+  <div class="tablero-grid">
+    <section class="tablero-block" id="llmBlock" hidden>
+      <h2>LLM</h2>
+      <p class="tablero-lead" id="llmLead"></p>
+      <p class="tablero-pace" id="llmNow"></p>
+      <dl class="tablero-kpis" id="llmKpis"></dl>
+      <p class="tablero-sub">Etapas ahora</p>
+      <div id="llmNowStack" class="tablero-stack" role="img" aria-label="Trabajo en vivo del LLM"></div>
+      <p class="tablero-sub">En la base</p>
+      <div id="llmStack" class="tablero-stack" role="img" aria-label="Stock del LLM"></div>
+      <figure class="tablero-fig">
+        <figcaption>Avisos terminados por minuto · últimas 24 h</figcaption>
+        <svg id="llmChart" class="tablero-chart tablero-chart-tall" role="img" aria-label="Avisos que el LLM terminó por minuto"></svg>
+        <ul id="llmChartLegend" class="tablero-legend"></ul>
+      </figure>
+    </section>
 
+    <section class="tablero-block" id="fichaBlock" hidden>
+      <h2>Fichas</h2>
+      <p class="tablero-lead" id="fichaLead"></p>
+      <p class="tablero-pace" id="fichaNow"></p>
+      <dl class="tablero-kpis" id="fichaKpis"></dl>
+      <p class="tablero-sub">En la base</p>
+      <div id="fichaStack" class="tablero-stack" role="img" aria-label="Stock de fichas"></div>
+      <figure class="tablero-fig">
+        <figcaption>Fichas bajadas o fallidas por minuto · últimas 24 h</figcaption>
+        <svg id="fichaChart" class="tablero-chart tablero-chart-tall" role="img" aria-label="Ritmo de fichas"></svg>
+      </figure>
+    </section>
+  </div>
+
+  <!-- 3. Salida a internet -->
   <section class="tablero-hero" id="lanesBlock" hidden>
     <div class="tablero-hero-copy">
       <h2>Por dónde sale</h2>
@@ -52,7 +77,8 @@
     </figure>
   </section>
 
-  <div class="tablero-grid tablero-grid-2">
+  <!-- 4. Qué entra y qué contesta cada portal -->
+  <div class="tablero-grid">
     <section class="tablero-block" id="moveBlock" hidden>
       <h2>Altas y bajas</h2>
       <p class="tablero-lead" id="moveLead"></p>
@@ -62,56 +88,43 @@
         <svg id="moveChart" class="tablero-chart tablero-chart-mid" role="img" aria-label="Avisos nuevos y desaparecidos"></svg>
       </figure>
     </section>
-    <section class="tablero-block" id="llmBlock" hidden>
-      <h2>LLM</h2>
-      <p class="tablero-lead" id="llmLead"></p>
-      <p class="tablero-pace" id="llmNow"></p>
-      <p class="tablero-sub">Ahora</p>
-      <div id="llmNowStack" class="tablero-stack" role="img" aria-label="Trabajo en vivo del LLM"></div>
-      <p class="tablero-sub">En la base</p>
-      <div id="llmStack" class="tablero-stack" role="img" aria-label="Stock del LLM"></div>
-      <dl class="tablero-kpis" id="llmKpis"></dl>
-      <figure class="tablero-fig">
-        <figcaption>Últimas 24 h · cada barra es un minuto (listos, parciales, errores)</figcaption>
-        <svg id="llmChart" class="tablero-chart tablero-chart-tall" role="img" aria-label="Avisos que el LLM terminó por minuto"></svg>
-        <ul id="llmChartLegend" class="tablero-legend"></ul>
-      </figure>
-    </section>
-  </div>
 
-  <div class="tablero-grid">
     <section class="tablero-block" id="httpBlock" hidden>
-      <h2>HTTP</h2>
+      <h2>HTTP por portal</h2>
+      <p class="tablero-lead">Requests de este proceso y qué códigos devolvieron.</p>
       <div id="httpHost"></div>
       <div id="httpStatus" class="tablero-chips"></div>
     </section>
-    <section class="tablero-block" id="fichaBlock" hidden>
-      <h2>Fichas</h2>
-      <p class="tablero-lead" id="fichaLead"></p>
-      <p class="tablero-pace" id="fichaNow"></p>
-      <div id="fichaStack" class="tablero-stack"></div>
-      <dl class="tablero-kpis" id="fichaKpis"></dl>
-      <figure class="tablero-fig">
-        <figcaption>Últimas 24 h · fichas bajadas o fallidas por minuto</figcaption>
-        <svg id="fichaChart" class="tablero-chart tablero-chart-tall" role="img" aria-label="Ritmo de fichas"></svg>
-      </figure>
-    </section>
+  </div>
+
+  <!-- 5. Stock -->
+  <div class="tablero-grid">
     <section class="tablero-block" id="stockBlock" hidden>
       <h2>Stock por portal</h2>
       <div id="stock"></div>
     </section>
+
     <section class="tablero-block" id="cityBlock" hidden>
       <h2>Avisos por lugar</h2>
-      <p class="tablero-lead">Los que más avisos tienen ahora. Sin ciudad van aparte; la LLM intenta asignarles una localidad real.</p>
+      <p class="tablero-lead">Los que más avisos tienen ahora. Sin ciudad van aparte; la LLM les busca una localidad real.</p>
       <div id="cities"></div>
     </section>
   </div>
 
-  <section class="tablero-block" id="logBlock" hidden>
-    <h2>Últimos mensajes</h2>
-    <ol id="logs" class="tablero-logs"></ol>
-  </section>
+  <!-- 6. Registro -->
+  <div class="tablero-grid">
+    <section class="tablero-block" id="visitBlock" hidden>
+      <h2>Visitas ahora</h2>
+      <p class="tablero-lead">Lo que Matomo vio hoy. Se refresca solo.</p>
+      <ol id="visits" class="tablero-logs"></ol>
+    </section>
 
-  <script src="/static/tablero.js?v=15"></script>
+    <section class="tablero-block" id="logBlock" hidden>
+      <h2>Últimos mensajes</h2>
+      <ol id="logs" class="tablero-logs"></ol>
+    </section>
+  </div>
+
+  <script src="/static/tablero.js?v=19"></script>
 </body>
 </html>

@@ -74,10 +74,10 @@ def test_prompt_is_city_specific_and_clamp_drops_invented_barrio():
     assert "rooms=N+1" in EXTRACT_SYSTEM
     assert "2 habitaciones" in EXTRACT_SYSTEM
     assert "uncovered_m2" in EXTRACT_SYSTEM
-    assert "province" in EXTRACT_SYSTEM
     assert "city_label" in EXTRACT_SYSTEM
+    assert "Sin province" in EXTRACT_SYSTEM
     assert "covered_m2 + uncovered_m2" in EXTRACT_SYSTEM
-    assert len(EXTRACT_SYSTEM) > 700
+    assert len(EXTRACT_SYSTEM) > 600
     names = {row["nombre"] for row in barrios_for_prompt("puerto-madryn", "Desembarco")}
     assert "Desembarco" in names
     clamped = clamp_extracted(
@@ -237,6 +237,43 @@ def test_prompt_omits_barrios_not_named_in_the_listing():
     assert "Desembarco" not in prompt
 
 
+def test_same_city_prompts_share_prefix_for_cache():
+    from app.llm_fields import build_extract_prompt
+
+    a = build_extract_prompt(
+        city="cordoba",
+        city_label="Córdoba",
+        title="Depto 2 amb",
+        address="Colón 100",
+        portal_type="departamento",
+        description="Living al frente.",
+    )
+    b = build_extract_prompt(
+        city="cordoba",
+        city_label="Córdoba",
+        title="Casa 3 dorm",
+        address="Vélez 50",
+        portal_type="casa",
+        description="Patio y parrilla.",
+    )
+    c = build_extract_prompt(
+        city="rosario",
+        city_label="Rosario",
+        title="PH 2 amb",
+        address="Pellegrini 10",
+        portal_type="ph",
+        description="Cocina independiente.",
+    )
+    head_a = a.split("titulo:", 1)[0]
+    head_b = b.split("titulo:", 1)[0]
+    head_c = c.split("titulo:", 1)[0]
+    assert head_a == head_b
+    assert head_a.startswith("lugar_buscado: Córdoba")
+    assert head_c.startswith("lugar_buscado: Rosario")
+    assert a.index("lugar_buscado:") < a.index("titulo:")
+    assert a.index("titulo:") < a.index("Living al frente")
+
+
 def test_extract_json_obj_repairs_truncated_qwen_output():
     from app.llm_fields import extract_json_obj
 
@@ -307,14 +344,52 @@ def test_local_chat_does_not_stack_timeouts(monkeypatch):
     assert CHAT_TIMEOUT_SEC <= 45
 
 
-def test_local_python_keeps_a_spare_worker_for_one_gpu_slot(monkeypatch):
+def test_local_python_uses_one_worker_for_one_gpu_slot(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "local")
     monkeypatch.setenv("LLM_PARALLEL", "1")
     from app import llm_enrich
 
     llm_enrich._busy.clear()
     assert llm_enrich.llm_workers() == 1
-    assert llm_enrich._wanted_workers() == 2
+    assert llm_enrich._wanted_workers() == 1
+    assert llm_enrich.MAX_TOKENS <= 96
+
+
+def test_local_chat_does_not_force_json_object(monkeypatch):
+    """Con response_format, llama.cpp devuelve contenido vacío y quema todos los tokens."""
+    seen = {}
+
+    class Fake:
+        def __init__(self, *a, **k):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, _url, json=None):
+            seen.update(json or {})
+
+            class Res:
+                def json(self_inner):
+                    return {"choices": [{"message": {"content": "{}"}}]}
+
+            return Res()
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+    monkeypatch.setattr("httpx.Client", Fake)
+    monkeypatch.setattr("app.llm_enrich._gpu.acquire_ticket", lambda timeout=None: 1)
+    monkeypatch.setattr("app.llm_enrich._gpu.release", lambda ticket=None: None)
+    from app.llm_enrich import _chat
+
+    _chat([{"role": "user", "content": "x"}])
+    assert "response_format" not in seen
+    assert seen.get("cache_prompt") is True
 
 
 def test_queue_stats_working_counts_busy_listings(monkeypatch):

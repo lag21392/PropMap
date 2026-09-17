@@ -218,3 +218,62 @@ def test_fold_short_cache_matches_raw():
     long = ("áéí " * 40)
     assert len(long) > 96
     assert fold(long) == _fold_raw(long)
+    from app.geo import _fold_long
+
+    _fold_long.cache_clear()
+    blob = "Departamento en venta " * 20
+    assert 96 < len(blob) <= 4000
+    assert fold(blob) == _fold_raw(blob)
+    assert fold(blob) == _fold_long(blob)
+
+
+def test_barrio_containing_bbox_skips_far_rings_and_keeps_smallest():
+    from app.geo import _polygon_index, remember_city_polygons
+
+    remember_city_polygons(
+        "ciudad-bbox-test",
+        [
+            {
+                "name": "Grande",
+                "zona": "Norte",
+                "lat": 0.0,
+                "lon": 0.0,
+                "ring": [[-1, -1], [-1, 1], [1, 1], [1, -1], [-1, -1]],
+            },
+            {
+                "name": "Chico",
+                "zona": "Norte",
+                "lat": 0.0,
+                "lon": 0.0,
+                "ring": [[-0.2, -0.2], [-0.2, 0.2], [0.2, 0.2], [0.2, -0.2], [-0.2, -0.2]],
+            },
+            {
+                "name": "Lejos",
+                "zona": "Sur",
+                "lat": 10.0,
+                "lon": 10.0,
+                "ring": [[9, 9], [9, 11], [11, 11], [11, 9], [9, 9]],
+            },
+        ],
+    )
+    inner = barrio_containing(0.0, 0.0, city="ciudad-bbox-test")
+    assert inner is not None
+    assert inner[0] == "Chico"
+    assert barrio_containing(10.0, 10.0, city="ciudad-bbox-test")[0] == "Lejos"
+    assert barrio_containing(50.0, 50.0, city="ciudad-bbox-test") is None
+    index = _polygon_index("ciudad-bbox-test")
+    assert len(index) == 3
+    remember_city_polygons(
+        "ciudad-bbox-test",
+        [
+            {
+                "name": "Solo",
+                "zona": "Centro",
+                "lat": 0.0,
+                "lon": 0.0,
+                "ring": [[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5]],
+            }
+        ],
+    )
+    assert barrio_containing(0.0, 0.0, city="ciudad-bbox-test")[0] == "Solo"
+    assert len(_polygon_index("ciudad-bbox-test")) == 1

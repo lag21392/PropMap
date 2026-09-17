@@ -85,6 +85,9 @@ _BARRIOS_FOR: dict[str, list[dict]] = {}
 _OWN_BARRIO_NAMES: dict[str, set[str]] = {}
 _OFFICIAL_BARRIO_NAMES: dict[str, set[str]] = {}
 _OWN_PLACE_NAMES: dict[str, set[str]] = {}
+_POLY_INDEX: dict[str, list[tuple[tuple[float, float, float, float], float, dict]]] = {}
+_RING_BBOX: dict[int, tuple[float, float, float, float] | None] = {}
+_RING_AREA: dict[int, float] = {}
 _OUTLINE_CACHE: dict[str, list[list[list[float]]]] = {}
 _OUTLINE_MISS: set[str] = set()
 _POINT_BOXES: list[tuple[str, float, float, float, float, float, float]] | None = None
@@ -124,11 +127,15 @@ def _invalidate_barrio_lists(city: str | None = None) -> None:
         _OWN_BARRIO_NAMES.pop(city, None)
         _OFFICIAL_BARRIO_NAMES.pop(city, None)
         _OWN_PLACE_NAMES.pop(city, None)
+        _POLY_INDEX.pop(city, None)
         return
     _BARRIOS_FOR.clear()
     _OWN_BARRIO_NAMES.clear()
     _OFFICIAL_BARRIO_NAMES.clear()
     _OWN_PLACE_NAMES.clear()
+    _POLY_INDEX.clear()
+    _RING_BBOX.clear()
+    _RING_AREA.clear()
 
 
 def remember_city_polygons(city: str, rows: list[dict]) -> None:
@@ -189,13 +196,16 @@ def city_polygons(city: str) -> list[dict]:
     rows = []
     if raw:
         try:
-            loaded = json.loads(raw)
+            from .jsoncodec import loads as json_loads
+
+            loaded = json_loads(raw)
             if isinstance(loaded, list):
                 rows = loaded
-        except json.JSONDecodeError:
+        except (ValueError, json.JSONDecodeError, TypeError):
             rows = []
     if rows:
         _POLY_CACHE[city] = rows
+        _POLY_INDEX.pop(city, None)
     return rows
 
 
@@ -215,7 +225,36 @@ def zona_from_bearing(lat: float, lon: float, clat: float | None = None, clon: f
     return "Centro"
 
 
+def _bbox_of_ring(ring: list) -> tuple[float, float, float, float] | None:
+    """Caja del anillo, cacheada. Evita ray-casting en los 175 barrios que no tocan el pin."""
+    key = id(ring)
+    if key in _RING_BBOX:
+        return _RING_BBOX[key]
+    lats: list[float] = []
+    lons: list[float] = []
+    for point in ring:
+        if len(point) >= 2:
+            lats.append(float(point[0]))
+            lons.append(float(point[1]))
+    box = (min(lats), min(lons), max(lats), max(lons)) if len(lats) >= 4 else None
+    if len(_RING_BBOX) > 8192:
+        _RING_BBOX.clear()
+        _RING_AREA.clear()
+    _RING_BBOX[key] = box
+    return box
+
+
+def _in_bbox(lat: float, lon: float, box: tuple[float, float, float, float] | None) -> bool:
+    if box is None:
+        return False
+    south, west, north, east = box
+    return south <= lat <= north and west <= lon <= east
+
+
 def _point_in_ring(lat: float, lon: float, ring: list[list[float]]) -> bool:
+    box = _bbox_of_ring(ring)
+    if box is not None and not _in_bbox(lat, lon, box):
+        return False
     inside = False
     for i in range(len(ring) - 1):
         y1, x1 = ring[i]
@@ -228,22 +267,53 @@ def _point_in_ring(lat: float, lon: float, ring: list[list[float]]) -> bool:
 
 
 def _ring_area(ring: list[list[float]]) -> float:
+    key = id(ring)
+    hit = _RING_AREA.get(key)
+    if hit is not None:
+        return hit
     area = 0.0
     for i in range(len(ring) - 1):
         area += ring[i][1] * ring[i + 1][0] - ring[i + 1][1] * ring[i][0]
-    return abs(area) / 2
+    out = abs(area) / 2
+    _RING_AREA[key] = out
+    return out
+
+
+def _polygon_index(city: str) -> list[tuple[tuple[float, float, float, float], float, dict]]:
+    hit = _POLY_INDEX.get(city)
+    if hit is not None:
+        return hit
+    rows: list[tuple[tuple[float, float, float, float], float, dict]] = []
+    for row in city_polygons(city):
+        ring = row.get("ring")
+        if not ring or len(ring) < 4:
+            continue
+        box = _bbox_of_ring(ring)
+        if box is None:
+            continue
+        rows.append((box, _ring_area(ring), row))
+    _POLY_INDEX[city] = rows
+    return rows
 
 
 def barrio_containing(lat: float, lon: float, city: str = DEFAULT_CITY) -> tuple[str, str, float, float] | None:
-    hits = [row for row in city_polygons(city) if row.get("ring") and _point_in_ring(lat, lon, row["ring"])]
+    hits: list[tuple[float, dict]] = []
+    for box, area, row in _polygon_index(city):
+        if not _in_bbox(lat, lon, box):
+            continue
+        if _point_in_ring(lat, lon, row["ring"]):
+            hits.append((area, row))
     if not hits:
         return None
-    best = min(hits, key=lambda row: _ring_area(row["ring"]))
+    best = min(hits, key=lambda item: item[0])[1]
     return best["name"], best["zona"], best["lat"], best["lon"]
 
 
 def _point_in_rings(lat: float, lon: float, rings: list[list[list[float]]]) -> bool:
-    return any(len(ring) >= 4 and _point_in_ring(lat, lon, ring) for ring in rings)
+    for ring in rings:
+        if len(ring) >= 4 and _point_in_ring(lat, lon, ring):
+            return True
+    return False
 
 
 def city_outline_rings(city: str | None) -> list[list[list[float]]]:
@@ -439,7 +509,13 @@ def in_city_radius(lat: float | None, lon: float | None, city: str | None) -> bo
             cfg = CITIES.get(alias) or {}
             if cfg:
                 break
-    in_rings = bool(rings) and _point_in_rings(float(lat), float(lon), rings)
+    in_rings = False
+    if rings:
+        outline_box = _rings_bbox(rings)
+        if outline_box and not _in_bbox(float(lat), float(lon), outline_box):
+            in_rings = False
+        else:
+            in_rings = _point_in_rings(float(lat), float(lon), rings)
     in_rad = False
     if cfg:
         clat, clon = cfg["lat"], cfg["lon"]
@@ -1074,8 +1150,11 @@ def public_row_fits_city(row: dict, city: str) -> bool:
 
 def fold(text: str) -> str:
     raw = text or ""
-    if len(raw) <= 96:
+    n = len(raw)
+    if n <= 96:
         return _fold_short(raw)
+    if n <= 4000:
+        return _fold_long(raw)
     return _fold_raw(raw)
 
 
@@ -1087,6 +1166,11 @@ def _fold_raw(text: str) -> str:
 
 @functools.lru_cache(maxsize=16384)
 def _fold_short(text: str) -> str:
+    return _fold_raw(text)
+
+
+@functools.lru_cache(maxsize=4096)
+def _fold_long(text: str) -> str:
     return _fold_raw(text)
 
 
@@ -1493,18 +1577,20 @@ _STREET_SKIP = {
 }
 
 
+_STREET_NUM_RE = re.compile(
+    r"(?:(?P<kind>avenida|av\.?|calle|pasaje)\s+)?"
+    r"(?P<name>[a-z0-9áéíóúüñ\.]{3,}(?:\s+[a-z0-9áéíóúüñ\.]{2,}){0,4})"
+    r"\s+(?:al\s+)?(?P<num>\d{2,5})\b"
+)
+
+
 def parse_street(text: str) -> tuple[str, int | None]:
     folded = fold(text)
     known_hits: list[tuple] = []
     other_hits: list[tuple] = []
-    pattern = re.compile(
-        r"(?:(?P<kind>avenida|av\.?|calle|pasaje)\s+)?"
-        r"(?P<name>[a-z0-9áéíóúüñ\.]{3,}(?:\s+[a-z0-9áéíóúüñ\.]{2,}){0,4})"
-        r"\s+(?:al\s+)?(?P<num>\d{2,5})\b"
-    )
     pos = 0
     while pos < len(folded):
-        match = pattern.search(folded, pos)
+        match = _STREET_NUM_RE.search(folded, pos)
         if not match:
             break
         name = fold(match.group("name"))

@@ -175,3 +175,93 @@ def test_grows_tor_circuits_when_all_blocked(monkeypatch):
     assert snap["tor_extra"] == 2
     crawl.reset()
     egress.reset()
+
+
+def test_local_pages_run_in_parallel(monkeypatch):
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "20")
+    monkeypatch.setenv("SCRAPE_LOCAL_PARALLEL", "3")
+    monkeypatch.setenv("SCRAPE_LOCAL_MAX_DAY", "600")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    crawl.reset()
+    zp = "www.zonaprop.com.ar"
+    assert egress.acquire_local(zp) is True
+    assert egress.acquire_local(zp) is True
+    assert egress.acquire_local(zp) is True
+    assert egress.acquire_local(zp, timeout=0.05) is False
+    assert egress.local_ready("www.argenprop.com") is True
+    egress.release_local(zp)
+    assert egress.acquire_local(zp, timeout=0.05) is True
+    egress.reset()
+    crawl.reset()
+
+
+def test_acquire_local_holds_the_page_slot(monkeypatch):
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.setenv("SCRAPE_LOCAL_PARALLEL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_MAX_DAY", "600")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    assert egress.acquire_local("www.zonaprop.com.ar", timeout=0.2) is True
+    assert egress.local_used_today() == 1
+    assert egress.local_has_room() is False
+    assert egress.acquire_local("www.argenprop.com", timeout=0.05) is False
+    egress.release_local("www.zonaprop.com.ar")
+    assert egress.acquire_local("www.argenprop.com", timeout=0.05) is True
+    egress.reset()
+
+
+def test_local_ready_while_other_portal_cools(monkeypatch):
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    crawl.reset()
+    crawl.note_http(403, "www.zonaprop.com.ar", lane="direct")
+    assert egress.local_ready("www.zonaprop.com.ar") is False
+    assert egress.local_ready("www.argenprop.com") is True
+    assert egress.acquire_local("www.argenprop.com") is True
+    egress.release_local("www.argenprop.com")
+    egress.reset()
+    crawl.reset()
+
+
+def test_local_lane_stops_at_daily_cap(monkeypatch):
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.setenv("SCRAPE_LOCAL_MAX_DAY", "2")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    crawl.reset()
+    egress.note_local_use()
+    assert egress.local_ready() is True
+    egress.note_local_use()
+    assert egress.local_ready() is False
+    assert egress.pick("www.zonaprop.com.ar") is None
+    egress.reset()
+    crawl.reset()
+
+
+def test_tor_goes_before_the_local_ip(monkeypatch):
+    monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
+    monkeypatch.setenv("TOR_ENABLED", "1")
+    monkeypatch.setenv("TOR_SOCKS", "socks5h://127.0.0.1:19050")
+    monkeypatch.setenv("TOR_CIRCUITS", "1")
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.setattr(egress, "_socks_supported", lambda _url: True)
+    egress.reset()
+    crawl.reset()
+    kinds = [lane.kind for lane in egress.lanes()]
+    assert "tor" in kinds and "direct" in kinds
+    lane = egress.pick("www.zonaprop.com.ar")
+    assert lane is not None and lane.kind == "tor"
+    egress.reset()
+    crawl.reset()

@@ -34,6 +34,17 @@ def test_never_downloaded_needs_fetch():
     assert needs_detail_fetch(_item("1")) is True
 
 
+def test_unknown_city_after_llm_pass_skips_ficha():
+    item = _item("lost", city="fuera", extra={"llm_city_ok": True, "llm_at": "2026-09-01T00:00:00+00:00"})
+    assert needs_detail_fetch(item) is False
+    still_new = _item("fresh", city="", extra={})
+    assert needs_detail_fetch(still_new) is True
+    skipped = _item("marked", city="", extra={"skip_details": True})
+    assert needs_detail_fetch(skipped) is False
+    placed = _item("ok", city="trelew", extra={"llm_city_ok": True})
+    assert needs_detail_fetch(placed) is True
+
+
 def test_already_downloaded_today_is_skipped():
     now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
     item = _item(

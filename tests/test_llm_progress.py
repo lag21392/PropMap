@@ -43,6 +43,7 @@ def test_format_report_mentions_priority_and_counts():
             "faltan_ficha": 5,
             "lleva": "2 h 10 min",
             "por_hora": 12.0,
+            "por_minuto": 0.2,
             "por_dia": 288,
             "faltan_tiempo": "7 h 30 min",
             "eta": "28/08 06:00",
@@ -56,6 +57,7 @@ def test_format_report_mentions_priority_and_counts():
     assert "urgentes 8" in text
     assert "gemini/gemini-3.5-flash-lite" in text
     assert "lleva 2 h 10 min" in text
+    assert "0.2/min" in text
     assert "12.0/h" in text
     assert "~288/día" in text
     assert "faltan 7 h 30 min" in text
@@ -72,6 +74,7 @@ def test_pace_uses_last_hour_and_eta():
     ]
     stats = pace(listos=4, faltan=8, started=started, done_at=done_at, now=now)
     assert stats["por_hora"] == 4.0
+    assert stats["por_minuto"] == 0.07
     assert stats["por_dia"] == 96.0
     assert stats["lleva"] == "2 h"
     assert stats["faltan_tiempo"] == "2 h"

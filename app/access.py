@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 from .geo import (
@@ -212,6 +213,10 @@ def access_needs_refresh(item: Listing) -> bool:
 
 _access_lock = threading.Lock()
 _access_inflight: set[str] = set()
+_access_at: dict[str, float] = {}
+_access_run = threading.Semaphore(1)
+ACCESS_COOLDOWN_SEC = 180.0
+ACCESS_TURN_SEC = 30.0
 
 
 def refresh_city_access(city_id: str) -> int:
@@ -253,6 +258,9 @@ def refresh_city_access(city_id: str) -> int:
                 pass
             updated += len(dirty)
             dirty = []
+            # Sin esta pausa el ingest se queda con el candado del cache y el
+            # watchdog cree que la API está trabada.
+            time.sleep(0.05)
     if dirty:
         store.update_extras(dirty)
         try:
@@ -266,24 +274,38 @@ def refresh_city_access(city_id: str) -> int:
     return updated
 
 
-def kick_access_later(city_id: str | None) -> None:
+def kick_access_later(city_id: str | None, *, now: bool = False) -> None:
+    """Un refresh recorre toda la ciudad: sin enfriamiento, cada aviso que entra
+    dispara otra pasada completa y el cache queda sin candado libre."""
     cid = (city_id or "").strip()
     if not cid or cid in {"fuera", "otros"} or os.environ.get("PROPMAP_TEST") == "1":
         return
+    last = _access_at.get(cid) or 0.0
     with _access_lock:
         if cid in _access_inflight:
+            return
+        if not now and time.monotonic() - last < ACCESS_COOLDOWN_SEC:
             return
         _access_inflight.add(cid)
 
     def _job() -> None:
+        # De a una ciudad: varias pasadas juntas leen la base entera en paralelo
+        # y no dejan respirar al cache ni a la API.
+        turn = _access_run.acquire(timeout=ACCESS_TURN_SEC)
         try:
+            if not turn:
+                return
             n = refresh_city_access(cid)
             if n:
                 log.info("access refresh %s n=%s", cid, n)
         except Exception:
             log.exception("access refresh %s", cid)
         finally:
+            if turn:
+                _access_run.release()
             with _access_lock:
+                if turn:
+                    _access_at[cid] = time.monotonic()
                 _access_inflight.discard(cid)
 
     threading.Thread(target=_job, daemon=True, name=f"access-{cid}").start()

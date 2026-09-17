@@ -33,6 +33,7 @@ PROXY_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 PROXY_HOSTS = ("properati.com",)
+LOCAL_HOSTS = ("zonaprop.com", "argenprop.com")
 TRANSLATE_PROXY = "https://translate.yandex.com/translate"
 TRANSLATE_LANGS = ("es-en", "es-es")
 SGAI_SCRAPE = "https://v2-api.scrapegraphai.com/api/scrape"
@@ -43,6 +44,10 @@ _DETAIL_URL = re.compile(
 _blocked_until: dict[str, float] = {}
 _tls = threading.local()
 PAGE_CACHE_TTL = 12 * 3600
+
+
+class PageGone(RuntimeError):
+    """El aviso ya no está (404/410): reintentarlo no sirve, hay que darlo de baja."""
 
 
 def reset_fetch_state() -> None:
@@ -104,55 +109,162 @@ def _httpx_get(
     return client.get(url)
 
 
+def portal_way(url: str = "", listing_id: str = "") -> str:
+    """Cómo salir de este aviso: traductor, IP local o Tor.
+
+    Properati entra por Yandex. Las fichas de ZonaProp y Argenprop van por
+    la IP de casa. El resto (Mercado Libre, listados) usa Tor.
+    """
+    host = urlparse(url or "").netloc.lower()
+    if not host:
+        src = (listing_id or "").split(":", 1)[0].lower()
+        if src == "properati":
+            return "translate"
+        if src in {"zonaprop", "argenprop"}:
+            return "local"
+        return "tor"
+    if any(part in host for part in PROXY_HOSTS):
+        return "translate"
+    if _looks_like_listing(url) and any(part in host for part in LOCAL_HOSTS):
+        return "local"
+    return "tor"
+
+
+def portal_host(url: str = "", listing_id: str = "") -> str:
+    if url:
+        return urlparse(url).netloc.lower()
+    src = (listing_id or "").split(":", 1)[0].lower()
+    return {
+        "zonaprop": "www.zonaprop.com.ar",
+        "argenprop": "www.argenprop.com",
+        "properati": "www.properati.com.ar",
+        "mercadolibre": "www.mercadolibre.com.ar",
+    }.get(src, "")
+
+
 def fetch_text(url: str, timeout: float = 35.0, retries: int = 3, paced: bool = True) -> str:
-    from .egress import can_fetch, lanes, note_error, pick, use_local
+    """Sale por el carril que ya sabemos que anda. Un 404/410 da de baja el aviso."""
+    from .egress import can_fetch, lanes
 
     cached = _read_page_cache(url)
     if cached:
         return cached
-    last_error: Exception | None = None
     host = urlparse(url).netloc
     listing = _looks_like_listing(url)
+    way = portal_way(url)
     if (
-        _host_is_blocked(host)
+        way != "translate"
+        and _host_is_blocked(host)
         and not listing
         and not _host_needs_proxy(url)
         and (len(lanes()) <= 1 or not can_fetch(host))
     ):
         raise RuntimeError(f"{host} en pausa (403)")
-    n_lanes = max(1, len(lanes()))
-    tries = n_lanes if n_lanes > 1 else (1 if _host_needs_proxy(url) else retries)
+    if way == "translate":
+        return _fetch_via_translate(url, timeout, paced, listing)
+    if way == "local":
+        return _fetch_via_local(url, timeout, paced, listing)
+    return _fetch_via_tor(url, timeout, paced, listing, retries)
+
+
+def _remember_ok(url: str, listing: bool, text: str, lane: str, host: str) -> str:
+    _observe(host, lane, 200)
+    return _remember_page(url, text)
+
+
+def _fetch_via_translate(url: str, timeout: float, paced: bool, listing: bool) -> str:
+    host = urlparse(url).netloc
+    proxied = _try_blocked_fallback(url, timeout, paced)
+    if proxied is not None and (not listing or _listing_html_ok(url, proxied)):
+        return _remember_ok(url, listing, proxied, "translate", host)
+    stealth = _try_stealth_fetch(url, timeout)
+    if stealth and (not listing or _listing_html_ok(url, stealth)):
+        return _remember_ok(url, listing, stealth, "stealth", host)
+    raise RuntimeError(f"No se pudo leer {url}: el traductor no devolvió la ficha")
+
+
+def _fetch_via_local(url: str, timeout: float, paced: bool, listing: bool) -> str:
+    from .egress import acquire_local, local_limits, release_local, use_local
+
+    host = urlparse(url).netloc
+    last_error: Exception | None = None
+    gap, _ = local_limits()
+    claimed = use_local() and acquire_local(host, timeout=(gap if paced else 0.0))
+    if claimed:
+        try:
+            if paced and crawl.aborted():
+                raise RuntimeError("búsqueda pausada")
+            response = _httpx_get(url, timeout, proxy=None)
+            crawl.note_http(response.status_code, host, lane="direct")
+            _observe(host, "direct", response.status_code)
+            if response.status_code in {404, 410}:
+                raise PageGone(f"HTTP {response.status_code}")
+            if response.status_code in {401, 403, 405}:
+                _mark_blocked(host)
+            response.raise_for_status()
+            text = response.text
+            if not listing or _listing_html_ok(url, text):
+                return _remember_page(url, text)
+            last_error = RuntimeError("ficha incompleta")
+        except PageGone:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if listing or not _host_is_blocked(host):
+                try:
+                    text = _fetch_urllib(url, timeout)
+                    if not listing or _listing_html_ok(url, text):
+                        return _remember_ok(url, listing, text, "urllib", host)
+                except PageGone:
+                    raise
+                except Exception as urllib_exc:
+                    last_error = urllib_exc
+        finally:
+            release_local(host, hold=paced)
+    stealth = _try_stealth_fetch(url, timeout)
+    if stealth and (not listing or _listing_html_ok(url, stealth)):
+        return _remember_ok(url, listing, stealth, "stealth", host)
+    raise RuntimeError(f"No se pudo leer {url}: {last_error or 'IP local no disponible'}")
+
+
+def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries: int) -> str:
+    from .egress import acquire_local, can_fetch, lanes, note_error, note_local_use, pick, release_local, use_local
+
+    host = urlparse(url).netloc
+    last_error: Exception | None = None
+    hidden = [lane for lane in lanes() if lane.kind != "direct"]
+    tries = min(4, len(hidden)) if hidden else (1 if _host_needs_proxy(url) else retries)
     skip_direct = _host_is_blocked(host) and _host_needs_proxy(url) and not can_fetch(host)
     tried: set[str] = set()
     if not skip_direct:
-        for attempt in range(tries):
+        for attempt in range(max(1, tries)):
             lane = pick(host, exclude=tried)
             if lane is None:
+                break
+            if hidden and lane.kind == "direct":
                 break
             if paced:
                 crawl.wait(host=host, lane=lane.id)
                 if crawl.aborted():
                     raise RuntimeError("búsqueda pausada")
             try:
+                if not lane.proxy:
+                    note_local_use(host)
                 response = _httpx_get(url, timeout, proxy=lane.proxy)
                 crawl.note_http(response.status_code, host, lane=lane.id)
                 _observe(host, lane.id, response.status_code)
+                if response.status_code in {404, 410}:
+                    raise PageGone(f"HTTP {response.status_code}")
                 if response.status_code in {429, 503}:
                     last_error = RuntimeError(f"HTTP {response.status_code}")
                     tried.add(lane.id)
                     continue
-                if response.status_code in {401, 403}:
+                if response.status_code in {401, 403, 405}:
                     tried.add(lane.id)
                     if not pick(host, exclude=tried):
                         _mark_blocked(host)
-                    if response.status_code == 403 and listing and use_local():
-                        try:
-                            text = _fetch_urllib(url, timeout)
-                            _observe(host, "urllib", 200)
-                            return _remember_page(url, text)
-                        except Exception as exc:
-                            last_error = exc
-                    if pick(host, exclude=tried):
+                    nxt = pick(host, exclude=tried)
+                    if nxt is not None and not (hidden and nxt.kind == "direct"):
                         continue
                     break
                 response.raise_for_status()
@@ -162,30 +274,52 @@ def fetch_text(url: str, timeout: float = 35.0, retries: int = 3, paced: bool = 
                     tried.add(lane.id)
                     continue
                 return _remember_page(url, text)
+            except PageGone:
+                raise
             except Exception as exc:
                 last_error = exc
                 note_error(lane.id)
                 tried.add(lane.id)
                 time.sleep(1.2 * (attempt + 1))
-        if use_local() and (listing or not _host_is_blocked(host) or _host_needs_proxy(url)):
-            try:
-                if paced:
-                    crawl.wait(host=host, lane="direct")
-                text = _fetch_urllib(url, timeout)
-                if not listing or _listing_html_ok(url, text):
-                    _observe(host, "urllib", 200)
-                    return _remember_page(url, text)
-                last_error = RuntimeError("ficha incompleta")
-            except Exception as exc:
-                last_error = exc
-    proxied = _try_blocked_fallback(url, timeout, paced)
-    if proxied is not None and (not listing or _listing_html_ok(url, proxied)):
-        _observe(host, "translate", 200)
-        return _remember_page(url, proxied)
     stealth = _try_stealth_fetch(url, timeout)
     if stealth and (not listing or _listing_html_ok(url, stealth)):
-        _observe(host, "stealth", 200)
-        return _remember_page(url, stealth)
+        return _remember_ok(url, listing, stealth, "stealth", host)
+    if (
+        hidden
+        and use_local()
+        and (listing or not _host_is_blocked(host) or _host_needs_proxy(url))
+        and acquire_local(host)
+    ):
+        try:
+            if paced and crawl.aborted():
+                raise RuntimeError("búsqueda pausada")
+            response = _httpx_get(url, timeout, proxy=None)
+            crawl.note_http(response.status_code, host, lane="direct")
+            _observe(host, "direct", response.status_code)
+            if response.status_code in {404, 410}:
+                raise PageGone(f"HTTP {response.status_code}")
+            if response.status_code in {401, 403, 405}:
+                _mark_blocked(host)
+            response.raise_for_status()
+            text = response.text
+            if not listing or _listing_html_ok(url, text):
+                return _remember_page(url, text)
+            last_error = RuntimeError("ficha incompleta")
+        except PageGone:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if listing or not _host_is_blocked(host) or _host_needs_proxy(url):
+                try:
+                    text = _fetch_urllib(url, timeout)
+                    if not listing or _listing_html_ok(url, text):
+                        return _remember_ok(url, listing, text, "urllib", host)
+                except PageGone:
+                    raise
+                except Exception as urllib_exc:
+                    last_error = urllib_exc
+        finally:
+            release_local(host, hold=paced)
     raise RuntimeError(f"No se pudo leer {url}: {last_error}")
 
 
@@ -392,13 +526,19 @@ def _fetch_translate_proxy(url: str, timeout: float, paced: bool) -> str:
 
 
 def _fetch_urllib(url: str, timeout: float) -> str:
+    import urllib.error
     import urllib.request
 
     request = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        if getattr(response, "status", 200) >= 400:
-            raise RuntimeError(f"HTTP {response.status}")
-        return response.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if getattr(response, "status", 200) >= 400:
+                raise RuntimeError(f"HTTP {response.status}")
+            return response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code in {404, 410}:
+            raise PageGone(f"HTTP {exc.code}") from exc
+        raise
 
 
 def fetch_bytes(url: str, timeout: float = 35.0, paced: bool = True) -> bytes:

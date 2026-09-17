@@ -111,6 +111,7 @@ def pace(
     elif elapsed_sec and elapsed_sec >= 90 and stamps:
         per_hour = len(stamps) / (elapsed_sec / 3600.0)
     per_day = per_hour * 24.0
+    per_min = per_hour / 60.0 if per_hour else 0.0
     eta_sec = (faltan / per_hour * 3600.0) if per_hour > 0 and faltan > 0 else None
     eta_at = ""
     if eta_sec is not None:
@@ -119,6 +120,7 @@ def pace(
         "lleva_sec": elapsed_sec,
         "lleva": fmt_duration(elapsed_sec),
         "por_hora": round(per_hour, 1),
+        "por_minuto": round(per_min, 2),
         "por_dia": round(per_day, 0),
         "faltan_sec": eta_sec,
         "faltan_tiempo": fmt_duration(eta_sec) if eta_sec is not None else "—",
@@ -207,7 +209,7 @@ def format_report(data: dict[str, Any]) -> str:
         f"avisos {data.get('avisos')} · listos {data.get('listos')} ({data.get('pct_listos')}%) · faltan {data.get('faltan')}",
         f"  sin dirección {data.get('sin_direccion')} (prioridad) · resto {data.get('resto')} · parciales {data.get('parciales')}",
         f"  esperan ficha web {data.get('faltan_ficha')}",
-        f"lleva {data.get('lleva') or '—'} · {data.get('por_hora') or 0}/h · ~{int(data.get('por_dia') or 0)}/día",
+        f"lleva {data.get('lleva') or '—'} · {data.get('por_minuto') or 0}/min · {data.get('por_hora') or 0}/h · ~{int(data.get('por_dia') or 0)}/día",
         f"faltan {data.get('faltan_tiempo') or '—'} · ETA {data.get('eta') or '—'}",
     ]
     llm = data.get("cola_llm") or {}

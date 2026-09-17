@@ -33,15 +33,24 @@ _fail_until: dict[str, float] = {}
 _cached: tuple[str, tuple[Lane, ...]] | None = None
 _extra_circuits = 0
 _last_grow = 0.0
+_local_at = 0.0
+_local_day = ""
+_local_n = 0
+_local_inflight = 0
+_local_hold = threading.local()
 
 
 def reset() -> None:
-    global _cached, _extra_circuits, _last_grow
+    global _cached, _extra_circuits, _last_grow, _local_at, _local_day, _local_n, _local_inflight
     with _lock:
         _fail_until.clear()
         _cached = None
         _extra_circuits = 0
         _last_grow = 0.0
+        _local_at = 0.0
+        _local_day = ""
+        _local_n = 0
+        _local_inflight = 0
 
 
 def lanes() -> tuple[Lane, ...]:
@@ -68,6 +77,105 @@ def use_local() -> bool:
     return not _tor_socks_list() and not _proxy_urls()
 
 
+def local_limits() -> tuple[float, int]:
+    """Segundos que ocupa una ficha por IP de casa, y tope diario."""
+    try:
+        gap = float(os.environ.get("SCRAPE_LOCAL_GAP_SEC") or 20.0)
+    except ValueError:
+        gap = 20.0
+    try:
+        cap = int(os.environ.get("SCRAPE_LOCAL_MAX_DAY") or 600)
+    except ValueError:
+        cap = 600
+    return max(0.0, gap), max(0, cap)
+
+
+def local_parallel() -> int:
+    try:
+        n = int(os.environ.get("SCRAPE_LOCAL_PARALLEL") or 4)
+    except ValueError:
+        n = 4
+    return max(1, min(8, n))
+
+
+def local_has_room() -> bool:
+    _, cap = local_limits()
+    today = time.strftime("%Y-%m-%d")
+    with _lock:
+        if _local_day == today and cap and _local_n >= cap:
+            return False
+        return _local_inflight < local_parallel()
+
+
+def local_ready(host: str = "") -> bool:
+    """True si este portal no está en la pausa corta de 20 s tras un 403."""
+    _, cap = local_limits()
+    today = time.strftime("%Y-%m-%d")
+    with _lock:
+        if _local_day == today and cap and _local_n >= cap:
+            return False
+    if host and crawl.cooling(host, "direct"):
+        return False
+    return True
+
+
+def note_local_use(host: str = "") -> None:
+    global _local_at, _local_day, _local_n
+    today = time.strftime("%Y-%m-%d")
+    with _lock:
+        if _local_day != today:
+            _local_day = today
+            _local_n = 0
+        _local_at = time.monotonic()
+        _local_n += 1
+
+
+def local_used_today() -> int:
+    with _lock:
+        return _local_n if _local_day == time.strftime("%Y-%m-%d") else 0
+
+
+def acquire_local(host: str = "", timeout: float | None = 0.0) -> bool:
+    """Toma un hueco local. Varias páginas a la vez; cada una dura ~20 s."""
+    global _local_at, _local_day, _local_n, _local_inflight
+    wait_s = 0.0 if timeout is None else max(0.0, timeout)
+    deadline = time.monotonic() + wait_s
+    while True:
+        if host and crawl.cooling(host, "direct"):
+            return False
+        with _lock:
+            today = time.strftime("%Y-%m-%d")
+            if _local_day != today:
+                _local_day = today
+                _local_n = 0
+            _, cap = local_limits()
+            if cap and _local_n >= cap:
+                return False
+            if _local_inflight < local_parallel():
+                _local_inflight += 1
+                _local_n += 1
+                _local_at = time.monotonic()
+                _local_hold.t = _local_at
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def release_local(host: str = "", hold: bool = False) -> None:
+    """Libera el hueco. Si hold, la página ocupó los 20 s aunque el GET haya sido corto."""
+    global _local_inflight
+    gap, _ = local_limits()
+    started = float(getattr(_local_hold, "t", 0.0) or 0.0)
+    _local_hold.t = 0.0
+    if hold and gap and started:
+        left = gap - (time.monotonic() - started)
+        if left > 0:
+            time.sleep(left)
+    with _lock:
+        _local_inflight = max(0, _local_inflight - 1)
+
+
 def can_fetch(host: str, exclude: set[str] | None = None) -> bool:
     return pick(host, exclude=exclude) is not None
 
@@ -82,6 +190,8 @@ def pick(host: str, exclude: set[str] | None = None, *, _grew: bool = False) -> 
         if lane.id in skip or lane.id in dead:
             continue
         if crawl.cooling(host, lane.id):
+            continue
+        if lane.kind == "direct" and not local_ready(host):
             continue
         options.append(lane)
     if not options:
@@ -129,6 +239,8 @@ def snapshot() -> dict:
         "down": list(down_until),
         "tracks": tracks,
         "use_local": use_local(),
+        "local_today": local_used_today(),
+        "local_cap": local_limits()[1],
         "tor_circuits": sum(1 for lane in rows if lane.kind == "tor"),
         "tor_extra": _extra_circuits,
     }

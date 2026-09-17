@@ -77,12 +77,12 @@ def test_watchdog_http_ok_and_fail(monkeypatch):
 def test_watchdog_stays_ok_while_cache_builds(monkeypatch):
     from app import listings_cache, watchdog
 
-    monkeypatch.setattr(watchdog, "_ping_locks", lambda: False)
     monkeypatch.setattr(watchdog, "_http_ok", lambda: False)
     watchdog._started = 0.0
     with listings_cache._Building():
         assert watchdog._healthy() is True
     assert watchdog._healthy() is False
+    assert watchdog._stuck_reason() == "/api/alive no contestó a tiempo"
 
 
 def test_cities_loading_does_not_block_when_lock_is_held():

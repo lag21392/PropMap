@@ -341,6 +341,7 @@ def init() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_seen ON visits(seen_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_name ON visits(name, city)")
+        _stamp_skip_details_unknown_city(conn)
         conn.commit()
     from .accounts import init_tables
 
@@ -417,6 +418,8 @@ def _merge_existing(item: Listing, row: sqlite3.Row) -> None:
         extra["expenses"] = old_extra.get("expenses")
     if not extra.get("pdf_text"):
         extra["pdf_text"] = old_extra.get("pdf_text")
+    if old_extra.get("skip_details"):
+        extra["skip_details"] = True
     if not extra.get("details_at"):
         extra["details_at"] = old_extra.get("details_at")
     old_edits = old_extra.get("user_edits") or {}
@@ -838,21 +841,54 @@ def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 7) -> lis
           CASE WHEN details_scraped = 1
                  OR length(trim(IFNULL(description, ''))) >= 160
                THEN 0 ELSE 1 END,
+          CASE WHEN city = ? THEN 0 ELSE 1 END,
+          city,
           CASE WHEN scraped_at >= date('now', '-2 days') THEN 0 ELSE 1 END,
           CASE WHEN llm_fix = 1 THEN 0 ELSE 1 END,
-          CASE WHEN IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina') THEN 0
-               WHEN llm_await = 1 THEN 1
+          CASE WHEN llm_await = 1 THEN 0
+               WHEN IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina') THEN 1
                WHEN lat IS NULL THEN 2
                ELSE 3 END,
-          CASE WHEN IFNULL(json_extract(extra_json, '$.llm_place.province'), '') = ''
-                AND IFNULL(json_extract(extra_json, '$.llm.province'), '') = ''
-               THEN 0 ELSE 1 END,
-          CASE WHEN city = ? THEN 0 ELSE 1 END,
           CASE WHEN details_scraped = 1 THEN 0 ELSE 1 END,
           scraped_at DESC
         LIMIT ?
     """
     return _fetch_backlog_rows(sql, (prefer, n))
+
+
+_SKIP_DETAILS_STAMP_SQL = """
+    UPDATE listings
+    SET extra_json = json_set(IFNULL(extra_json, '{}'), '$.skip_details', json('true'))
+    WHERE IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina')
+      AND IFNULL(json_extract(extra_json, '$.skip_details'), 0) = 0
+      AND (
+        IFNULL(json_extract(extra_json, '$.llm_city_ok'), 0) != 0
+        OR IFNULL(json_extract(extra_json, '$.llm_ready'), 0) != 0
+        OR length(trim(IFNULL(json_extract(extra_json, '$.llm_at'), ''))) > 0
+      )
+"""
+
+
+_SKIP_DETAILS_STAMP_META = "skip_details_unknown_city"
+
+
+def _stamp_skip_details_unknown_city(conn: sqlite3.Connection, *, force: bool = False) -> None:
+    """Marca sin-ciudad que ya tuvieron pasada LLM para no volver a bajar la ficha."""
+    try:
+        if not force:
+            done = conn.execute(
+                "SELECT 1 FROM meta WHERE key = ?",
+                (_SKIP_DETAILS_STAMP_META,),
+            ).fetchone()
+            if done:
+                return
+        conn.execute(_SKIP_DETAILS_STAMP_SQL)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (_SKIP_DETAILS_STAMP_META, "1"),
+        )
+    except sqlite3.OperationalError:
+        return
 
 
 def fetch_detail_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
@@ -864,6 +900,15 @@ def fetch_detail_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
         WHERE details_scraped = 0
           AND IFNULL(url, '') != ''
           AND is_hidden = 0
+          AND NOT (
+            IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina')
+            AND (
+              IFNULL(json_extract(extra_json, '$.skip_details'), 0) != 0
+              OR IFNULL(json_extract(extra_json, '$.llm_city_ok'), 0) != 0
+              OR IFNULL(json_extract(extra_json, '$.llm_ready'), 0) != 0
+              OR length(trim(IFNULL(json_extract(extra_json, '$.llm_at'), ''))) > 0
+            )
+          )
         ORDER BY
           CASE WHEN llm_await = 1 THEN 0 ELSE 1 END,
           CASE WHEN city = ? THEN 0 ELSE 1 END,

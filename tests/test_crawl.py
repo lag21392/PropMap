@@ -49,12 +49,24 @@ def test_parallel_waits_do_not_multiply_cooldown():
     assert elapsed >= 1.3
 
 
-def test_note_http_403_pauses_host_for_minutes():
+def test_note_http_403_on_tor_pauses_for_minutes():
     crawl.reset()
     try:
-        crawl.note_http(403, "www.zonaprop.com.ar")
-        assert crawl.host_paused("www.zonaprop.com.ar")
+        crawl.note_http(403, "www.zonaprop.com.ar", lane="tor-0")
+        assert crawl.host_paused("www.zonaprop.com.ar", lane="tor-0")
         assert crawl.snapshot()["wait_s"] >= 12 * 60 - 1
+        assert not crawl.host_paused("www.argenprop.com")
+    finally:
+        crawl.reset()
+
+
+def test_note_http_403_on_local_is_about_20s():
+    crawl.reset()
+    try:
+        crawl.note_http(403, "www.zonaprop.com.ar", lane="direct")
+        wait_s = crawl.snapshot()["wait_s"]
+        assert 17 <= wait_s <= 23
+        assert crawl.cooling("www.zonaprop.com.ar", "direct")
         assert not crawl.host_paused("www.argenprop.com")
     finally:
         crawl.reset()
