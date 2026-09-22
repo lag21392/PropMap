@@ -372,16 +372,7 @@ def auth_logout(request: Request) -> JSONResponse:
 @app.get("/api/auth/me")
 def auth_me(request: Request) -> dict:
     from .accounts import optional_user, public_account
-    from .analytics import visitor_from_request
-    from .matomo import queue_visit
 
-    queue_visit(
-        request,
-        vid=visitor_from_request(request),
-        path="/",
-        referrer=request.headers.get("referer") or "",
-        name="pageview",
-    )
     user = optional_user(request)
     if not user or not user.email_verified:
         return {"user": None}
@@ -426,8 +417,15 @@ async def admin(request: Request) -> FileResponse:
 
 
 @app.get("/flujo")
-async def flujo_page() -> FileResponse:
-    return FileResponse(STATIC / "flujo.html", headers={"Cache-Control": "no-store"})
+async def flujo_page(request: Request) -> Response:
+    from .matomo_gate import has_access, login_page
+
+    if not has_access(request):
+        return login_page(next_url="/flujo")
+    return FileResponse(
+        STATIC / "flujo.html",
+        headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"},
+    )
 
 
 @app.get("/tablero")
@@ -452,7 +450,7 @@ def _stamp_ops_if_password(request: Request, password: str, data: dict):
 
 
 def _require_ops(request: Request, password: str = "") -> None:
-    from .matomo_gate import has_access
+    from .matomo_gate import _note_login_attempt, has_access, login_locked
     from .search_auth import password_matches
 
     if has_access(request):
@@ -460,6 +458,10 @@ def _require_ops(request: Request, password: str = "") -> None:
     got = (password or "").strip() or (request.headers.get("x-propmap-ops") or "")
     if password_matches(got):
         return
+    if got:
+        if login_locked(request):
+            raise HTTPException(status_code=429, detail="Demasiados intentos")
+        _note_login_attempt(request)
     raise HTTPException(status_code=401, detail="Contraseña incorrecta")
 
 
@@ -497,6 +499,20 @@ def lineage_graph(payload: AdminStatsIn, request: Request) -> dict:
     from .lineage import blueprint
 
     return _stamp_ops_if_password(request, payload.password, blueprint())
+
+
+@app.get("/robots.txt")
+def robots_txt() -> Response:
+    body = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Disallow: /stats\n"
+        "Disallow: /stats/\n"
+        "Disallow: /tablero\n"
+        "Disallow: /flujo\n"
+        "Disallow: /admin\n"
+    )
+    return Response(body, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/stats")
@@ -823,6 +839,22 @@ def favorites_report(request: Request) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="favoritos-propmap.pdf"'},
     )
+
+
+@app.get("/api/listing")
+def listing_get(request: Request, id: str = Query(..., min_length=3)) -> dict:
+    from .accounts import optional_user, overlay_pins
+
+    t0 = time.perf_counter()
+    store.init()
+    item = store.get_listing(id)
+    if item is None:
+        raise HTTPException(404, "No está ese aviso")
+    public = item.to_public_dict()
+    user = optional_user(request)
+    if user:
+        public = overlay_pins([public], user)[0]
+    return _with_timing("listing", t0, {"ok": True, "listing": public}, {"id": id})
 
 
 @app.post("/api/listing")

@@ -22,6 +22,22 @@ SCRIPT_PATH = "/q/l.js"
 HIT_PATH = "/q/l"
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _TRUSTED_IP_HEADERS = ("cf-connecting-ip", "true-client-ip", "x-real-ip")
+_BOT_UA = re.compile(
+    r"(?:"
+    r"googlebot|google-inspectiontool|storebot-google|adsbot-google|googleother|"
+    r"google-extended|google-cloudvertexbot|apis-google|duplexweb-google|"
+    r"bingbot|bingpreview|adidxbot|msnbot|slurp|duckduckbot|baiduspider|"
+    r"yandex(bot|\.com/bots)|facebookexternalhit|facebot|meta-externalagent|"
+    r"meta-externalfetcher|twitterbot|linkedinbot|embedly|quora link preview|"
+    r"telegrambot|applebot|petalbot|semrushbot|ahrefsbot|mj12bot|"
+    r"dotbot|bytespider|gptbot|chatgpt-user|claudebot|anthropic|ccbot|"
+    r"amazonbot|ia_archiver|pingdom|uptimerobot|"
+    r"headlesschrome|puppeteer|playwright|phantomjs|"
+    r"python-requests|python-urllib|go-http-client|"
+    r"curl/|wget/"
+    r")",
+    re.I,
+)
 _recent_hits: dict[str, float] = {}
 _recent_lock = threading.Lock()
 HIT_DEDUP_SEC = 15.0
@@ -107,6 +123,14 @@ def proxy_tracker(request: Request, body: bytes) -> Response:
         return Response(status_code=204)
 
 
+def looks_like_bot(ua: str) -> bool:
+    """Crawlers, previews y clientes HTTP. No cuentan como visita de una persona."""
+    text = (ua or "").strip()
+    if not text:
+        return True
+    return bool(_BOT_UA.search(text))
+
+
 def queue_visit(
     request: Request,
     *,
@@ -118,6 +142,8 @@ def queue_visit(
 ) -> None:
     """Manda la visita a Matomo desde el servidor. No espera la respuesta."""
     if not internal_url():
+        return
+    if looks_like_bot(request.headers.get("user-agent") or ""):
         return
     snapshot = {
         "geo_ip": ip_for_geo(request),
@@ -235,6 +261,8 @@ def ip_for_geo(request: Request) -> str:
 
 def _send_visit(snapshot: dict) -> None:
     try:
+        if looks_like_bot(str(snapshot.get("ua") or "")):
+            return
         base = internal_url()
         site_id = _site_id()
         if not base or not site_id:

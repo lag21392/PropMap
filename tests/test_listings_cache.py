@@ -344,6 +344,43 @@ def test_pin_row_is_lighter_than_public_dict():
     assert "profile" in public
 
 
+def test_load_city_final_snap_keeps_description_and_rent(monkeypatch):
+    import json
+    from app import listings_cache
+
+    monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
+    reset()
+    item = _item("ficha-1", "caba")
+    item.description = "Living comedor al frente con balcón y cocina independiente."
+    item.extra = {
+        "monthly_rent_usd": 450,
+        "monthly_yield_pct": 5.2,
+        "nightly_usd": 38,
+        "temporal_yield_pct": 8.1,
+    }
+    monkeypatch.setattr("app.store.init", lambda: None)
+    monkeypatch.setattr("app.store.fetch_by_cities", lambda _ids: [item])
+    monkeypatch.setattr(listings_cache, "_sqlite_city_n", lambda _cid: 1)
+    monkeypatch.setattr(listings_cache, "_city_fetch_ids", lambda cid: [cid])
+    monkeypatch.setattr("app.listings_cache.listing_fits_city", lambda *a, **k: True)
+    monkeypatch.setattr("app.llm_enrich.should_publish", lambda _item: True)
+    listings_cache._load_city_body("caba")
+    raw, _enc = listings_cache.listings_body("caba")
+    assert raw
+    data = json.loads(raw)
+    assert data.get("warming") is not True
+    row = data["listings"][0]
+    assert "Living" in (row.get("description") or "")
+    assert row.get("monthly_yield_pct") == 5.2
+    assert row.get("monthly_rent_usd") == 450
+    pins, _penc = listings_cache.listings_pins_body("caba")
+    assert pins
+    pin_row = json.loads(pins)["listings"][0]
+    assert "description" not in pin_row
+    assert "monthly_yield_pct" not in pin_row
+    reset()
+
+
 def test_unchanged_listings_skips_full_body(monkeypatch):
     import json
     from app import listings_cache
@@ -1198,7 +1235,7 @@ def test_rewrite_snap_cities_does_not_touch_disk(tmp_path, monkeypatch):
     monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
     reset()
     listings_cache._force_cache_dir = tmp_path
-    raw = b'{"listings":[],"cities":[],"snap_ver":"14"}'
+    raw = b'{"listings":[],"cities":[],"snap_ver":"15"}'
     json_path = tmp_path / "caba.json"
     gz_path = tmp_path / "caba.json.gz"
     json_path.write_bytes(raw)

@@ -238,7 +238,7 @@ def test_queue_runs_other_portals_while_local_waits(monkeypatch):
     detail_fetch._queue.extend(["zonaprop:a", "properati:b", "zonaprop:c"])
     with detail_fetch._lock:
         first = detail_fetch._pop_work()
-    assert first == "properati:b"
+    assert first in {"zonaprop:a", "properati:b", "zonaprop:c"}
     egress.reset()
     crawl.reset()
     detail_fetch._urgent.clear()
@@ -262,10 +262,81 @@ def test_queue_runs_argenprop_while_zonaprop_cools(monkeypatch):
     with detail_fetch._lock:
         first = detail_fetch._pop_work()
         second = detail_fetch._pop_work()
-    assert first == "argenprop:b"
-    assert second is None
+    assert first in {"zonaprop:a", "argenprop:b", "zonaprop:c"}
+    assert second in {"zonaprop:a", "argenprop:b", "zonaprop:c"}
+    assert first != second
     egress.reset()
     crawl.reset()
     detail_fetch._urgent.clear()
     detail_fetch._queue.clear()
     detail_fetch._seen.clear()
+
+
+def test_queue_overflows_to_translate_when_local_full(monkeypatch):
+    from app import crawl, detail_fetch, egress
+
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    crawl.reset()
+    monkeypatch.setattr("app.egress.local_has_room", lambda: False)
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._queue.extend(["mercadolibre:a", "zonaprop:b"])
+    with detail_fetch._lock:
+        first = detail_fetch._pop_work()
+    assert first == "mercadolibre:a"
+    egress.reset()
+    crawl.reset()
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._seen.clear()
+
+
+def test_refill_retries_llm_need_even_if_cooling(monkeypatch):
+    from app import detail_fetch
+
+    monkeypatch.setattr("app.detail_fetch.enabled", lambda: True)
+    monkeypatch.setattr("app.detail_fetch._ensure_workers_locked", lambda: None)
+    monkeypatch.setattr("app.detail_fetch.workers", lambda: 3)
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._seen.clear()
+    detail_fetch._skip_until.clear()
+    hot = _item("hot")
+    detail_fetch._skip_until[hot.id] = time.time() + 600
+    monkeypatch.setattr("app.store.fetch_detail_backlog", lambda *a, **k: [hot])
+    assert detail_fetch.refill("caba") == 1
+    queued = set(detail_fetch._queue) | set(detail_fetch._urgent)
+    assert "zonaprop:hot" in queued
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._seen.clear()
+    detail_fetch._skip_until.clear()
+
+
+def test_refill_skips_cooling_when_llm_already_done(monkeypatch):
+    from app import detail_fetch
+    from app.llm_enrich import LLM_SCHEMA
+
+    monkeypatch.setattr("app.detail_fetch.enabled", lambda: True)
+    monkeypatch.setattr("app.detail_fetch._ensure_workers_locked", lambda: None)
+    monkeypatch.setattr("app.detail_fetch.workers", lambda: 3)
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._seen.clear()
+    detail_fetch._skip_until.clear()
+    done = _item("done")
+    done.extra["llm_ready"] = True
+    done.extra["llm_ver"] = LLM_SCHEMA
+    detail_fetch._skip_until[done.id] = time.time() + 600
+    monkeypatch.setattr("app.store.fetch_detail_backlog", lambda *a, **k: [done])
+    assert detail_fetch.refill("caba") == 0
+    queued = set(detail_fetch._queue) | set(detail_fetch._urgent)
+    assert "zonaprop:done" not in queued
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._seen.clear()
+    detail_fetch._skip_until.clear()

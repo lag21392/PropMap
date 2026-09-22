@@ -60,7 +60,7 @@ def test_apply_yields_from_comps():
         for _ in range(4)
     ]
     apply_yields([item], comps)
-    assert 650 <= item.extra["monthly_rent_usd"] <= 760
+    assert 580 <= item.extra["monthly_rent_usd"] <= 680
     assert item.extra["monthly_yield_pct"] > 5
     assert "Zona Norte" in (item.extra.get("rental_month_scope") or "")
 
@@ -137,7 +137,9 @@ def test_estimate_rent_without_city_comps_or_size():
     ]
     rent, scope, n = estimate_rent(comps, item, "monthly", sale_m2={"puerto-madryn": 1600, "trelew": 900})
     assert rent is not None
-    assert 250 < rent < 700
+    assert 200 < rent < 350
+    assert "precio de venta" in (scope or "")
+    assert "Madryn" not in (scope or "")
     assert item.bedrooms is None
     apply_yields([item], comps, sale_m2={"puerto-madryn": 1600, "trelew": 900}, persist=False)
     assert item.extra["monthly_rent_usd"]
@@ -312,6 +314,17 @@ def test_comp_title_without_en_place_is_kept():
     assert len(rows) == 1
 
 
+def test_caba_barrio_in_title_is_kept():
+    from app.yields import _comp_matches_city
+
+    assert _comp_matches_city(
+        {
+            "city": "caba",
+            "title": "Departamento en Alquiler en Palermo",
+        }
+    )
+
+
 def test_large_mixed_layout_uses_similar_size_not_barrio_mix():
     item = Listing(
         source="zonaprop",
@@ -358,10 +371,134 @@ def test_large_mixed_layout_uses_similar_size_not_barrio_mix():
         )
     apply_yields([item], comps, persist=False)
     assert item.extra["monthly_rent_usd"] is not None
-    assert item.extra["monthly_rent_usd"] < 530
+    assert item.extra["monthly_rent_usd"] < 500
     assert item.extra["layout_conflict"] is True
     assert item.extra["rent_confidence"] == "low"
     assert item.extra["monthly_rent_lo"] <= item.extra["monthly_rent_usd"] <= item.extra["monthly_rent_hi"]
     assert "Desembarco" not in (item.extra.get("rental_month_scope") or "")
     assert "señales mixtas" in (item.extra.get("rental_month_scope") or "")
 
+
+def test_contract_rent_is_unit_m2_times_size_with_ask_haircut():
+    item = Listing(
+        source="manual",
+        source_id="unit-m2",
+        url="",
+        title="Depto 1 dorm",
+        property_type="departamento",
+        price_usd=90_000,
+        barrio="Centro",
+        city="caba",
+        bedrooms=1,
+        covered_m2=40,
+    )
+    comps = [
+        {
+            "city": "caba",
+            "period": "monthly",
+            "property_type": "departamento",
+            "bedrooms": 1,
+            "barrio": "Centro",
+            "covered_m2": 40,
+            "price_usd": 500,
+            "currency": "ARS",
+        }
+        for _ in range(4)
+    ]
+    rent, _scope, n = estimate_rent(comps, item, "monthly")
+    assert n >= 3
+    assert rent == round(500 * 0.88, 2)
+
+
+def test_ars_comps_preferred_over_usd_asking():
+    item = Listing(
+        source="manual",
+        source_id="ars-usd",
+        url="",
+        title="Depto 1 dorm",
+        property_type="departamento",
+        price_usd=90_000,
+        barrio="Centro",
+        city="caba",
+        bedrooms=1,
+        covered_m2=40,
+    )
+    comps = []
+    for _ in range(5):
+        comps.append(
+            {
+                "city": "caba",
+                "period": "monthly",
+                "property_type": "departamento",
+                "bedrooms": 1,
+                "barrio": "Centro",
+                "covered_m2": 40,
+                "price_usd": 400,
+                "currency": "ARS",
+            }
+        )
+    for _ in range(5):
+        comps.append(
+            {
+                "city": "caba",
+                "period": "monthly",
+                "property_type": "departamento",
+                "bedrooms": 1,
+                "barrio": "Centro",
+                "covered_m2": 40,
+                "price_usd": 900,
+                "currency": "USD",
+            }
+        )
+    rent, _scope, _n = estimate_rent(comps, item, "monthly")
+    assert rent is not None
+    assert 330 <= rent <= 380
+
+
+def test_rent_does_not_borrow_from_other_cities():
+    item = Listing(
+        source="manual",
+        source_id="madryn-local",
+        url="",
+        title="Depto 1 dorm",
+        property_type="departamento",
+        price_usd=90_000,
+        barrio="Centro",
+        city="puerto-madryn",
+        bedrooms=1,
+        covered_m2=40,
+    )
+    comps = []
+    for _ in range(6):
+        comps.append(
+            {
+                "city": "puerto-madryn",
+                "period": "monthly",
+                "property_type": "departamento",
+                "bedrooms": 1,
+                "barrio": "Centro",
+                "price_usd": 380,
+                "currency": "ARS",
+                "title": "Departamento en Alquiler en Puerto Madryn",
+            }
+        )
+    for _ in range(12):
+        comps.append(
+            {
+                "city": "caba",
+                "period": "monthly",
+                "property_type": "departamento",
+                "bedrooms": 1,
+                "barrio": "Palermo",
+                "covered_m2": 40,
+                "price_usd": 900,
+                "currency": "USD",
+                "title": "Departamento en Alquiler en Palermo",
+            }
+        )
+    rent, scope, _n = estimate_rent(comps, item, "monthly")
+    assert rent is not None
+    assert 300 <= rent <= 380
+    assert "Caba" not in scope
+    assert "Palermo" not in scope
+    assert "ajustado por USD/m²" not in scope

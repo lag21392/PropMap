@@ -63,8 +63,8 @@ KEEP_CITY_GAP_SEC = 1.2
 MAX_RAM_SNAPS = 4
 HYDRATE_RAM = 3
 RAM_SOFT_KB = 3_800_000
-SNAP_VER = "14"
-SNAP_READ_VERS = frozenset({"14"})
+SNAP_VER = "17"
+SNAP_READ_VERS = frozenset({"17"})
 MIN_TRUSTED_SNAP = 80
 TINY_SNAP = 8
 PIN_FLUSH_FIRST = 80
@@ -1048,7 +1048,7 @@ def _load_city_body(city_id: str) -> None:
         items = store.fetch_by_cities(wanted or [city_id])
         sqlite_n = _sqlite_city_n(city_id) or len(items)
         log.warning("lei %s avisos de sqlite para %s", len(items), city_id)
-        pins: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         last_flush = 0
         last_disk = 0
         for i, item in enumerate(items):
@@ -1063,21 +1063,21 @@ def _load_city_body(city_id: str) -> None:
                 if not tagged:
                     item.city = city_id
             apply_unit_price(item, rate)
-            pins.append(_pin_row(item))
-            n = len(pins)
+            rows.append(item.to_public_dict())
+            n = len(rows)
             if n == PIN_FLUSH_FIRST or n - last_flush >= PIN_FLUSH_STEP:
                 persist_warm = n == PIN_FLUSH_FIRST or n - last_disk >= PIN_FLUSH_DISK
-                _commit_snap(city_id, pins, warming=True, persist=persist_warm)
+                _commit_snap(city_id, rows, warming=True, persist=persist_warm)
                 last_flush = n
                 if persist_warm:
                     last_disk = n
                 log.warning("mapa de %s: %s pines", city_id, n)
         with _lock:
             _db_loaded.add(city_id)
-        if pins:
-            _commit_snap(city_id, pins, warming=False, persist=True, db_n=sqlite_n)
-            log.warning("cache de %s en disco: %s pines", city_id, len(pins))
-        log.warning("cache de %s listo: %s avisos", city_id, len(pins))
+        if rows:
+            _commit_snap(city_id, rows, warming=False, persist=True, db_n=sqlite_n)
+            log.warning("cache de %s en disco: %s fichas", city_id, len(rows))
+        log.warning("cache de %s listo: %s avisos", city_id, len(rows))
     except Exception:
         log.exception("no pude armar cache de %s", city_id)
     finally:

@@ -233,3 +233,36 @@ def test_api_listing_does_not_write_shared_user_edits(tmp_path, monkeypatch):
     assert stored.price == 150000
     assert stored.address == "San Martín 50"
     assert not (stored.extra or {}).get("user_edits")
+
+
+def test_api_listing_get_returns_description_and_rent(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    _ready(tmp_path, monkeypatch)
+    monkeypatch.setenv("PROPMAP_TEST", "1")
+    item = Listing(
+        source="zonaprop",
+        source_id="ficha-get",
+        url="https://example.com/ficha-get",
+        title="Depto",
+        property_type="departamento",
+        price=110000,
+        currency="USD",
+        price_usd=110000,
+        city="caba",
+        address="Mitre 10",
+        description="Living comedor al frente con balcón.",
+        extra={"monthly_rent_usd": 420, "monthly_yield_pct": 4.8},
+    )
+    store.upsert_many([item])
+    with TestClient(main.app) as client:
+        res = client.get("/api/listing", params={"id": item.id})
+        missing = client.get("/api/listing", params={"id": "zonaprop:no-esta"})
+    assert res.status_code == 200
+    body = res.json()["listing"]
+    assert "Living comedor" in (body.get("description") or "")
+    assert body.get("monthly_yield_pct") == 4.8
+    assert body.get("monthly_rent_usd") == 420
+    assert missing.status_code == 404

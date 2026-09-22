@@ -114,7 +114,7 @@ def local_ready(host: str = "") -> bool:
     with _lock:
         if _local_day == today and cap and _local_n >= cap:
             return False
-    if host and crawl.cooling(host, "direct"):
+    if host and crawl.host_cooling(host, "direct"):
         return False
     return True
 

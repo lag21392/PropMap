@@ -3,8 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+import secrets
+import threading
+import time
+from html import escape
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -36,11 +41,78 @@ _APP_PATH = (
 )
 _ROOT_REF = re.compile(rf'(?<=["\'(=])/(?={_APP_PATH})')
 _SKIP_PREFIX = ("/stats", "/matomo.js", "/matomo.php", "/static/", "/q/")
+LOGIN_MAX = 8
+LOGIN_WINDOW_SEC = 900.0
+_CAPTCHA_TTL = 600
+log = logging.getLogger(__name__)
+_login_hits: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
 
 
 def cookie_token() -> str:
     secret = search_password() or (os.environ.get("AUTH_SECRET") or "propmap")
     return hmac.new(secret.encode("utf-8"), b"stats-ok", hashlib.sha256).hexdigest()
+
+
+def reset_login_guard() -> None:
+    with _login_lock:
+        _login_hits.clear()
+
+
+def _captcha_key() -> bytes:
+    secret = search_password() or (os.environ.get("AUTH_SECRET") or "propmap")
+    return hashlib.sha256(b"propmap-ops-captcha:" + secret.encode("utf-8")).digest()
+
+
+def issue_captcha() -> tuple[str, str]:
+    a = secrets.randbelow(8) + 2
+    b = secrets.randbelow(8) + 2
+    answer = str(a + b)
+    exp = str(int(time.time()) + _CAPTCHA_TTL)
+    nonce = secrets.token_hex(8)
+    sig = hmac.new(_captcha_key(), f"{exp}:{nonce}:{answer}".encode(), hashlib.sha256).hexdigest()
+    return f"{a} + {b}", f"{exp}.{nonce}.{sig}"
+
+
+def captcha_ok(token: str, got: str) -> bool:
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        return False
+    exp, nonce, sig = parts
+    try:
+        if int(exp) < time.time():
+            return False
+    except ValueError:
+        return False
+    answer = re.sub(r"\D+", "", got or "")
+    if not answer:
+        return False
+    want = hmac.new(_captcha_key(), f"{exp}:{nonce}:{answer}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want, sig)
+
+
+def _visitor_ip(request: Request) -> str:
+    from .matomo import ip_for_geo
+
+    return ip_for_geo(request) or (request.client.host if request.client else "unknown")
+
+
+def login_locked(request: Request) -> bool:
+    ip = _visitor_ip(request)
+    now = time.monotonic()
+    with _login_lock:
+        hits = [t for t in _login_hits.get(ip, []) if now - t < LOGIN_WINDOW_SEC]
+        _login_hits[ip] = hits
+        return len(hits) >= LOGIN_MAX
+
+
+def _note_login_attempt(request: Request) -> None:
+    ip = _visitor_ip(request)
+    now = time.monotonic()
+    with _login_lock:
+        hits = [t for t in _login_hits.get(ip, []) if now - t < LOGIN_WINDOW_SEC]
+        hits.append(now)
+        _login_hits[ip] = hits
 
 
 def has_access(request: Request) -> bool:
@@ -83,49 +155,74 @@ def login_page(error: str = "", next_url: str = "", heading: str = "") -> HTMLRe
         else "Cómo está armado" if dest == "/flujo"
         else "Tablero Matomo"
     )
-    note = "<p class='err'>Contraseña incorrecta.</p>" if error else ""
-    html = f"""<!DOCTYPE html>
+    note = ""
+    if error == "locked":
+        note = "<p class='err'>Demasiados intentos. Esperá unos minutos.</p>"
+    elif error == "captcha":
+        note = "<p class='err'>La cuenta no cierra. Probá de nuevo.</p>"
+    elif error:
+        note = "<p class='err'>Contraseña incorrecta.</p>"
+    question, token = issue_captcha()
+    markup = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PropMap · {title}</title>
-  <link rel="stylesheet" href="/static/styles.css?v=ui29" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>PropMap · {escape(title)}</title>
+  <link rel="stylesheet" href="/static/styles.css?v=ui37" />
 </head>
 <body class="ops-gate">
   <main class="ops-card">
     <p class="ops-kicker">Solo administración</p>
-    <h1>{title}</h1>
+    <h1>{escape(title)}</h1>
     <p>Una sola contraseña. La sesión vale para Matomo, el scrape y el flujo.</p>
     {note}
     <form method="post" action="{PREFIX}/login">
-      <input type="hidden" name="next" value="{dest}" />
+      <input type="hidden" name="next" value="{escape(dest, quote=True)}" />
+      <input type="hidden" name="captcha_tok" value="{escape(token, quote=True)}" />
       <label>Contraseña <input type="password" name="password" autocomplete="current-password" required /></label>
+      <label>¿Cuánto es {escape(question)}?
+        <input name="captcha" inputmode="numeric" autocomplete="off" required />
+      </label>
+      <p class="ops-hp" aria-hidden="true">
+        <label>Sitio web <input type="text" name="website" tabindex="-1" autocomplete="off" /></label>
+      </p>
       <button type="submit" class="primary">Entrar</button>
     </form>
-    <p class="muted"><a href="/admin">Volver</a></p>
+    <p class="muted"><a href="/">Volver</a></p>
   </main>
 </body>
 </html>"""
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(
+        markup,
+        headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+    )
 
 
 async def _posted_fields(request: Request) -> dict[str, str]:
     raw = await request.body()
     content_type = (request.headers.get("content-type") or "").lower()
+    empty = {"password": "", "next": "", "captcha": "", "captcha_tok": "", "website": ""}
     if "json" in content_type:
         try:
             data = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
-            return {"password": "", "next": ""}
+            return empty
         return {
             "password": str((data or {}).get("password") or ""),
             "next": str((data or {}).get("next") or ""),
+            "captcha": str((data or {}).get("captcha") or ""),
+            "captcha_tok": str((data or {}).get("captcha_tok") or ""),
+            "website": str((data or {}).get("website") or ""),
         }
     parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
     return {
         "password": (parsed.get("password") or [""])[0],
         "next": (parsed.get("next") or [""])[0],
+        "captcha": (parsed.get("captcha") or [""])[0],
+        "captcha_tok": (parsed.get("captcha_tok") or [""])[0],
+        "website": (parsed.get("website") or [""])[0],
     }
 
 
@@ -136,7 +233,18 @@ async def _posted_password(request: Request) -> str:
 async def handle_login(request: Request) -> Response:
     fields = await _posted_fields(request)
     dest = _safe_next(fields.get("next") or "")
+    if login_locked(request):
+        log.warning("ops login locked ip=%s", _visitor_ip(request))
+        return login_page("locked", next_url=dest)
+    _note_login_attempt(request)
+    if (fields.get("website") or "").strip():
+        log.warning("ops login honeypot ip=%s", _visitor_ip(request))
+        return login_page("bad", next_url=dest)
+    if not captcha_ok(fields.get("captcha_tok") or "", fields.get("captcha") or ""):
+        log.warning("ops login captcha ip=%s", _visitor_ip(request))
+        return login_page("captcha", next_url=dest)
     if not password_matches(fields.get("password") or ""):
+        log.warning("ops login fail ip=%s", _visitor_ip(request))
         return login_page("bad", next_url=dest)
     response = RedirectResponse(dest, status_code=303)
     return _stamp(response, request)

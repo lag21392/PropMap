@@ -8,7 +8,7 @@ def _item(source_id: str, **kw) -> Listing:
         source="zonaprop",
         source_id=source_id,
         url=kw.pop("url", f"https://example.com/{source_id}"),
-        title="Depto",
+        title=kw.pop("title", "Depto"),
         property_type="departamento",
         city=kw.pop("city", "caba"),
         extra=extra,
@@ -131,6 +131,8 @@ def test_detail_backlog_skips_downloaded(tmp_path, monkeypatch):
     rows = store.fetch_detail_backlog(8, prefer_city="caba")
     ids = [row.id for row in rows]
     assert ids == ["zonaprop:need"]
+    skipped = store.fetch_detail_backlog(8, prefer_city="caba", skip_ids={"zonaprop:need"})
+    assert skipped == []
 
 
 def test_detail_backlog_skips_unknown_city_after_llm_pass(tmp_path, monkeypatch):
@@ -166,7 +168,7 @@ def test_init_marks_unknown_city_after_llm_pass(tmp_path, monkeypatch):
 def test_pump_is_idle_in_tests():
     from app.backfill import pump
 
-    assert pump(prefer_cities=["caba"]) == {"details": 0, "llm": 0}
+    assert pump(prefer_cities=["caba"]) == {"details": 0, "llm": 0, "copy": 0}
 
 
 def test_llm_refill_fills_from_store(tmp_path, monkeypatch):
@@ -191,7 +193,7 @@ def test_llm_refill_fills_from_store(tmp_path, monkeypatch):
     assert queued == {"zonaprop:a", "zonaprop:b"}
 
 
-def test_llm_refill_skips_cards_without_text(tmp_path, monkeypatch):
+def test_llm_refill_takes_short_list_cards(tmp_path, monkeypatch):
     from app import llm_enrich, store
 
     monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
@@ -203,14 +205,16 @@ def test_llm_refill_skips_cards_without_text(tmp_path, monkeypatch):
     llm_enrich._seen.clear()
     store.upsert_many(
         [
-            _item("raw", details_scraped=False),
+            _item("raw", details_scraped=False, description="corto"),
             _item("ready-text", details_scraped=True),
+            _item("blank", details_scraped=False, title="", description=""),
         ]
     )
     n = llm_enrich.refill("caba")
     queued = set(llm_enrich._urgent) | set(llm_enrich._queue)
-    assert n == 1
-    assert queued == {"zonaprop:ready-text"}
+    assert n == 2
+    assert queued == {"zonaprop:raw", "zonaprop:ready-text"}
+    assert "zonaprop:blank" not in queued
 
 
 def test_llm_backlog_does_not_starve_detailed_behind_short_new_ads(tmp_path, monkeypatch):
@@ -278,3 +282,83 @@ def test_llm_backlog_uses_needs_llm_index(tmp_path, monkeypatch):
             )
         ).lower()
     assert "idx_listings_needs_llm" in plan
+
+
+def test_llm_refill_runs_unassigned_city_without_ficha(tmp_path, monkeypatch):
+    from app import llm_enrich, store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    monkeypatch.setattr(llm_enrich, "enabled", lambda: True)
+    monkeypatch.setattr(llm_enrich, "_ensure_workers_locked", lambda: None)
+    llm_enrich._urgent.clear()
+    llm_enrich._queue.clear()
+    llm_enrich._seen.clear()
+    llm_enrich._skip_until.clear()
+    store.upsert_many([_item("lost", city="fuera", details_scraped=False)])
+    n = llm_enrich.refill("caba")
+    queued = set(llm_enrich._urgent) | set(llm_enrich._queue)
+    assert n == 1
+    assert queued == {"zonaprop:lost"}
+
+
+def test_llm_refill_runs_list_card_snippet(tmp_path, monkeypatch):
+    from app import llm_enrich, store
+    from app.freshness import LIST_TEXT_MIN
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    monkeypatch.setattr(llm_enrich, "enabled", lambda: True)
+    monkeypatch.setattr(llm_enrich, "_ensure_workers_locked", lambda: None)
+    llm_enrich._urgent.clear()
+    llm_enrich._queue.clear()
+    llm_enrich._seen.clear()
+    llm_enrich._skip_until.clear()
+    store.upsert_many(
+        [_item("snip", details_scraped=False, description="d" * LIST_TEXT_MIN)]
+    )
+    n = llm_enrich.refill("caba")
+    queued = set(llm_enrich._urgent) | set(llm_enrich._queue)
+    assert n == 1
+    assert queued == {"zonaprop:snip"}
+
+
+def test_llm_refill_skips_cooling_head_and_takes_others(tmp_path, monkeypatch):
+    import time
+
+    from app import llm_enrich, store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    monkeypatch.setattr(llm_enrich, "enabled", lambda: True)
+    monkeypatch.setattr(llm_enrich, "_ensure_workers_locked", lambda: None)
+    llm_enrich._urgent.clear()
+    llm_enrich._queue.clear()
+    llm_enrich._seen.clear()
+    llm_enrich._skip_until.clear()
+    blocked = [_item(f"cool-{i}", details_scraped=True) for i in range(12)]
+    ok = _item("ok", details_scraped=True)
+    store.upsert_many(blocked + [ok])
+    until = time.time() + 999
+    llm_enrich._skip_until.update({item.id: until for item in blocked})
+    n = llm_enrich.refill("caba")
+    queued = set(llm_enrich._urgent) | set(llm_enrich._queue)
+    assert n == 1
+    assert queued == {"zonaprop:ok"}
+
+
+def test_detail_backlog_prioritizes_needs_llm(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    done = _item(
+        "done-llm",
+        details_scraped=False,
+        extra={"llm_ready": True, "llm_ver": LLM_SCHEMA, "llm_partial": False},
+    )
+    need = _item("need-llm", details_scraped=False)
+    store.upsert_many([done, need])
+    ids = [row.id for row in store.fetch_detail_backlog(8, prefer_city="caba")]
+    assert ids[0] == "zonaprop:need-llm"
+    assert ids.index("zonaprop:need-llm") < ids.index("zonaprop:done-llm")

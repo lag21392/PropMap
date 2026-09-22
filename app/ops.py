@@ -144,7 +144,9 @@ def inventory(force: bool = False) -> dict[str, Any]:
                 SELECT
                   SUM(CASE WHEN llm_ready = 1 AND llm_ver = ? AND llm_partial = 0 THEN 1 ELSE 0 END),
                   SUM(llm_partial),
-                  SUM(llm_await)
+                  SUM(llm_await),
+                  SUM(needs_llm),
+                  SUM(CASE WHEN details_scraped = 0 AND is_hidden = 0 THEN 1 ELSE 0 END)
                 FROM listings
                 """,
                 (LLM_SCHEMA,),
@@ -184,11 +186,12 @@ def inventory(force: bool = False) -> dict[str, Any]:
     llm_done = int(llm_row[0] or 0)
     llm_partial = int(llm_row[1] or 0)
     await_llm = int(llm_row[2] or 0)
-    llm_need = max(0, total - llm_done - llm_partial)
+    llm_need = int(llm_row[3] or 0)
+    details_need = int(llm_row[4] or 0)
     data = {
         "listings": total,
         "details": detailed,
-        "details_need": max(0, total - detailed),
+        "details_need": details_need,
         "details_pct": round(100.0 * detailed / total, 1) if total else 0.0,
         "llm_done": llm_done,
         "llm_partial": llm_partial,
@@ -270,6 +273,7 @@ def _build_dashboard() -> dict[str, Any]:
     inv = inventory()
     llm_live = live.get("llm") or {}
     details_live = live.get("details") or {}
+    copy_live = live.get("copy") or {}
     llm_pace = _outcome_pace(tel.get("series") or [], "llm_by", prefix="llm")
     details_pace = _outcome_pace(tel.get("series") or [], "details_by", prefix="details")
     llm_rate = float(llm_pace.get("per_hour") or 0)
@@ -301,6 +305,7 @@ def _build_dashboard() -> dict[str, Any]:
             "counts": live.get("counts") or {},
             "llm": llm_live,
             "details": details_live,
+            "copy": live.get("copy") or {},
             "crawl": live.get("crawl") or {},
             "logs": list(live.get("logs") or [])[-24:],
             "jobs": jobs,
@@ -332,11 +337,14 @@ def _build_dashboard() -> dict[str, Any]:
             "working": int(llm_live.get("cleaning") or 0),
             "workers": int(llm_live.get("workers") or 0),
             "cap": int(llm_live.get("cap") or 0),
-            "gpu": bool(llm_live.get("gpu")),
+            "gpu": bool(llm_live.get("gpu")) or bool(copy_live.get("cleaning")),
             "llama_ok": bool(llm_live.get("llama_ok")),
             "n_ctx": int(llm_live.get("n_ctx") or 0),
-            "busy_s": float(llm_live.get("busy_s") or 0),
+            "busy_s": float(llm_live.get("busy_s") or 0) or float(copy_live.get("busy_s") or 0),
             "busy": list(llm_live.get("busy") or []),
+            "copy_queue": int(copy_live.get("pending") or 0),
+            "copy_working": int(copy_live.get("cleaning") or 0),
+            "copy_cap": int(copy_live.get("cap") or 0),
             "pct": float(inv.get("llm_pct") or 0),
             **llm_pace,
         },

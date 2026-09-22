@@ -111,7 +111,7 @@ function paint(data) {
   paintSummary({ live, inv, tel, move, llm, fichas, egress, running });
   paintLanes(egress.tracks || [], tel, data.busy || [], egress);
   paintMove(move, tel.series || []);
-  paintLlm(llm, tel.series || []);
+  paintLlm(llm, tel.series || [], live.copy || {});
   paintFichas(fichas, tel.series || []);
   paintHttp(tel.http || {});
   paintStock(inv, tel);
@@ -123,7 +123,9 @@ function paint(data) {
     || Number(llm.queue || 0) > 0
     || Number(llm.this_min || 0) > 0
     || Number(fichas.working || 0) > 0
-    || Number(fichas.queue || 0) > 0;
+    || Number(fichas.queue || 0) > 0
+    || Number((live.copy || {}).cleaning || 0) > 0
+    || Number((live.copy || {}).pending || 0) > 0;
 }
 
 function paintLanes(tracks, tel, busy, egress) {
@@ -328,7 +330,12 @@ function paintSummary(ctx) {
     alerts.push(["bad", "llama.cpp no responde: el LLM está parado."]);
   } else if (Number(llm.working || 0) && !llm.gpu && Number(llm.busy_s || 0) > 20) {
     alerts.push(["bad", `El pedido a la GPU se colgó hace ${Math.round(Number(llm.busy_s || 0))} s.`]);
-  } else if (Number(llm.need || 0) && !Number(llm.queue || 0) && !Number(llm.ready || 0)) {
+  } else if (
+    Number(llm.need || 0) &&
+    !Number(llm.queue || 0) &&
+    !Number(llm.ready || 0) &&
+    !Number(llm.working || 0)
+  ) {
     alerts.push(["warn", `Faltan ${fmt(llm.need)} avisos pero la cola está vacía: el refill no trae trabajo.`]);
   }
   if (Number(llm.fail_h || 0)) {
@@ -352,7 +359,7 @@ function paintSummary(ctx) {
     .join("");
 }
 
-function paintLlm(pipe, series) {
+function paintLlm(pipe, series, copy) {
   document.getElementById("llmBlock").hidden = false;
   const done = Number(pipe.done || 0);
   const need = Number(pipe.need || 0);
@@ -366,19 +373,24 @@ function paintLlm(pipe, series) {
   const thisMin = Number(pipe.this_min || 0);
   const okH = Number(pipe.ok_h || 0);
   const okD = Number(pipe.ok_d || 0);
-  const gpu = Boolean(pipe.gpu);
+  const copyQ = Number(pipe.copy_queue || (copy || {}).pending || 0);
+  const copyW = Number(pipe.copy_working || (copy || {}).cleaning || 0);
+  const copyCap = Number(pipe.copy_cap || (copy || {}).cap || 0);
+  const gpu = Boolean(pipe.gpu) || Boolean(copyW);
   const llamaOk = pipe.llama_ok !== false;
   const busyS = Number(pipe.busy_s || 0);
   const ok24 = Number(pipe.ok_24 || 0);
   const stuck = Boolean(working) && !gpu && busyS > 20;
   const nowBits = [];
-  if (gpu) {
+  if (gpu && copyW && !working) {
+    nowBits.push(`GPU redactando descripción${busyS ? ` hace ${Math.round(busyS)} s` : ""}`);
+  } else if (gpu) {
     nowBits.push(`GPU generando${busyS ? ` hace ${Math.round(busyS)} s` : ""}`);
   } else if (stuck) {
     nowBits.push(`GPU quieta · el worker se trabó ${Math.round(busyS)} s en un aviso`);
   } else if (queue && working) {
     nowBits.push(`armando el próximo prompt${busyS ? ` (${Math.round(busyS)} s)` : ""}`);
-  } else if (queue) {
+  } else if (queue || copyQ) {
     nowBits.push("GPU libre y hay cola: debería arrancar ya");
   } else {
     nowBits.push("GPU libre");
@@ -386,15 +398,21 @@ function paintLlm(pipe, series) {
   if (!llamaOk) nowBits.push("llama.cpp no responde");
   nowBits.push(ready ? `${fmt(ready)} prompt${ready === 1 ? "" : "s"} esperando turno` : "sin prompt de reserva");
   if (saving) nowBits.push(`${fmt(saving)} esperando para guardarse`);
+  if (copyQ || copyW) {
+    nowBits.push(`${fmt(copyW)} descripciones en GPU · ${fmt(copyQ)}${copyCap ? ` / ${fmt(copyCap)}` : ""} en cola`);
+  }
   document.getElementById("llmNow").textContent = `Ahora: ${nowBits.join(" · ")}.`;
   document.getElementById("llmLead").textContent = need
     ? (stuck
         ? `Hay ${fmt(queue)} en cola pero la GPU no está generando. No es que falte trabajo: el pedido a llama.cpp se colgó.`
         : `En la base faltan ${fmt(need)}. ${etaCopy(pipe.eta_h, need, gpu || working || thisMin || okH || okD || ok24)}`)
-    : "No hay avisos pendientes de esta versión del LLM.";
+    : (copyQ || copyW
+        ? `Extracción al día. Redactando descripciones: ${fmt(copyQ)} en cola.`
+        : "No hay avisos pendientes de esta versión del LLM.");
   paintStack("llmNowStack", [
     { label: "Prompts armados", n: ready, color: "#6a8f2e" },
     { label: "GPU generando", n: gpu ? 1 : 0, color: "#3d6f8a" },
+    { label: "Descripciones", n: copyW || copyQ, color: "#5a7a9a" },
     { label: "Guardando", n: saving, color: "#a07a2e" },
     { label: "Worker trabado", n: stuck ? 1 : 0, color: "#c45c3a" },
     { label: "Listos este minuto", n: thisMin, color: "#2a4a3c" },
@@ -406,6 +424,7 @@ function paintLlm(pipe, series) {
   ]);
   document.getElementById("llmKpis").innerHTML = paceKpis(pipe, [
     kpi("En cola", `${fmt(queue)}${cap ? ` / ${fmt(cap)}` : ""}`),
+    copyQ || copyW ? kpi("Descripciones", `${fmt(copyQ)}${copyCap ? ` / ${fmt(copyCap)}` : ""}`) : "",
     partial ? kpi("Parciales", fmt(partial)) : "",
     awaitDir ? kpi("Sin dirección", fmt(awaitDir)) : "",
   ]);

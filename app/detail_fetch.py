@@ -93,7 +93,7 @@ def needs_llm(item: Listing) -> bool:
     return needs_improve(item)
 
 
-def enqueue(listings: list[Listing] | None) -> None:
+def enqueue(listings: list[Listing] | None, *, ignore_cooling: bool = False) -> None:
     if not enabled() or not listings:
         return
     from .llm_enrich import enqueue as enqueue_llm
@@ -109,7 +109,7 @@ def enqueue(listings: list[Listing] | None) -> None:
                 if tries >= COLD_TRIES and item.id not in _skip_until:
                     # Tras un reinicio, los que ya venían fallando no arrancan de cero.
                     _cool_locked(item.id, tries)
-                if _cooling_locked(item.id):
+                if not ignore_cooling and _cooling_locked(item.id):
                     continue
                 loc_first = location_incomplete(item) or extra.get("await_llm")
                 if item.id in _seen:
@@ -138,7 +138,8 @@ def refill(prefer_city: str = "") -> int:
         pending = len(_urgent) + len(_queue)
         room = max(0, workers() * 3 - pending)
         skip = set(_seen)
-        skip.update(lid for lid, until in _skip_until.items() if until > now)
+        # El backfill es un reintento deliberado: no filtrar por cooling (_skip_until)
+        # para que los items con detail_tries agotados puedan reintentarse.
     if room <= 0:
         return 0
     from . import store
@@ -146,7 +147,11 @@ def refill(prefer_city: str = "") -> int:
     items = store.fetch_detail_backlog(min(24, room + 8), prefer_city=prefer_city)
     take = [item for item in items if item.id not in skip][:room]
     if take:
-        enqueue(take)
+        # Limpiar cooling para estos items ya que el backfill los está reintentando
+        with _lock:
+            for item in take:
+                _skip_until.pop(item.id, None)
+        enqueue(take, ignore_cooling=True)
     return len(take)
 
 
@@ -251,6 +256,10 @@ def _fetch_id(listing_id: str) -> None:
             [item],
             urgent=location_incomplete(item) or bool(extra.get("await_llm")),
         )
+    else:
+        from .llm_copy import enqueue as enqueue_copy
+
+        enqueue_copy([item])
     with _lock:
         if listing_id not in _urgent and listing_id not in _queue:
             _seen.discard(listing_id)

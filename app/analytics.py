@@ -60,6 +60,10 @@ def _record_safe(payload: dict, ua: str = "", header_ref: str = "") -> None:
 
 
 def record(payload: dict, ua: str = "", header_ref: str = "") -> None:
+    from .matomo import looks_like_bot
+
+    if looks_like_bot(ua):
+        return
     store.init()
     name = str(payload.get("n") or payload.get("name") or "pageview")[:40]
     if name not in {"pageview", "place", "listing", "tab"}:

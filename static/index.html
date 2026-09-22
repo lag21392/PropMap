@@ -9,9 +9,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui28" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui30" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui79" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui83" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -19,7 +19,7 @@
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui28" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui30" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -90,10 +90,6 @@
           <input id="favOnly" type="checkbox" />
           Solo favoritos
         </label>
-        <label class="check" title="Saca avisos sin dirección, intersección ni pin aproximado del portal. Quedan ubicación real y manzanas del aviso.">
-          <input id="hideNoLoc" type="checkbox" checked />
-          Ocultar sin ubicación
-        </label>
       </div>
 
       <div class="deal-block">
@@ -101,7 +97,7 @@
           <span>Ganga</span>
           <details class="deal-help">
             <summary aria-label="Ayuda del filtro de ganga">i</summary>
-            <p>Esto no es una tasación. El score es <strong>respecto de esta ciudad</strong>: USD/m² del mismo tipo y tamaño acá, no contra el resto del país. Un lote o depto barato puede ser ganga; <strong>dato raro</strong> es solo si el USD/m² es imposible (error de carga), no por estar debajo de la mediana.</p>
+            <p>El score compara el USD/m² de este aviso con otros del mismo tipo y tamaño en esta ciudad. Un lote o depto barato puede ser ganga. <strong>Dato raro</strong> aparece cuando el m² es imposible: casi siempre un error de carga.</p>
           </details>
         </div>
         <input id="dealBar" type="range" min="0" max="70" step="5" value="0" aria-label="Filtro de ganga" />
@@ -210,7 +206,7 @@
           <li><span class="dot loteo"></span><span><strong>Beige:</strong> loteo o catálogo. No entra en la mediana del barrio.</span></li>
           <li><span class="pin-legend round"></span><span><strong>Punto redondo:</strong> ubicación real (calle y altura, o intersección geocodificada).</span></li>
           <li><span class="pin-legend square"></span><span><strong>Cuadrado:</strong> ubicación aproximada del aviso: una manzana o zona, no la puerta.</span></li>
-          <li><span class="pin-legend lost"></span><span><strong>Sin ubicación:</strong> no hay dirección, intersección ni pin aproximado scrapeo. El filtro los puede sacar del mapa.</span></li>
+          <li><span class="pin-legend lost"></span><span><strong>Sin ubicación:</strong> el aviso no trae dirección, intersección ni pin aproximado.</span></li>
         </ul>
       </aside>
       <p class="map-hint">Arrastrá el mapa · rueda = zoom · redondo = ubicación real · cuadrado = manzana del aviso</p>
@@ -337,8 +333,8 @@
       <ul class="help-list">
         <li>Escribí una ciudad; si hay varias con el mismo nombre, elegí la de la provincia que corresponde. Filtrá tipo / barrio / precio y ordená la lista.</li>
         <li>Tocá un pin o una tarjeta para abrir la ficha a la derecha. Si hay varios avisos en el mismo punto, el mapa solo sirve para elegir cuál.</li>
-        <li>El color compara el USD/m² con el mismo tipo en esa zona. No es una tasación.</li>
-        <li>El punto redondo es ubicación real (calle y altura o esquina). El cuadrado es la manzana aproximada del aviso. Lo que no tiene ni eso queda marcado como sin ubicación; podés ocultarlos con el filtro del mapa.</li>
+        <li>El color compara el USD/m² con el mismo tipo en esa zona.</li>
+        <li>El punto redondo es ubicación real (calle y altura o esquina). El cuadrado es la manzana aproximada del aviso. Si no hay ni eso, queda marcado como sin ubicación.</li>
         <li>Marcá favoritos con una cuenta validada; se guardan cifrados. En el celular usá las solapas de abajo.</li>
       </ul>
       <p class="help-rent"><strong>Alquileres:</strong> el contrato (USD/mes) y el temporal (USD/noche) son <em>estimaciones</em> armadas con avisos de la zona, el tipo y el tamaño. Descuentan vacancia u ocupación típica. No son un alquiler cerrado ni un ingreso asegurado.</p>
@@ -349,8 +345,17 @@
     </form>
   </dialog>
 
-  <dialog id="authModal" class="auth-dialog" aria-labelledby="authTitle">
-    <form id="authForm">
+  <dialog id="authModal" class="auth-dialog is-soon" aria-labelledby="authSoonTitle">
+    <div class="auth-soon">
+      <p class="auth-soon-kicker">Cuentas</p>
+      <p class="auth-soon-stamp" aria-hidden="true">Pronto</p>
+      <h2 id="authSoonTitle">Próximamente</h2>
+      <p>Favoritos y notas van a vivir en tu cuenta. El mapa se usa igual, sin registrarse.</p>
+      <div class="dialog-actions">
+        <button class="primary" type="button" id="authSoonClose">Entendido</button>
+      </div>
+    </div>
+    <form id="authForm" hidden>
       <div class="auth-tabs" role="tablist">
         <button type="button" class="is-on" data-auth-tab="login" role="tab" aria-selected="true">Entrar</button>
         <button type="button" data-auth-tab="register" role="tab" aria-selected="false">Crear cuenta</button>
@@ -420,6 +425,6 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
-  <script defer src="/static/app.js?v=ui79"></script>
+  <script defer src="/static/app.js?v=ui83"></script>
 </body>
 </html>

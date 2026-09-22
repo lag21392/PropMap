@@ -241,26 +241,6 @@ function isLocationMissing(item) {
   return !streetAddress(item) && !hasInterseccion(item) && !hasScrapedApprox(item);
 }
 
-const HIDE_NOLOC_KEY = "propmap.hideNoLoc";
-
-function hideNoLocOn() {
-  return Boolean($("hideNoLoc")?.checked);
-}
-
-function setHideNoLoc(on, persist = true) {
-  const hide = Boolean(on);
-  if ($("hideNoLoc")) $("hideNoLoc").checked = hide;
-  if (persist) {
-    try { localStorage.setItem(HIDE_NOLOC_KEY, hide ? "1" : "0"); } catch (_) {}
-  }
-}
-
-function initHideNoLoc() {
-  let saved = null;
-  try { saved = localStorage.getItem(HIDE_NOLOC_KEY); } catch (_) {}
-  setHideNoLoc(saved == null ? true : saved === "1", false);
-}
-
 function prefetchPins(city, seq, waitKind) {
   const q = new URLSearchParams({ city, pins: "1" });
   const ac = new AbortController();
@@ -294,7 +274,9 @@ async function load(opts = {}) {
     if (opts.live) q.set("live", "1");
     q.set("city", city);
     const knownRev = listingsRevByCity[city];
-    if (allListings.length && knownRev) q.set("since", String(knownRev));
+    if (allListings.length && knownRev && !String(lastListingsFp).endsWith(":p")) {
+      q.set("since", String(knownRev));
+    }
     const ac = new AbortController();
     const kill = setTimeout(() => ac.abort(), 25000);
     try {
@@ -358,7 +340,7 @@ function applyListingsPayload(data, city, seq, opts = {}) {
   if (lastListingsFp.endsWith(":f") && data.layer === "pins") return;
   lastListingsFp = fp;
   lastListingsFetchAt = Date.now();
-  allListings = applyLocalPins(data.listings || []);
+  allListings = applyLocalPins(data.listings || []).map(withCachedFicha);
   facebook = data.facebook || [];
   if (data.usd_ars) usdArs = Number(data.usd_ars) || usdArs;
   window.lastStats = data.stats || {};
@@ -729,7 +711,6 @@ function filtered() {
     if (minDeal > 0 && cityDealScore(item) < minDeal) return false;
     if (minDeal >= 40 && item.is_outlier) return false;
     if (favs && !item.favorite) return false;
-    if (hideNoLocOn() && isLocationMissing(item)) return false;
     return true;
   });
 }
@@ -1282,7 +1263,10 @@ function render() {
   highlightSelected();
   if (selectedId) {
     const current = allListings.find((x) => x.id === selectedId);
-    if (current) showDetail(current);
+    if (current) {
+      showDetail(withCachedFicha(current));
+      fillListingFicha(current);
+    }
   }
   requestAnimationFrame(() => paintMapMarkers(items));
 }
@@ -1301,9 +1285,13 @@ function selectListing(item, { focusMap = true, at = null, keepPopup = false } =
   highlightSelected();
   refreshZoneIcons();
   showDetail(item);
+  fillListingFicha(item);
   if (!keepPopup) map.closePopup();
   showApproxBox(item, at || listingPopupLatLng(item));
   if (focusMap) focusListing(item);
+
+  // Highlight the clicked marker with pulse effect
+  highlightMarkerPulse(item);
 }
 
 function refreshZoneIcons() {
@@ -1640,7 +1628,7 @@ function cardHtml(item) {
       <div class="price">${money(item)}</div>
       <div class="headline">${escapeHtml(bits.join(" · ") || item.title || "")}</div>
       <div class="meta">${escapeHtml(place)}${escapeHtml(crossing)}${escapeHtml(between)} · ${escapeHtml(sourceSummary(item))}${locBit}${item.mortgage_credit === true ? " · apto crédito" : ""}${item.contacted ? " · contactado" : ""}</div>
-      <span class="tag ${cssId(item.deal_label)}">${escapeHtml(item.deal_label || "")}${item.vs_barrio_pct != null ? ` · ${item.vs_barrio_pct > 0 ? "-" : "+"}${Math.abs(item.vs_barrio_pct)}% vs barrio` : ""}</span>
+      <span class="tag ${cssId(item.deal_label || "")}">${escapeHtml(item.deal_label || "")}${item.vs_barrio_pct != null ? ` · ${item.vs_barrio_pct > 0 ? "-" : "+"}${Math.abs(item.vs_barrio_pct)}% vs barrio` : ""}</span>
       ${rentStrip(item)}
       ${pentagonChart(item.profile, { mini: true })}
       ${item.quality_label ? `<span class="tag quality">${escapeHtml(item.quality_label)} · ${fmt(item.quality_score)}</span>` : ""}
@@ -1743,7 +1731,10 @@ function rerenderKeep() {
     selectedId = keep;
     highlightSelected();
     const current = allListings.find((x) => x.id === keep);
-    if (current) showDetail(current);
+    if (current) {
+      showDetail(withCachedFicha(current));
+      fillListingFicha(current);
+    }
   }
 }
 
@@ -1772,6 +1763,71 @@ function applyLocalPins(listings) {
     const pin = local[item.id];
     if (!pin) return item;
     return { ...item, favorite: Boolean(pin.favorite), notes: pin.notes || "", contacted: Boolean(pin.contacted) };
+  });
+}
+
+const fichaById = {};
+const fichaWait = {};
+const fichaMiss = {};
+
+function isFichaReady(item) {
+  return Boolean(
+    item
+    && Object.prototype.hasOwnProperty.call(item, "description")
+    && Object.prototype.hasOwnProperty.call(item, "monthly_yield_pct")
+  );
+}
+
+function withCachedFicha(item) {
+  if (!item) return item;
+  if (isFichaReady(item)) {
+    fichaById[item.id] = item;
+    return item;
+  }
+  const extra = fichaById[item.id];
+  return extra ? { ...item, ...extra } : item;
+}
+
+function mergeFicha(item, full) {
+  if (!item || !full) return item;
+  fichaById[item.id] = full;
+  const idx = allListings.findIndex((row) => row.id === item.id);
+  if (idx >= 0) {
+    allListings[idx] = { ...allListings[idx], ...full };
+    return allListings[idx];
+  }
+  return { ...item, ...full };
+}
+
+async function hydrateFicha(item) {
+  if (!item || !item.id) return item;
+  if (isFichaReady(item)) return item;
+  if (fichaMiss[item.id]) return item;
+  if (fichaById[item.id]) return mergeFicha(item, fichaById[item.id]);
+  if (!fichaWait[item.id]) {
+    fichaWait[item.id] = fetch(`/api/listing?id=${encodeURIComponent(item.id)}`)
+      .then((res) => {
+        if (res.status === 404) {
+          fichaMiss[item.id] = true;
+          return null;
+        }
+        return res.ok ? res.json() : null;
+      })
+      .then((data) => data && data.listing)
+      .catch(() => null);
+  }
+  const full = await fichaWait[item.id];
+  delete fichaWait[item.id];
+  if (!full) return item;
+  return mergeFicha(item, full);
+}
+
+function fillListingFicha(item) {
+  if (!item || isFichaReady(item)) return;
+  const id = item.id;
+  hydrateFicha(item).then((full) => {
+    if (selectedId !== id || !full) return;
+    showDetail(full);
   });
 }
 
@@ -1824,7 +1880,6 @@ function showDetail(item) {
     if (["Ubicación aproximada", "Entre calles"].includes(k) && (v === "—" || !v)) return false;
     return true;
   }).map(([k, v]) => `<div class="fact"><span>${escapeHtml(String(k))}</span><b>${escapeHtml(String(v))}</b></div>`).join("");
-  const canEdit = Boolean(item.contacted);
   const hero = listingImage(item.image);
   const missingMark = isLocationMissing(item)
     ? `<p class="loc-missing">Sin dirección, intersección ni ubicación aproximada del aviso.</p>`
@@ -1866,14 +1921,10 @@ function showDetail(item) {
       <summary>Descripción</summary>
       <p class="desc">${escapeHtml(item.description || "Sin descripción todavía. Tocá buscar avisos para leer la ficha completa.")}</p>
     </details>
+    ${currentUser ? `
     <details class="fold" open>
       <summary>Notas y correcciones</summary>
-      <form class="edit-form${canEdit ? "" : " is-locked"}" id="editForm">
-      <label class="check">
-        <input type="checkbox" id="contactedChk" ${item.contacted ? "checked" : ""} />
-        Contacté este aviso (permite editar datos)
-      </label>
-      <p class="muted edit-hint">${canEdit ? "Precio, m² y dirección quedan solo en tu cuenta. El mapa público no cambia." : "Entrá con tu cuenta, marcá “contacté” y las correcciones quedan solo para vos."}</p>
+      <form class="edit-form" id="editForm">
       <div class="edit-fields">
         <label>Precio USD <input id="editPrice" type="number" step="100" value="${item.price_usd || item.price || ""}" /></label>
         <div class="row">
@@ -1890,6 +1941,7 @@ function showDetail(item) {
       </div>
     </form>
     </details>
+    ` : ""}
   `;
   $("closeDetail")?.addEventListener("click", closeDetail);
   document.querySelector(".near-fold")?.addEventListener("toggle", () => {
@@ -1898,12 +1950,8 @@ function showDetail(item) {
     else poiLayer.clearLayers();
   });
   fillNearby(item);
-  $("contactedChk")?.addEventListener("change", async (ev) => {
-    await saveListing(item.id, { contacted: ev.target.checked });
-  });
   $("saveEdits")?.addEventListener("click", async () => {
     const payload = {
-      contacted: true,
       currency: "USD",
       address: $("editAddress")?.value || "",
       notes: $("editNotes")?.value || "",
@@ -2160,14 +2208,12 @@ function cssId(value) {
   return String(value || "").replace(/[^a-z0-9]+/gi, "-");
 }
 
-["typeFilter", "zonaFilter", "barrioFilter", "maxPrice", "favOnly", "hideNoLoc", "dealBar", "sortBy"].forEach((id) => {
+["typeFilter", "zonaFilter", "barrioFilter", "maxPrice", "favOnly", "dealBar", "sortBy"].forEach((id) => {
   if (!$(id)) return;
   $(id).addEventListener("input", () => {
-    if (id === "hideNoLoc") setHideNoLoc($(id).checked);
     render();
   });
   $(id).addEventListener("change", () => {
-    if (id === "hideNoLoc") setHideNoLoc($(id).checked);
     render();
     if (id === "typeFilter") loadMarket();
   });
@@ -3162,6 +3208,7 @@ document.querySelectorAll("[data-auth-tab]").forEach((btn) => {
   btn.addEventListener("click", () => setAuthTab(btn.dataset.authTab));
 });
 $("authCancel")?.addEventListener("click", () => $("authModal")?.close());
+$("authSoonClose")?.addEventListener("click", () => $("authModal")?.close());
 $("authResend")?.addEventListener("click", async () => {
   const err = $("authError");
   const ok = $("authOk");
@@ -3350,8 +3397,6 @@ function whenIdle(fn) {
 }
 
 bindFolds();
-initHideNoLoc();
-track("pageview");
 hydrateAuth().finally(() => {
   load();
   pollStatus();

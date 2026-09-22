@@ -137,16 +137,21 @@ def payload_from_gemini(data: dict[str, Any]) -> dict[str, Any]:
     return {"message": {"content": "\n".join(texts), "tool_calls": calls}}
 
 
-def chat(messages: list[dict[str, Any]], ollama_tools: list[dict[str, Any]]) -> dict[str, Any]:
+def chat(
+    messages: list[dict[str, Any]],
+    ollama_tools: list[dict[str, Any]],
+    max_output_tokens: int | None = None,
+) -> dict[str, Any]:
     key = api_key()
     if not key:
         return {}
     system, contents = contents_from_messages(messages)
     if not contents:
         return {}
+    tokens = max(16, int(max_output_tokens or 512))
     body: dict[str, Any] = {
         "contents": contents,
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": tokens},
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}

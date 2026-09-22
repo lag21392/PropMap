@@ -27,6 +27,42 @@ def test_loads_extra_full_keeps_access():
     assert extra["search_city"] == "pilar"
 
 
+def test_map_fetch_keeps_pentagon_scores(tmp_path, monkeypatch):
+    from app import store
+    from app.models import Listing
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    store.upsert_many(
+        [
+            Listing(
+                source="zonaprop",
+                source_id="radar",
+                url="https://example.com/radar",
+                title="Depto",
+                property_type="departamento",
+                city="caba",
+                extra={
+                    "profile": {
+                        "pin_grade": "exact",
+                        "axes": {
+                            "zona": {"score": 80, "pois": [1, 2], "note": "Palermo"},
+                            "price_m2": {"score": 70, "confidence": "high"},
+                        },
+                    },
+                    "access": {"nearby": [{"name": "subte"}]},
+                },
+            )
+        ]
+    )
+    rows = store.fetch_by_cities({"caba"})
+    assert len(rows) == 1
+    axes = rows[0].extra["profile"]["axes"]
+    assert axes["zona"] == {"score": 80, "confidence": None, "note": "Palermo"}
+    assert axes["price_m2"]["score"] == 70
+    assert "access" not in rows[0].extra
+
+
 def test_upsert_many_merges_existing_and_keeps_last_duplicate(tmp_path, monkeypatch):
     from app import store
     from app.models import Listing

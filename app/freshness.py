@@ -114,9 +114,13 @@ def needs_detail_fetch(item: Listing, now: datetime | None = None) -> bool:
     return False
 
 
+# Snippet de listado (Properati/ML suelen traer 80–150 chars). 160 dejaba la cola LLM vacía.
+LIST_TEXT_MIN = 80
+
+
 def has_usable_listing_text(item: Listing) -> bool:
     """Hay texto de lista o ficha para la LLM; no hace falta esperar otra bajada HTTP."""
     extra = item.extra or {}
     if item.details_scraped or extra.get("details_at"):
         return True
-    return len((item.description or "").strip()) >= 160
+    return len((item.description or "").strip()) >= LIST_TEXT_MIN

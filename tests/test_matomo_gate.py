@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app.matomo import public_url
 from app.matomo_gate import _rewrite_cookie, _rewrite_location, _rewrite_text, rewrite_asset
+from tests.conftest import post_ops_login, solve_ops_captcha
 
 
 def test_rewrites_root_refs_to_stats_prefix(monkeypatch):
@@ -100,13 +101,54 @@ def test_stats_gate_asks_for_password(monkeypatch):
         page = client.get("/stats")
         assert page.status_code == 200
         assert "Contraseña" in page.text
+        assert "Cuánto es" in page.text
         assert page.headers.get("cache-control") == "no-store"
-        bad = client.post("/stats/login", data={"password": "nope"})
+        assert "noindex" in (page.headers.get("x-robots-tag") or "")
+        captcha = solve_ops_captcha(page.text)
+        bad = client.post("/stats/login", data={"password": "nope", **captcha})
         assert "incorrecta" in bad.text
-        good = client.post("/stats/login", data={"password": "test-secret"}, follow_redirects=False)
+        good = post_ops_login(client, "test-secret")
         assert good.status_code == 303
         assert good.headers["location"].endswith("/stats/")
         assert "propmap_ops" in good.cookies
+
+
+def test_stats_login_needs_captcha(monkeypatch):
+    monkeypatch.setenv("SEARCH_PASSWORD", "test-secret")
+    with TestClient(main.app) as client:
+        miss = client.post("/stats/login", data={"password": "test-secret"})
+        assert "cuenta no cierra" in miss.text
+        assert "propmap_ops" not in miss.cookies
+        page = client.get("/stats")
+        trap = client.post(
+            "/stats/login",
+            data={"password": "test-secret", "website": "http://spam.example", **solve_ops_captcha(page.text)},
+        )
+        assert "incorrecta" in trap.text
+        assert "propmap_ops" not in trap.cookies
+
+
+def test_stats_login_locks_after_too_many_tries(monkeypatch):
+    from app import matomo_gate
+
+    monkeypatch.setenv("SEARCH_PASSWORD", "test-secret")
+    monkeypatch.setattr(matomo_gate, "LOGIN_MAX", 3)
+    matomo_gate.reset_login_guard()
+    with TestClient(main.app) as client:
+        for _ in range(3):
+            page = client.get("/stats")
+            client.post("/stats/login", data={"password": "nope", **solve_ops_captcha(page.text)})
+        locked = client.post("/stats/login", data={"password": "test-secret"})
+        assert "Demasiados intentos" in locked.text
+        assert "propmap_ops" not in locked.cookies
+
+
+def test_robots_hides_admin_paths():
+    with TestClient(main.app) as client:
+        text = client.get("/robots.txt").text
+        assert "Disallow: /stats" in text
+        assert "Disallow: /tablero" in text
+        assert "Allow: /" in text
 
 
 def test_compose_binds_matomo_to_localhost():

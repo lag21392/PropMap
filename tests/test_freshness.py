@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.freshness import needs_detail_fetch, reset_known, same_local_day
+from app.freshness import LIST_TEXT_MIN, has_usable_listing_text, needs_detail_fetch, reset_known, same_local_day
 from app.models import Listing
 from app.scrapers import paginate
 from app.scrapers.details import DETAILS_PARSER
@@ -165,3 +165,12 @@ def test_page_workers_stay_serial_in_tests():
     from app.scrapers import page_workers
 
     assert page_workers() == 1
+
+
+def test_list_card_snippet_is_usable_text():
+    short = _item("short", description="corto")
+    snippet = _item("snip", description="d" * LIST_TEXT_MIN)
+    detailed = _item("ficha", description="", details_scraped=True)
+    assert has_usable_listing_text(short) is False
+    assert has_usable_listing_text(snippet) is True
+    assert has_usable_listing_text(detailed) is True

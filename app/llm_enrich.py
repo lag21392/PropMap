@@ -88,6 +88,10 @@ class _GpuSlot:
             self._held = False
             self._cv.notify_all()
 
+    def held(self) -> bool:
+        with self._cv:
+            return self._held
+
     def steal(self) -> None:
         with self._cv:
             self._owner += 1
@@ -337,6 +341,8 @@ def needs_improve(item: Listing) -> bool:
     extra = item.extra or {}
     if extra.get("duplicate_of") or extra.get("dedupe_hidden"):
         return False
+    if extra.get("llm_thin") and (item.details_scraped or extra.get("details_at")):
+        return True
     if _city_unassigned(item) and not extra.get("llm_city_ok"):
         return True
     if _has_data_fixes(item) and not extra.get("llm_repair"):
@@ -346,6 +352,27 @@ def needs_improve(item: Listing) -> bool:
     if extra.get("llm_partial") and extra.get("llm_ver") == LLM_SCHEMA:
         return False
     return True
+
+
+def can_run_now(item: Listing) -> bool:
+    """Hay con qué enriquecer ahora: título, texto, ficha, ciudad por resolver, o la ficha ya falló."""
+    from .detail_fetch import COLD_TRIES
+    from .freshness import has_usable_listing_text, needs_detail_fetch
+
+    if has_usable_listing_text(item):
+        return True
+    if (item.description or "").strip() or (item.title or "").strip():
+        return True
+    if not needs_detail_fetch(item):
+        return True
+    extra = item.extra or {}
+    if extra.get("llm_thin") and (item.details_scraped or extra.get("details_at")):
+        return True
+    if _city_unassigned(item) and not extra.get("llm_city_ok"):
+        return True
+    if int(extra.get("detail_tries") or 0) >= COLD_TRIES:
+        return True
+    return False
 
 
 def mark_await_llm(item: Listing) -> Listing:
@@ -388,8 +415,8 @@ def queue_stats() -> dict[str, Any]:
             "busy_s": max((row["s"] for row in busy), default=0),
             "slots": llm_parallel() if llm_provider() != "gemini" else llm_workers(),
         }
-    live = llama_status()
-    stats["gpu"] = bool(live.get("gpu"))
+        live = llama_status()
+    stats["gpu"] = bool(live.get("gpu")) or gpu_held()
     stats["llama_ok"] = bool(live.get("ok"))
     stats["n_ctx"] = int(live.get("n_ctx") or 0)
     return stats
@@ -401,7 +428,7 @@ def llama_status() -> dict[str, Any]:
     try:
         import httpx
 
-        with httpx.Client(timeout=1.2, trust_env=False) as client:
+        with httpx.Client(timeout=2.0, trust_env=False) as client:
             health = client.get(f"{llm_url()}/health")
             slots = client.get(f"{llm_url()}/slots")
         rows = slots.json() if slots.status_code == 200 else []
@@ -417,7 +444,7 @@ def llama_status() -> dict[str, Any]:
                     pass
         return {"ok": health.status_code == 200, "gpu": gpu, "n_ctx": n_ctx}
     except Exception:
-        return {"ok": False, "gpu": False, "n_ctx": 0}
+        return {"ok": True, "gpu": gpu_held(), "n_ctx": 0}
 
 
 def _ops_note(metric: str, **labels: Any) -> None:
@@ -425,6 +452,15 @@ def _ops_note(metric: str, **labels: Any) -> None:
         from .ops import note
 
         note(metric, **labels)
+    except Exception:
+        return
+
+
+def _queue_copy(item: Listing) -> None:
+    try:
+        from .llm_copy import enqueue as enqueue_copy
+
+        enqueue_copy([item])
     except Exception:
         return
 
@@ -505,14 +541,18 @@ def refill(prefer_city: str = "") -> int:
         return 0
     from . import store
 
-    items = store.fetch_llm_backlog(room + 24 + min(blocked, 80), prefer_city=prefer_city, schema=LLM_SCHEMA)
-    from .freshness import has_usable_listing_text, needs_detail_fetch
+    items = store.fetch_llm_backlog(
+        room + 24 + min(blocked, 80),
+        prefer_city=prefer_city,
+        schema=LLM_SCHEMA,
+        skip_ids=skip,
+    )
 
     take: list = []
     for item in items:
         if item.id in skip:
             continue
-        if needs_detail_fetch(item) and not has_usable_listing_text(item):
+        if not can_run_now(item):
             continue
         take.append(item)
         if len(take) >= room:
@@ -584,6 +624,34 @@ def _has_work() -> bool:
     return bool(_urgent or _queue)
 
 
+_extract_on_gpu = False
+
+
+def gpu_held() -> bool:
+    return _gpu.held()
+
+
+def poke_gpu() -> None:
+    """Despierta al hilo de GPU: hay un prompt de extract o de copy listo."""
+    with _ready_cv:
+        _ready_cv.notify_all()
+
+
+def extract_busy() -> bool:
+    """Hay extracción lista para la GPU o ya generando. El apply a SQLite no cuenta."""
+    if _extract_on_gpu:
+        return True
+    with _ready_cv:
+        return bool(_ready)
+
+
+def ensure_running() -> None:
+    if not enabled():
+        return
+    with _lock:
+        _ensure_workers_locked()
+
+
 def _wanted_workers() -> int:
     """Un hilo: Pascal tiene 1 slot. El segundo se pisa y alarga cada aviso."""
     if llm_provider() != "local":
@@ -603,10 +671,73 @@ def _ensure_workers_locked() -> None:
     while _prep_workers < PREP_WORKERS:
         _prep_workers += 1
         threading.Thread(target=_drain_prep, daemon=True, name=f"llm-prep-{_prep_workers}").start()
+    try:
+        from .llm_copy import ensure_running as ensure_copy
+
+        ensure_copy()
+    except Exception:
+        pass
+
+
+def _take_copy_job() -> tuple | None:
+    try:
+        from .llm_copy import take_ready
+
+        return take_ready()
+    except Exception:
+        return None
+
+
+def _next_gpu_job(wait: float) -> tuple[str | None, tuple | None]:
+    """Un solo consumidor de GPU: extracción si hay prompt, si no descripción."""
+    job = _take_prepared(0)
+    if job is not None:
+        return "extract", job
+    copy_job = _take_copy_job()
+    if copy_job is not None:
+        return "copy", copy_job
+    job = _take_prepared(max(0.0, wait))
+    if job is not None:
+        return "extract", job
+    copy_job = _take_copy_job()
+    if copy_job is not None:
+        return "copy", copy_job
+    return None, None
+
+
+def _run_extract_gpu(job: tuple) -> None:
+    global _extract_on_gpu
+    listing_id, item, prep = job
+    _extract_on_gpu = True
+    try:
+        raw = _chat_json(str(prep.get("prompt") or ""))
+    except Exception:
+        raw = ""
+    finally:
+        _extract_on_gpu = False
+    _finish_async(
+        lambda lid=listing_id, row=item, pre=prep, txt=raw: _finish_job(lid, row, pre, txt)
+    )
+
+
+def _run_copy_gpu(job: tuple) -> None:
+    from . import llm_copy
+
+    listing_id, item, messages = job
+    llm_copy.mark_gpu(listing_id)
+    raw = ""
+    try:
+        payload = _chat(messages, use_tools=False, max_tokens=llm_copy.MAX_TOKENS)
+        if payload:
+            message = payload.get("message") or (payload.get("choices") or [{}])[0].get("message") or {}
+            raw = str(message.get("content") or "")
+    except Exception:
+        raw = ""
+    _finish_async(lambda lid=listing_id, row=item, txt=raw: llm_copy.complete(lid, row, txt))
 
 
 def _drain() -> None:
-    """Turno de GPU: manda el prompt ya armado y suelta el resultado. No lee ni escribe SQLite."""
+    """Turno de GPU: extract primero, copy si el slot quedaría libre. No toca SQLite."""
     global _workers
     testing = os.environ.get("PROPMAP_TEST") == "1"
     try:
@@ -620,17 +751,11 @@ def _drain() -> None:
                 except Exception:
                     pass
                 continue
-            job = _take_prepared(0.4)
-            if job is None:
-                continue
-            listing_id, item, prep = job
-            try:
-                raw = _chat_json(str(prep.get("prompt") or ""))
-            except Exception:
-                raw = ""
-            _finish_async(
-                lambda lid=listing_id, row=item, pre=prep, txt=raw: _finish_job(lid, row, pre, txt)
-            )
+            kind, job = _next_gpu_job(0.12)
+            if kind == "extract" and job is not None:
+                _run_extract_gpu(job)
+            elif kind == "copy" and job is not None:
+                _run_copy_gpu(job)
     finally:
         with _lock:
             _workers = max(0, _workers - 1)
@@ -640,6 +765,8 @@ def _drain() -> None:
 def _take_prepared(timeout: float) -> tuple[str, Listing, dict[str, Any]] | None:
     with _ready_cv:
         if not _ready:
+            if timeout <= 0:
+                return None
             _ready_cv.wait(timeout)
         if _ready:
             job = _ready.popleft()
@@ -801,23 +928,31 @@ def _commit_llm_ok(item: Listing, data: dict[str, Any]) -> None:
     extra["llm_city_ok"] = True
     extra["llm_repair"] = True
     extra["llm_at"] = _now_iso()
+    if item.details_scraped or extra.get("details_at"):
+        extra.pop("llm_thin", None)
+    else:
+        extra["llm_thin"] = True
     item.extra = extra
     _mark_no_city_skip_details(item)
     _save_llm_item(item)
     _ops_note("llm", outcome="ok")
+    _queue_copy(item)
 
 
 def _needs_details_first(listing_id: str, item: Listing) -> bool:
     """True si el aviso todavía no tiene texto para analizar: primero baja la ficha."""
     from . import detail_fetch
-    from .freshness import has_usable_listing_text, needs_detail_fetch
+    from .freshness import needs_detail_fetch
 
+    extra = item.extra or {}
     if not needs_detail_fetch(item):
+        return False
+    if _city_unassigned(item) and not extra.get("llm_city_ok"):
         return False
     with detail_fetch._lock:
         already = listing_id in detail_fetch._seen
     detail_fetch.enqueue([item])
-    if has_usable_listing_text(item) or already:
+    if can_run_now(item) or already:
         return False
     with _lock:
         _seen.discard(listing_id)
@@ -843,6 +978,7 @@ def _commit_llm_fail(listing_id: str, item: Listing) -> None:
         with _lock:
             _seen.discard(listing_id)
             _skip_until.pop(listing_id, None)
+        _queue_copy(item)
         return
     _save_llm_item(item)
     with _lock:
@@ -1074,12 +1210,13 @@ def _validate_place(name: str, city: str, province: str | None = None) -> dict[s
     }
 
 
-def _chat(messages: list[dict[str, Any]], *, use_tools: bool = False) -> dict[str, Any]:
+def _chat(messages: list[dict[str, Any]], *, use_tools: bool = False, max_tokens: int | None = None) -> dict[str, Any]:
     tools = TOOLS if use_tools else []
+    tokens = max(16, int(max_tokens or MAX_TOKENS))
     if llm_provider() == "gemini":
         from .llm_gemini import chat as gemini_chat
 
-        return gemini_chat(messages, tools)
+        return gemini_chat(messages, tools, max_output_tokens=tokens)
 
     ctx = llm_ctx()
     body: dict[str, Any] = {
@@ -1088,8 +1225,8 @@ def _chat(messages: list[dict[str, Any]], *, use_tools: bool = False) -> dict[st
         "think": False,
         "chat_template_kwargs": {"enable_thinking": False},
         "cache_prompt": True,
-        "options": {"temperature": 0.1, "num_predict": MAX_TOKENS, "num_ctx": ctx},
-        "max_tokens": MAX_TOKENS,
+        "options": {"temperature": 0.1, "num_predict": tokens, "num_ctx": ctx},
+        "max_tokens": tokens,
         "temperature": 0.1,
         "stop": ["```", "<|im_end|>", "<end_of_turn>"],
         "messages": messages,

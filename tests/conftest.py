@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 
@@ -94,3 +95,31 @@ def georef_fixtures(monkeypatch):
     monkeypatch.setattr(place_api, "_nominatim_place", lambda *args, **kwargs: None)
     yield
     place_api.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def reset_ops_login_guard():
+    from app.matomo_gate import reset_login_guard
+
+    reset_login_guard()
+    yield
+    reset_login_guard()
+
+
+def solve_ops_captcha(html: str) -> dict[str, str]:
+    question = re.search(r"(\d+)\s*\+\s*(\d+)", html or "")
+    token = re.search(r'name="captcha_tok" value="([^"]+)"', html or "")
+    if not question or not token:
+        raise AssertionError("la pantalla de ops no pidió captcha")
+    return {
+        "captcha": str(int(question.group(1)) + int(question.group(2))),
+        "captcha_tok": token.group(1),
+    }
+
+
+def post_ops_login(client, password: str, next_url: str = ""):
+    from app.matomo_gate import login_page
+
+    html = login_page(next_url=next_url).body.decode("utf-8")
+    data = {"password": password, "next": next_url, **solve_ops_captcha(html)}
+    return client.post("/stats/login", data=data, follow_redirects=False)

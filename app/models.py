@@ -106,7 +106,7 @@ class Listing:
             "tags": (self.extra or {}).get("tags") or (self.extra or {}).get("amenities") or [],
             "place_tags": (self.extra or {}).get("place_tags") or [],
             "expenses": (self.extra or {}).get("expenses"),
-            "description": self.description or "",
+            "description": _public_description(self),
             "published_at": self.published_at,
             "deal_score": (self.extra or {}).get("deal_score"),
             "is_outlier": bool((self.extra or {}).get("is_outlier")),
@@ -198,3 +198,9 @@ class Listing:
 
         data["profile"] = compute_profile(self, {})
         return apply_public_location(data)
+
+
+def _public_description(item: Listing) -> str:
+    from .llm_copy import display_description
+
+    return display_description(item)

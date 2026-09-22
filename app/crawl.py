@@ -141,13 +141,22 @@ def cooling(host: str = "", lane: str = "direct") -> bool:
 
 
 def host_paused(host: str, lane: str | None = None) -> bool:
+    return _host_busy_match(host, lane, min_left=0.0)
+
+
+def host_cooling(host: str, lane: str | None = None) -> bool:
+    """True si algún host emparentado está en cooldown de bloqueo (>= COOL_SEC)."""
+    return _host_busy_match(host, lane, min_left=COOL_SEC)
+
+
+def _host_busy_match(host: str, lane: str | None, min_left: float) -> bool:
     token = (host or "").lower().strip()
     if not token:
         return False
     now = time.time()
     with _gate:
         for key, until in _host_busy.items():
-            if until <= now:
+            if until - now < min_left:
                 continue
             if lane and _lane_of_key(key) != lane:
                 continue

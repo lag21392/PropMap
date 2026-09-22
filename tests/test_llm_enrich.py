@@ -893,6 +893,107 @@ def test_needs_improve_prioritizes_missing_location_but_also_stale_schema():
     assert needs_improve(broken) is False
 
 
+def test_can_run_now_unassigned_or_snippet_or_failed_ficha():
+    from app.detail_fetch import COLD_TRIES
+    from app.freshness import LIST_TEXT_MIN
+    from app.llm_enrich import can_run_now
+
+    assigned_empty = Listing(
+        source="zonaprop",
+        source_id="empty",
+        url="https://example.com/empty",
+        title="Depto",
+        property_type="departamento",
+        city="caba",
+    )
+    snippet = Listing(
+        source="zonaprop",
+        source_id="snip",
+        url="https://example.com/snip",
+        title="Depto",
+        property_type="departamento",
+        city="caba",
+        description="d" * LIST_TEXT_MIN,
+    )
+    lost = Listing(
+        source="zonaprop",
+        source_id="lost",
+        url="https://example.com/lost",
+        title="Casa",
+        property_type="casa",
+        city="fuera",
+    )
+    failed = Listing(
+        source="zonaprop",
+        source_id="failed",
+        url="https://example.com/failed",
+        title="Depto",
+        property_type="departamento",
+        city="caba",
+        extra={"detail_tries": COLD_TRIES},
+    )
+    assert can_run_now(assigned_empty) is True
+    assert can_run_now(snippet) is True
+    assert can_run_now(lost) is True
+    assert can_run_now(failed) is True
+    blank = Listing(
+        source="zonaprop",
+        source_id="blank",
+        url="https://example.com/blank",
+        title="",
+        property_type="departamento",
+        city="caba",
+    )
+    assert can_run_now(blank) is False
+
+
+def test_extract_busy_ignores_waiting_queue():
+    from app import llm_enrich
+
+    llm_enrich._urgent.clear()
+    llm_enrich._queue.clear()
+    llm_enrich._busy.clear()
+    llm_enrich._ready.clear()
+    llm_enrich._extract_on_gpu = False
+    llm_enrich._queue.append("zonaprop:waiting")
+    llm_enrich._busy["zonaprop:saving"] = 1.0
+    assert llm_enrich.extract_busy() is False
+    llm_enrich._ready.append(("zonaprop:ready", None, {}))
+    try:
+        assert llm_enrich.extract_busy() is True
+        llm_enrich._ready.clear()
+        llm_enrich._extract_on_gpu = True
+        assert llm_enrich.extract_busy() is True
+    finally:
+        llm_enrich._extract_on_gpu = False
+        llm_enrich._busy.clear()
+        llm_enrich._queue.clear()
+        llm_enrich._ready.clear()
+
+
+def test_next_gpu_job_prefers_extract_then_copy():
+    from app import llm_copy, llm_enrich
+
+    llm_enrich._ready.clear()
+    llm_copy._ready.clear()
+    llm_copy._ready.append(("copy:1", None, []))
+    kind, job = llm_enrich._next_gpu_job(0)
+    assert kind == "copy"
+    assert job[0] == "copy:1"
+    llm_enrich._ready.append(("ex:1", None, {}))
+    llm_copy._ready.append(("copy:2", None, []))
+    try:
+        kind, job = llm_enrich._next_gpu_job(0)
+        assert kind == "extract"
+        assert job[0] == "ex:1"
+        kind, job = llm_enrich._next_gpu_job(0)
+        assert kind == "copy"
+        assert job[0] == "copy:2"
+    finally:
+        llm_enrich._ready.clear()
+        llm_copy._ready.clear()
+
+
 def test_commit_llm_ok_disables_ficha_when_city_stays_unknown(monkeypatch):
     from app import llm_enrich
     from app.models import Listing
@@ -931,6 +1032,7 @@ def test_commit_llm_ok_keeps_ficha_when_city_is_known(monkeypatch):
     monkeypatch.setattr(llm_enrich, "_ops_note", lambda *a, **k: None)
     llm_enrich._commit_llm_ok(item, {})
     assert not item.extra.get("skip_details")
+    assert item.extra.get("llm_thin") is True
 
 
 def test_commit_llm_fail_disables_ficha_when_city_unknown(monkeypatch):
@@ -1067,9 +1169,39 @@ def test_enrich_id_does_not_scrape_ficha_itself(monkeypatch):
     llm_enrich._seen.add(item.id)
     llm_enrich._enrich_id(item.id)
     assert scraped == []
-    assert analyzed == []
+    assert analyzed == [item.id]
     assert item.id in detail_fetch._urgent
-    assert item.id not in llm_enrich._seen
+
+
+def test_enrich_id_runs_unassigned_city_without_waiting_for_ficha(monkeypatch):
+    from app import detail_fetch, llm_enrich
+    from app.models import Listing
+
+    item = Listing(
+        source="zonaprop",
+        source_id="llm-fuera",
+        url="https://example.com/fuera",
+        title="Casa en Canning",
+        property_type="casa",
+        city="fuera",
+        extra={"await_llm": True},
+    )
+    analyzed = []
+    monkeypatch.setattr("app.store.get_listing", lambda listing_id: item)
+    monkeypatch.setattr(llm_enrich, "analyze_listing", lambda row: analyzed.append(row.id) or {"ok": True})
+    monkeypatch.setattr("app.store.upsert_listings", lambda rows, **k: None)
+    monkeypatch.setattr("app.store.upsert_many", lambda rows, **k: None)
+    monkeypatch.setattr(llm_enrich, "apply_analysis", lambda *a, **k: None)
+    monkeypatch.setattr(llm_enrich, "pin_listing_city", lambda row, **_k: None)
+    monkeypatch.setattr(detail_fetch, "enabled", lambda: True)
+    monkeypatch.setattr(detail_fetch, "_ensure_workers_locked", lambda: None)
+    detail_fetch._urgent.clear()
+    detail_fetch._queue.clear()
+    detail_fetch._seen.clear()
+    llm_enrich._enrich_id(item.id)
+    assert analyzed == [item.id]
+    assert item.id not in detail_fetch._urgent
+    assert item.id not in detail_fetch._queue
 
 
 def test_enrich_id_runs_llm_when_card_already_has_text(monkeypatch):

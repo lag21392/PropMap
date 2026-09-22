@@ -280,11 +280,13 @@ def status() -> dict:
     from .listings_cache import current_rev, public_meta
     from .llm_enrich import queue_stats
     from .detail_fetch import queue_stats as detail_stats
+    from .llm_copy import queue_stats as copy_stats
 
     meta = public_meta()
     payload["listings_rev"] = current_rev()
     payload["llm"] = queue_stats()
     payload["details"] = detail_stats()
+    payload["copy"] = copy_stats()
     payload["last_run"] = meta.get("last_run") or fallback_run
     payload["usd_ars"] = meta.get("usd_ars") if meta.get("usd_ars") is not None else fallback_usd
     payload["queue"] = list(_aux.get("queue") or [])

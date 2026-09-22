@@ -4,6 +4,7 @@ from app import crawl, main, ops
 from app.http_client import fetch_text, reset_fetch_state
 from app.llm_enrich import LLM_SCHEMA
 from app.models import Listing
+from tests.conftest import post_ops_login
 from tests.test_http_client import _Client, _Resp
 
 
@@ -71,6 +72,36 @@ def test_inventory_counts_llm_and_details(tmp_path, monkeypatch):
     assert "caba" in cities
 
 
+def test_inventory_excludes_hidden_from_llm_need(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    ops.reset()
+    wait = Listing(
+        source="zonaprop",
+        source_id="ops-wait",
+        url="https://example.com/wait",
+        title="Casa",
+        property_type="casa",
+        city="cordoba",
+    )
+    dup = Listing(
+        source="zonaprop",
+        source_id="ops-dup",
+        url="https://example.com/dup",
+        title="Casa",
+        property_type="casa",
+        city="cordoba",
+        extra={"duplicate_of": "zonaprop:ops-wait"},
+    )
+    store.upsert_many([wait, dup])
+    inv = ops.inventory(force=True)
+    assert inv["listings"] == 2
+    assert inv["llm_need"] == 1
+    assert inv["details_need"] == 1
+
+
 def test_fetch_text_notes_lane(monkeypatch):
     reset_fetch_state()
     url = "https://www.argenprop.com/departamentos-venta.html"
@@ -99,11 +130,7 @@ def test_tablero_and_ops_api_need_admin(monkeypatch):
         assert by_password.status_code == 200
         assert "propmap_ops" in by_password.cookies
         assert client.get("/api/ops").status_code == 200
-        login = client.post(
-            "/stats/login",
-            data={"password": "test-secret", "next": "/tablero"},
-            follow_redirects=False,
-        )
+        login = post_ops_login(client, "test-secret", next_url="/tablero")
         assert login.status_code == 303
         assert login.headers["location"] == "/tablero"
         page = client.get("/tablero")
@@ -140,11 +167,7 @@ def test_ops_header_unlocks_metrics(monkeypatch):
 def test_login_rejects_external_next(monkeypatch):
     monkeypatch.setenv("SEARCH_PASSWORD", "test-secret")
     with TestClient(main.app) as client:
-        res = client.post(
-            "/stats/login",
-            data={"password": "test-secret", "next": "//evil.example/phish"},
-            follow_redirects=False,
-        )
+        res = post_ops_login(client, "test-secret", next_url="//evil.example/phish")
         assert res.status_code == 303
         assert res.headers["location"] == "/stats/"
 

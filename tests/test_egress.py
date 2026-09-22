@@ -227,6 +227,8 @@ def test_local_ready_while_other_portal_cools(monkeypatch):
     assert egress.local_ready("www.argenprop.com") is True
     assert egress.acquire_local("www.argenprop.com") is True
     egress.release_local("www.argenprop.com")
+    crawl.note_http(403, "inmueble.mercadolibre.com.ar", lane="direct")
+    assert egress.local_ready("mercadolibre.com.ar") is False
     egress.reset()
     crawl.reset()
 

@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.lineage import blueprint, entity_diagram, graph, module_graph
+from tests.conftest import post_ops_login
 
 
 def test_graph_is_a_connected_pipeline():
@@ -69,8 +70,16 @@ def test_lineage_requires_admin_password(monkeypatch):
         assert body["flow"]["nodes"]
 
 
-def test_flujo_page_is_served():
+def test_flujo_page_is_served(monkeypatch):
+    monkeypatch.setenv("SEARCH_PASSWORD", "test-secret")
     with TestClient(main.app) as client:
+        gate = client.get("/flujo")
+        assert gate.status_code == 200
+        assert "Contraseña" in gate.text
+        assert b"flujo.js" not in gate.content
+        login = post_ops_login(client, "test-secret", next_url="/flujo")
+        assert login.status_code == 303
+        assert login.headers["location"] == "/flujo"
         page = client.get("/flujo")
         assert page.status_code == 200
         assert b"elkjs" in page.content

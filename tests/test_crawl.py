@@ -117,5 +117,22 @@ def test_short_pacing_is_not_cooling():
         rows = crawl.busy_rows()
         assert any(row["lane"] == "direct" and row["host"] == "www.argenprop.com" for row in rows)
         assert all(not row["cooling"] for row in rows if row["host"] == "www.argenprop.com")
+        assert not crawl.host_cooling("www.argenprop.com", "direct")
+    finally:
+        crawl.reset()
+
+
+def test_host_cooling_matches_related_subdomain():
+    crawl.reset()
+    try:
+        crawl.note_http(403, "inmueble.mercadolibre.com.ar", lane="direct")
+        assert crawl.host_cooling("mercadolibre.com.ar", "direct")
+        assert not crawl.host_cooling("www.zonaprop.com.ar", "direct")
+    finally:
+        crawl.reset()
+    try:
+        crawl.backoff(0.4, "terreno.mercadolibre.com.ar", lane="direct")
+        assert crawl.host_paused("mercadolibre.com.ar", "direct")
+        assert not crawl.host_cooling("mercadolibre.com.ar", "direct")
     finally:
         crawl.reset()

@@ -59,6 +59,19 @@ def test_index_does_not_wait_for_visit_write(monkeypatch):
     assert elapsed < 3
 
 
+def test_analytics_skips_crawlers():
+    from app import analytics
+
+    analytics._recent.clear()
+    record(
+        {"n": "pageview", "p": "/bot", "vid": "google-bot"},
+        ua="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    )
+    data = summary(14)
+    pages = {row["name"]: row["count"] for row in data["pages"]}
+    assert pages.get("/bot", 0) == 0
+
+
 def test_record_skips_when_write_lock_is_busy():
     from app import analytics, store
 

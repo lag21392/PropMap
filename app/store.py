@@ -31,13 +31,13 @@ EDIT_FIELDS = (
 
 _MAP_EXTRA_SQL = (
     "json_remove(IFNULL(extra_json, '{}'), "
-    "'$.profile.axes', '$.profile.access', '$.access', "
+    "'$.profile.access', '$.access', "
     "'$.photos', '$.llm', '$.pdf_text')"
 )
 
 
 def _loads_extra(raw, *, map_row: bool = False) -> dict:
-    """Hidratar extra_json. En el mapa se tiran ejes/POIs/fotos que no pintan el pin."""
+    """Hidratar extra_json. En el mapa quedan scores del pentágono; se tiran POIs/fotos."""
     if not raw:
         extra: dict = {}
     else:
@@ -486,6 +486,8 @@ def _listing_query_flags(item: Listing) -> dict[str, int]:
 
     if hidden:
         needs = 0
+    elif extra.get("llm_thin") and (item.details_scraped or extra.get("details_at")):
+        needs = 1
     elif unassigned and not extra.get("llm_city_ok"):
         needs = 1
     elif fix:
@@ -830,16 +832,44 @@ def fetch_for_city(city_id: str) -> list[Listing]:
     return fitted
 
 
-def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 7) -> list[Listing]:
-    """Avisos a enriquecer: primero lo nuevo, sin provincia, errores y sin ciudad/ubicación."""
+def fetch_llm_backlog(
+    limit: int,
+    prefer_city: str = "",
+    schema: int = 7,
+    skip_ids: set[str] | None = None,
+) -> list[Listing]:
+    """Avisos a enriquecer ahora: texto de lista, ficha, ciudad por resolver, o ficha ya fallida."""
+    from .freshness import LIST_TEXT_MIN
+
     n = max(1, min(160, int(limit or 1)))
     prefer = (prefer_city or "").strip()
-    sql = """
+    min_len = int(LIST_TEXT_MIN)
+    skip = [lid for lid in dict.fromkeys(skip_ids or ()) if lid][:240]
+    _ = schema
+    runnable = f"""(
+          details_scraped = 1
+          OR length(trim(IFNULL(description, ''))) >= 1
+          OR length(trim(IFNULL(title, ''))) >= 4
+          OR IFNULL(json_extract(extra_json, '$.details_at'), '') != ''
+          OR IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina')
+          OR IFNULL(CAST(json_extract(extra_json, '$.detail_tries') AS INTEGER), 0) >= 4
+          OR IFNULL(json_extract(extra_json, '$.skip_details'), 0) != 0
+          OR (IFNULL(json_extract(extra_json, '$.llm_thin'), 0) != 0 AND details_scraped = 1)
+        )"""
+    skip_sql = ""
+    params: list = []
+    if skip:
+        skip_sql = f" AND id NOT IN ({','.join('?' * len(skip))})"
+        params.extend(skip)
+    params.extend((prefer, n))
+    sql = f"""
         SELECT * FROM listings
         WHERE needs_llm = 1 AND is_hidden = 0
+          AND {runnable}
+          {skip_sql}
         ORDER BY
           CASE WHEN details_scraped = 1
-                 OR length(trim(IFNULL(description, ''))) >= 160
+                 OR length(trim(IFNULL(description, ''))) >= {min_len}
                THEN 0 ELSE 1 END,
           CASE WHEN city = ? THEN 0 ELSE 1 END,
           city,
@@ -853,7 +883,7 @@ def fetch_llm_backlog(limit: int, prefer_city: str = "", schema: int = 7) -> lis
           scraped_at DESC
         LIMIT ?
     """
-    return _fetch_backlog_rows(sql, (prefer, n))
+    return _fetch_backlog_rows(sql, tuple(params))
 
 
 _SKIP_DETAILS_STAMP_SQL = """
@@ -891,11 +921,22 @@ def _stamp_skip_details_unknown_city(conn: sqlite3.Connection, *, force: bool = 
         return
 
 
-def fetch_detail_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
+def fetch_detail_backlog(
+    limit: int,
+    prefer_city: str = "",
+    skip_ids: set[str] | None = None,
+) -> list[Listing]:
     """Fichas que todavía no se bajaron, de toda la base."""
     n = max(1, min(80, int(limit or 1)))
     prefer = (prefer_city or "").strip()
-    sql = """
+    skip = [lid for lid in dict.fromkeys(skip_ids or ()) if lid][:240]
+    skip_sql = ""
+    params: list = []
+    if skip:
+        skip_sql = f" AND id NOT IN ({','.join('?' * len(skip))})"
+        params.extend(skip)
+    params.extend((prefer, n))
+    sql = f"""
         SELECT * FROM listings
         WHERE details_scraped = 0
           AND IFNULL(url, '') != ''
@@ -909,13 +950,41 @@ def fetch_detail_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
               OR length(trim(IFNULL(json_extract(extra_json, '$.llm_at'), ''))) > 0
             )
           )
+          {skip_sql}
         ORDER BY
+          CASE WHEN needs_llm = 1 THEN 0 ELSE 1 END,
           CASE WHEN llm_await = 1 THEN 0 ELSE 1 END,
           CASE WHEN city = ? THEN 0 ELSE 1 END,
           scraped_at DESC
         LIMIT ?
     """
-    return _fetch_backlog_rows(sql, (prefer, n))
+    return _fetch_backlog_rows(sql, tuple(params))
+
+
+def fetch_copy_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
+    """Avisos ya extraídos, con ficha o texto, todavía sin párrafo redactado."""
+    from .freshness import LIST_TEXT_MIN
+    from .llm_copy import COPY_SCHEMA
+
+    n = max(1, min(40, int(limit or 1)))
+    prefer = (prefer_city or "").strip()
+    sql = """
+        SELECT * FROM listings
+        WHERE is_hidden = 0
+          AND needs_llm = 0
+          AND (details_scraped = 1 OR length(trim(IFNULL(description, ''))) >= ?)
+          AND length(trim(IFNULL(json_extract(extra_json, '$.user_edits.description'), ''))) = 0
+          AND (
+            IFNULL(CAST(json_extract(extra_json, '$.copy.ver') AS INTEGER), 0) != ?
+            OR length(trim(IFNULL(json_extract(extra_json, '$.copy.text'), ''))) = 0
+            OR IFNULL(CAST(json_extract(extra_json, '$.copy.llm_ver') AS INTEGER), 0) != llm_ver
+          )
+        ORDER BY
+          CASE WHEN city = ? THEN 0 ELSE 1 END,
+          scraped_at DESC
+        LIMIT ?
+    """
+    return _fetch_backlog_rows(sql, (int(LIST_TEXT_MIN), int(COPY_SCHEMA), prefer, n))
 
 
 def _fetch_backlog_rows(sql: str, params: tuple) -> list[Listing]:

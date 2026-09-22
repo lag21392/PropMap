@@ -128,6 +128,51 @@ def test_config_uses_names_adblockers_do_not_match(monkeypatch, tmp_path):
     assert "matomo.php" not in cfg["tracker"]
 
 
+def test_looks_like_bot_catches_crawlers():
+    assert matomo.looks_like_bot("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)")
+    assert matomo.looks_like_bot("facebookexternalhit/1.1")
+    assert matomo.looks_like_bot("curl/7.81.0")
+    assert matomo.looks_like_bot("")
+    assert not matomo.looks_like_bot(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0"
+    )
+
+
+def test_queue_visit_skips_googlebot(monkeypatch):
+    captured = []
+
+    class Fake:
+        def __init__(self, **_kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def get(self, *_a, **_k):
+            captured.append(1)
+
+            class Res:
+                status_code = 204
+
+            return Res()
+
+    monkeypatch.setenv("MATOMO_INTERNAL_URL", "http://matomo")
+    monkeypatch.setattr(matomo.httpx, "Client", Fake)
+    req = _request(
+        {
+            "x-real-ip": "34.105.93.96",
+            "user-agent": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.179 Mobile Safari/537.36 "
+            "(compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        }
+    )
+    matomo.queue_visit(req, vid="bbbbbbbbbbbbbbbb", path="/", name="pageview")
+    assert captured == []
+
+
 def test_queue_visit_sends_cip(monkeypatch):
     matomo._recent_hits.clear()
     captured = []

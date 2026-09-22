@@ -77,13 +77,15 @@ def test_portal_way_routes_known_hosts():
     from app.http_client import portal_way
 
     assert portal_way("https://www.properati.com.ar/detalle/ficha") == "translate"
-    assert portal_way("https://www.zonaprop.com.ar/propiedades/clasificado/x.html") == "local"
-    assert portal_way("https://www.argenprop.com/casa-en-venta-en-trelew--19704628") == "local"
+    assert portal_way("https://www.zonaprop.com.ar/propiedades/clasificado/x.html") == "translate"
+    assert portal_way("https://www.argenprop.com/casa-en-venta-en-trelew--19704628") == "translate"
     assert portal_way("https://www.zonaprop.com.ar/departamentos-venta-capital-federal.html") == "tor"
-    assert portal_way("https://www.mercadolibre.com.ar/MLA-123456789") == "tor"
-    assert portal_way(listing_id="zonaprop:1") == "local"
+    assert portal_way("https://www.mercadolibre.com.ar/MLA-123456789") == "translate"
+    assert portal_way("https://inmueble.mercadolibre.com.ar/MLA-123456789-depto") == "translate"
+    assert portal_way("https://listado.mercadolibre.com.ar/inmuebles/departamentos") == "tor"
+    assert portal_way(listing_id="zonaprop:1") == "translate"
     assert portal_way(listing_id="properati:1") == "translate"
-    assert portal_way(listing_id="mercadolibre:1") == "tor"
+    assert portal_way(listing_id="mercadolibre:1") == "translate"
 
 
 def test_fetch_text_uses_translate_proxy_when_properati_returns_401(monkeypatch):
@@ -107,31 +109,24 @@ def test_fetch_text_uses_translate_proxy_when_properati_returns_401(monkeypatch)
     assert "mapData" in text
 
 
-def test_fetch_text_does_not_proxy_zonaprop(monkeypatch):
+def test_fetch_text_proxies_zonaprop_listing_after_401(monkeypatch):
     reset_fetch_state()
     url = "https://www.zonaprop.com.ar/propiedades/clasificado/x.html"
-    called = []
-
-    def boom(*_a, **_k):
-        called.append("proxy")
-        raise AssertionError("zonaprop no debe ir al proxy")
-
+    html = "<html>ficha via yandex" + ("." * 9000) + "</html>"
     monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client({
         "https://www.zonaprop.com.ar/": _Resp(401, "Access Denied", url),
     }, **kw))
     monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
     monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
     monkeypatch.setattr("app.http_client.crawl.note_http", lambda *a, **k: None)
-    monkeypatch.setattr("app.http_client._fetch_translate_proxy", boom)
+    monkeypatch.setattr("app.http_client._fetch_translate_proxy", lambda *_a, **_k: html)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
     monkeypatch.setattr(
         "app.http_client._fetch_urllib",
         lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("urllib fail")),
     )
-    try:
-        fetch_text(url, paced=False, retries=1)
-    except RuntimeError:
-        pass
-    assert called == []
+    text = fetch_text(url, paced=False, retries=1)
+    assert "ficha via yandex" in text
 
 
 def test_fetch_text_uses_stealth_when_proxy_fails_on_listing(monkeypatch):
@@ -280,7 +275,7 @@ def test_fetch_text_skips_tor_on_zonaprop_listing(monkeypatch):
     text = fetch_text(url, paced=False, retries=1)
     assert "ficha zonaprop" in text
     assert proxies == [None]
-    assert egress.local_used_today() == 1
+    assert egress.local_used_today() == 0
     crawl.reset()
     reset_fetch_state()
     egress.reset()
@@ -322,6 +317,8 @@ def test_fetch_text_drops_gone_from_local(monkeypatch):
     monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
     monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
     monkeypatch.setattr("app.http_client._try_blocked_fallback", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.http_client._try_translate_listing", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.http_client._try_hidden_fetch", lambda *_a, **_k: None)
     monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
     try:
         fetch_text(url, paced=False, retries=1)
@@ -353,3 +350,120 @@ def test_enrich_details_drops_listing_that_is_gone(monkeypatch):
     assert dropped == [item.id]
     assert item.extra.get("gone") is True
     assert item.details_scraped is False
+
+
+def test_fetch_text_skips_tor_on_mercadolibre_listing(monkeypatch):
+    from app import crawl, egress
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
+    monkeypatch.setenv("TOR_ENABLED", "1")
+    monkeypatch.setenv("TOR_SOCKS", "socks5h://127.0.0.1:19050")
+    monkeypatch.setenv("TOR_CIRCUITS", "8")
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.setattr(egress, "_socks_supported", lambda _url: True)
+    egress.reset()
+    url = "https://inmueble.mercadolibre.com.ar/MLA-123456789-depto"
+    html = "<html>ficha ml" + ("." * 9000) + "</html>"
+    proxies = []
+
+    class _Client:
+        def __init__(self, **kw):
+            self.proxy = kw.get("proxy")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get(self, href: str):
+            proxies.append(self.proxy)
+            if self.proxy:
+                raise AssertionError("Mercado Libre ficha no debe salir por Tor")
+            return _Resp(200, html, href)
+
+    monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client(**kw))
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.http_client._try_hidden_fetch", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.http_client._fetch_urllib",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no")),
+    )
+    text = fetch_text(url, paced=False, retries=1)
+    assert "ficha ml" in text
+    assert proxies == [None]
+    assert egress.local_used_today() == 0
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()
+
+
+def test_fetch_text_uses_translate_when_local_listing_blocked(monkeypatch):
+    from app import crawl, egress
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    url = "https://www.zonaprop.com.ar/propiedades/clasificado/vive.html"
+    html = "<html>ficha via yandex" + ("." * 9000) + "</html>"
+    routes = {
+        "https://www.zonaprop.com.ar/": _Resp(403, "Access Denied", url),
+        "https://translate.yandex.com/translate": _Resp(200, html, "https://translated.turbopages.org/x"),
+    }
+    monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client(routes, **kw))
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.http_client._fetch_urllib",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("urllib 403")),
+    )
+    text = fetch_text(url, paced=False, retries=1)
+    assert "ficha via yandex" in text
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()
+
+
+def test_translate_cooling_falls_back_to_local(monkeypatch):
+    from app import crawl, egress
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    url = "https://inmueble.mercadolibre.com.ar/MLA-123456789-depto"
+    html = "<html>ficha local" + ("." * 9000) + "</html>"
+    crawl.note_http(403, "translate.yandex.com", lane="direct")
+    routes = {"https://inmueble.mercadolibre.com.ar/": _Resp(200, html, url)}
+    monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client(routes, **kw))
+
+    def boom_wait(**_kw):
+        raise AssertionError("no esperar el cooldown del traductor")
+
+    monkeypatch.setattr("app.http_client.crawl.wait", boom_wait)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.http_client._try_hidden_fetch", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.http_client._fetch_urllib",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no")),
+    )
+    text = fetch_text(url, paced=True, retries=1)
+    assert "ficha local" in text
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()

@@ -33,7 +33,7 @@ PROXY_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 PROXY_HOSTS = ("properati.com",)
-LOCAL_HOSTS = ("zonaprop.com", "argenprop.com")
+LOCAL_HOSTS = ("zonaprop.com", "argenprop.com", "mercadolibre.com")
 TRANSLATE_PROXY = "https://translate.yandex.com/translate"
 TRANSLATE_LANGS = ("es-en", "es-es")
 SGAI_SCRAPE = "https://v2-api.scrapegraphai.com/api/scrape"
@@ -110,23 +110,22 @@ def _httpx_get(
 
 
 def portal_way(url: str = "", listing_id: str = "") -> str:
-    """Cómo salir de este aviso: traductor, IP local o Tor.
+    """Cómo salir de este aviso: traductor, otra IP (Tor) o IP local.
 
-    Properati entra por Yandex. Las fichas de ZonaProp y Argenprop van por
-    la IP de casa. El resto (Mercado Libre, listados) usa Tor.
+    Las fichas (Properati, ZonaProp, Argenprop, Mercado Libre) entran por
+    Yandex. Si el traductor no anda, Tor; la IP de casa es el último
+    recurso. Los listados siguen por Tor.
     """
     host = urlparse(url or "").netloc.lower()
     if not host:
         src = (listing_id or "").split(":", 1)[0].lower()
-        if src == "properati":
+        if src in {"properati", "zonaprop", "argenprop", "mercadolibre"}:
             return "translate"
-        if src in {"zonaprop", "argenprop"}:
-            return "local"
         return "tor"
     if any(part in host for part in PROXY_HOSTS):
         return "translate"
     if _looks_like_listing(url) and any(part in host for part in LOCAL_HOSTS):
-        return "local"
+        return "translate"
     return "tor"
 
 
@@ -138,7 +137,7 @@ def portal_host(url: str = "", listing_id: str = "") -> str:
         "zonaprop": "www.zonaprop.com.ar",
         "argenprop": "www.argenprop.com",
         "properati": "www.properati.com.ar",
-        "mercadolibre": "www.mercadolibre.com.ar",
+        "mercadolibre": "mercadolibre.com.ar",
     }.get(src, "")
 
 
@@ -175,21 +174,31 @@ def _remember_ok(url: str, listing: bool, text: str, lane: str, host: str) -> st
 def _fetch_via_translate(url: str, timeout: float, paced: bool, listing: bool) -> str:
     host = urlparse(url).netloc
     proxied = _try_blocked_fallback(url, timeout, paced)
+    if proxied is None:
+        proxied = _try_translate_listing(url, timeout, paced)
     if proxied is not None and (not listing or _listing_html_ok(url, proxied)):
         return _remember_ok(url, listing, proxied, "translate", host)
     stealth = _try_stealth_fetch(url, timeout)
     if stealth and (not listing or _listing_html_ok(url, stealth)):
         return _remember_ok(url, listing, stealth, "stealth", host)
-    raise RuntimeError(f"No se pudo leer {url}: el traductor no devolvió la ficha")
+    hidden = _try_hidden_fetch(url, timeout, paced, listing)
+    if hidden is not None:
+        return _remember_ok(url, listing, hidden, "tor", host)
+    return _fetch_via_local(url, timeout, paced, listing, fallbacks=False)
 
 
-def _fetch_via_local(url: str, timeout: float, paced: bool, listing: bool) -> str:
-    from .egress import acquire_local, local_limits, release_local, use_local
+def _fetch_via_local(
+    url: str,
+    timeout: float,
+    paced: bool,
+    listing: bool,
+    fallbacks: bool = True,
+) -> str:
+    from .egress import acquire_local, release_local, use_local
 
     host = urlparse(url).netloc
     last_error: Exception | None = None
-    gap, _ = local_limits()
-    claimed = use_local() and acquire_local(host, timeout=(gap if paced else 0.0))
+    claimed = use_local() and acquire_local(host, timeout=(0.4 if paced else 0.0))
     if claimed:
         try:
             if paced and crawl.aborted():
@@ -221,9 +230,13 @@ def _fetch_via_local(url: str, timeout: float, paced: bool, listing: bool) -> st
                     last_error = urllib_exc
         finally:
             release_local(host, hold=paced)
-    stealth = _try_stealth_fetch(url, timeout)
-    if stealth and (not listing or _listing_html_ok(url, stealth)):
-        return _remember_ok(url, listing, stealth, "stealth", host)
+    if fallbacks:
+        proxied = _try_translate_listing(url, timeout, paced)
+        if proxied is not None:
+            return _remember_ok(url, listing, proxied, "translate", host)
+        stealth = _try_stealth_fetch(url, timeout)
+        if stealth and (not listing or _listing_html_ok(url, stealth)):
+            return _remember_ok(url, listing, stealth, "stealth", host)
     raise RuntimeError(f"No se pudo leer {url}: {last_error or 'IP local no disponible'}")
 
 
@@ -284,6 +297,9 @@ def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries
     stealth = _try_stealth_fetch(url, timeout)
     if stealth and (not listing or _listing_html_ok(url, stealth)):
         return _remember_ok(url, listing, stealth, "stealth", host)
+    proxied = _try_translate_listing(url, timeout, paced)
+    if proxied is not None:
+        return _remember_ok(url, listing, proxied, "translate", host)
     if (
         hidden
         and use_local()
@@ -368,11 +384,18 @@ def _listing_html_ok(url: str, text: str) -> bool:
         return False
     host = urlparse(url).netloc.lower()
     lowered = text.lower()
+    if len(text) < 800:
+        return False
+    if "access denied" in lowered and "realestatelisting" not in lowered and len(text) < 8000:
+        return False
     if "argenprop" in host:
         return len(text) >= 8000 and (
             "data-location-map" in lowered or "data-latitude" in lowered
         )
-    return len(text) > 800
+    if "mercadolibre" in host:
+        if "ingresa a" in lowered and "tu cuenta" in lowered and "realestatelisting" not in lowered:
+            return False
+    return True
 
 
 def _page_cache_dir() -> Path | None:
@@ -494,16 +517,71 @@ def _try_blocked_fallback(url: str, timeout: float, paced: bool) -> str | None:
         return None
     try:
         return _fetch_translate_proxy(url, timeout, paced)
+    except PageGone:
+        raise
     except Exception:
         return None
 
 
-def _fetch_translate_proxy(url: str, timeout: float, paced: bool) -> str:
+def _try_translate_listing(url: str, timeout: float, paced: bool) -> str | None:
+    if not _looks_like_listing(url):
+        return None
+    try:
+        return _fetch_translate_proxy(url, timeout, paced, listing=True)
+    except PageGone:
+        raise
+    except Exception:
+        return None
+
+
+def _try_hidden_fetch(url: str, timeout: float, paced: bool, listing: bool) -> str | None:
+    """Un intento por Tor/proxy ya electo, sin esperar el cooldown de 403."""
+    from .egress import lanes, note_error, pick
+
+    host = urlparse(url).netloc
+    hidden = [lane for lane in lanes() if lane.kind != "direct"]
+    if not hidden:
+        return None
+    tried: set[str] = set()
+    for _ in range(min(3, len(hidden))):
+        lane = pick(host, exclude=tried)
+        if lane is None or lane.kind == "direct":
+            return None
+        tried.add(lane.id)
+        if paced:
+            crawl.wait(host=host, lane=lane.id)
+            if crawl.aborted():
+                return None
+        try:
+            response = _httpx_get(url, timeout, proxy=lane.proxy)
+            crawl.note_http(response.status_code, host, lane=lane.id)
+            _observe(host, lane.id, response.status_code)
+            if response.status_code in {404, 410}:
+                raise PageGone(f"HTTP {response.status_code}")
+            if response.status_code in {401, 403, 405, 429, 503}:
+                note_error(lane.id)
+                continue
+            response.raise_for_status()
+            text = response.text
+            if listing and not _listing_html_ok(url, text):
+                continue
+            return text
+        except PageGone:
+            raise
+        except Exception:
+            note_error(lane.id)
+    return None
+
+
+def _fetch_translate_proxy(url: str, timeout: float, paced: bool, listing: bool = False) -> str:
     last_error: Exception | None = None
     for lang in TRANSLATE_LANGS:
         proxy = translate_proxy_url(url, lang)
         host = urlparse(proxy).netloc
         if paced:
+            if crawl.cooling(host) or crawl.host_cooling(host, "direct"):
+                last_error = RuntimeError("traductor en pausa")
+                break
             crawl.wait(host=host)
             if crawl.aborted():
                 raise RuntimeError("búsqueda pausada")
@@ -511,13 +589,17 @@ def _fetch_translate_proxy(url: str, timeout: float, paced: bool) -> str:
             with httpx.Client(headers=PROXY_HEADERS, follow_redirects=True, timeout=max(timeout, 25.0)) as client:
                 response = client.get(proxy)
                 crawl.note_http(response.status_code, host)
+                _observe(host, "translate", response.status_code)
                 if response.status_code in {400, 429, 503}:
                     last_error = RuntimeError(f"HTTP {response.status_code}")
                     time.sleep(1.5)
                     continue
                 response.raise_for_status()
                 text = response.text
-            if proxy_html_looks_valid(text):
+            if listing:
+                if _listing_html_ok(url, text):
+                    return text
+            elif proxy_html_looks_valid(text):
                 return text
             last_error = RuntimeError("el proxy no devolvió la ficha")
         except Exception as exc:
