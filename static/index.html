@@ -62,9 +62,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui38" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui41" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui95" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui98" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -72,7 +72,7 @@
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui38" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui41" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -97,6 +97,7 @@
         <h1 class="brand-tagline">Casas, departamentos y terrenos en venta en Argentina, comparados en el mapa.</h1>
       </header>
 
+      <div class="panel-scroll">
       <div class="filters">
         <label class="place-wrap">Lugar
           <input id="placeQuery" type="search" placeholder="Escribí una ciudad" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="placeSuggest" />
@@ -284,6 +285,23 @@
               <div class="market-list" id="marketDrops"></div>
             </div>
           </div>
+          <div class="fold barrio-averages" id="statsCard" data-fold="averages" data-fold-default="closed">
+            <button type="button" class="fold-head" aria-expanded="false">Promedios por barrio</button>
+            <div class="fold-body" hidden>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Barrio</th>
+                      <th>USD</th>
+                      <th>USD/m²</th>
+                    </tr>
+                  </thead>
+                  <tbody id="statsBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -310,6 +328,7 @@
           · <a data-mail-inbox hidden href="http://127.0.0.1:7500" target="_blank" rel="noopener">Bandeja</a>
         </p>
       </footer>
+      </div>
     </aside>
 
     <aside class="list-rail" id="pane-list" data-pane="list" aria-label="Avisos">
@@ -357,37 +376,6 @@
       </aside>
       <p class="map-hint">Arrastrá el mapa · rueda = zoom · redondo = ubicación real · cuadrado = manzana del aviso</p>
       <p class="map-legal"><a href="/ciudades">Ciudades</a> · <a href="/legal">Términos, privacidad y derechos reservados</a> · avisos de terceros · Ley 25.326</p>
-      <section class="stats-card" id="statsCard">
-        <div class="stats-head">
-          <h2>Promedios por barrio</h2>
-          <button type="button" id="toggleStats" class="ghost">ocultar</button>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Barrio / zona</th>
-                <th>Avisos</th>
-                <th>Mediana USD</th>
-                <th>USD/m²</th>
-                <th>Oport.</th>
-              </tr>
-            </thead>
-            <tbody id="statsBody"></tbody>
-          </table>
-        </div>
-        <div class="legend">
-          <span class="dot deal"></span> oportunidad (más barato que el barrio)
-          <span class="dot good"></span> bueno
-          <span class="dot market"></span> mercado
-          <span class="dot high"></span> caro
-          <span class="dot warn"></span> revisar
-          <span class="dot loteo"></span> loteo
-          <span class="pin-legend round"></span> ubicación real
-          <span class="pin-legend square"></span> aprox. (manzana)
-          <span class="pin-legend lost"></span> sin ubicación
-        </div>
-      </section>
     </main>
 
     <aside class="detail is-empty" id="detailPane" data-pane="detail">
@@ -571,6 +559,6 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
-  <script defer src="/static/app.js?v=ui95"></script>
+  <script defer src="/static/app.js?v=ui98"></script>
 </body>
 </html>

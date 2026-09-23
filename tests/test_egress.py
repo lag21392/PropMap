@@ -250,6 +250,36 @@ def test_local_lane_stops_at_daily_cap(monkeypatch):
     crawl.reset()
 
 
+def test_local_ip_takes_over_when_tor_is_cooling(monkeypatch):
+    monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
+    monkeypatch.setenv("TOR_ENABLED", "1")
+    monkeypatch.setenv("TOR_SOCKS", "socks5h://127.0.0.1:19050")
+    monkeypatch.setenv("TOR_CIRCUITS", "2")
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.setenv("SCRAPE_LOCAL_GAP_SEC", "20")
+    monkeypatch.setenv("SCRAPE_LOCAL_PARALLEL", "4")
+    monkeypatch.setenv("SCRAPE_LOCAL_MAX_DAY", "600")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.setattr(egress, "_socks_supported", lambda _url: True)
+    egress.reset()
+    crawl.reset()
+    host = "www.zonaprop.com.ar"
+    kinds = [lane.kind for lane in egress.lanes()]
+    assert "direct" in kinds and kinds.count("tor") == 2
+    for lane in egress.lanes():
+        if lane.kind == "tor":
+            crawl.note_http(403, host, lane=lane.id)
+    lane = egress.pick(host)
+    assert lane is not None and lane.kind == "direct"
+    assert egress.acquire_local(host) is True
+    egress.release_local(host, hold=False)
+    crawl.note_http(403, host, lane="direct")
+    monkeypatch.setattr(egress, "_maybe_grow", lambda: False)
+    assert egress.pick(host) is None
+    crawl.reset()
+    egress.reset()
+
+
 def test_tor_goes_before_the_local_ip(monkeypatch):
     monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
     monkeypatch.setenv("TOR_ENABLED", "1")

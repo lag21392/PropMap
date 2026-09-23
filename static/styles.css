@@ -37,13 +37,21 @@ h1, h2 {
   min-height: 0;
 }
 .panel {
+  display: flex;
+  flex-direction: column;
   border-right: 1px solid var(--line);
   background:
     radial-gradient(900px 280px at 0 -10%, rgba(46, 196, 182, 0.16), transparent 55%),
     var(--panel);
-  overflow: auto;
-  padding: 14px 14px 80px;
+  overflow: hidden;
+  padding: 14px 14px 12px;
   min-height: 0;
+}
+.panel-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: 16px;
 }
 .list-rail {
   display: flex;
@@ -425,7 +433,7 @@ h1, h2 {
   border-radius: 0;
   background: transparent;
   color: var(--ink);
-  padding: 11px 12px;
+  padding: 12px 14px;
   font-weight: 700;
   font-size: 13px;
 }
@@ -730,20 +738,22 @@ button:disabled { opacity: 0.55; cursor: wait; }
   color: var(--muted);
 }
 .map-legal a { color: var(--teal); }
-.stats-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-}
 .ghost {
   background: transparent;
   color: var(--muted);
   padding: 4px 8px;
 }
-.stats-card.collapsed .table-wrap,
-.stats-card.collapsed .legend { display: none; }
-.stats-card.collapsed { max-height: none; width: auto; }
+.barrio-averages { margin: 0; }
+.barrio-averages .table-wrap { overflow: auto; max-height: 220px; }
+.barrio-averages table { font-size: 12px; table-layout: fixed; width: 100%; }
+.barrio-averages th,
+.barrio-averages td { padding: 4px 4px; }
+.barrio-averages th:nth-child(1),
+.barrio-averages td:nth-child(1) { width: 46%; overflow: hidden; text-overflow: ellipsis; }
+.barrio-averages th:nth-child(2),
+.barrio-averages td:nth-child(2),
+.barrio-averages th:nth-child(3),
+.barrio-averages td:nth-child(3) { width: 27%; }
 .pin-legend {
   display: inline-block;
   width: 9px;
@@ -853,7 +863,7 @@ input, select, textarea {
   justify-content: space-between;
   align-items: baseline;
 }
-.block-head h2, .stats-card h2 { font-size: 18px; margin: 0 0 8px; }
+.block-head h2 { font-size: 18px; margin: 0 0 8px; }
 .list { display: flex; flex-direction: column; gap: 8px; contain: content; }
 .list-pad { flex: 0 0 auto; pointer-events: none; }
 .card {
@@ -1045,7 +1055,7 @@ input, select, textarea {
   font-weight: 400;
 }
 .fold:not([open]) > summary::after { content: "▸"; }
-.fold > :not(summary) { padding: 0 12px 12px; }
+.fold > :not(summary):not(.fold-head) { padding: 0 12px 12px; }
 .near-list {
   margin: 0 0 12px;
   padding: 10px 12px;
@@ -1102,19 +1112,6 @@ input, select, textarea {
 .market-stat small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
 .map-wrap { position: relative; height: 100%; min-height: 0; }
 #map { height: 100%; background: #08151c; }
-.stats-card {
-  position: absolute;
-  right: 16px;
-  bottom: 16px;
-  width: min(520px, calc(100% - 32px));
-  max-height: 38vh;
-  overflow: auto;
-  background: rgba(8, 22, 30, 0.92);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  padding: 12px 14px;
-  backdrop-filter: blur(10px);
-}
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 6px 4px; text-align: left; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 500; }
@@ -1544,7 +1541,6 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
     box-shadow: -12px 0 40px rgba(0,0,0,0.35);
   }
   .detail.is-empty { display: none; }
-  .stats-card { display: none; }
 }
 @media (max-width: 980px) {
   .shell {
@@ -1797,12 +1793,12 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   .map-wrap { display: none; }
   body.tab-map .map-wrap,
   body.tab-list .list-rail,
-  body.tab-market .panel,
+  body.tab-market .panel { display: flex; }
   body.tab-detail .detail { display: block; }
   body.tab-map .map-wrap { display: block; }
   body.tab-detail .detail.is-empty { display: flex; }
   .detail { box-shadow: none; border-left: 0; }
-  .stats-card, .map-legend { display: none; }
+  .map-legend { display: none; }
   .map-hint { display: none; }
   .map-legal { bottom: calc(var(--dock) + 10px); left: 10px; }
   .map-account {
@@ -1894,8 +1890,7 @@ button {
 .map-loading,
 .map-hint,
 .map-legal,
-.map-legend,
-.stats-card {
+.map-legend {
   background: rgba(251, 252, 249, 0.94);
   color: var(--ink);
 }

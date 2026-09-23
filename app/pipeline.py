@@ -535,6 +535,20 @@ def _run_city_job(city_id: str, progress: Progress | None = None, fast: bool = T
                 report("Cortando para búsqueda rápida…")
                 with _lock:
                     _job(city_id)["counts"] = counts
+            elif paused or stop.is_set():
+                shown = sum(counts.values())
+                report(f"{city['label']}: dejo el cupo. {shown} avisos nuevos quedan para el próximo turno.")
+                with _lock:
+                    job = _job(city_id)
+                    job["counts"] = counts
+                    job["paused"] = True
+                    if "cupo" not in (job.get("message") or "").lower():
+                        job["message"] = (
+                            f"{city['label']}: pausado · {shown} avisos nuevos. Sigue en el próximo turno."
+                        )
+                    _status["counts"].update(counts)
+                    _status["paused"] = True
+                    _status["message"] = job["message"]
             elif country:
                 now = datetime.now(timezone.utc).isoformat()
                 store.set_meta("last_run", now)
