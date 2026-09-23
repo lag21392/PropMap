@@ -1,5 +1,7 @@
+name: propmap-dev
+
 services:
-  propmap:
+  web:
     build:
       context: .
       dockerfile: Dockerfile
@@ -254,12 +256,16 @@ services:
 volumes:
   matomo-db:
     name: propmap-dev_matomo-db
+    external: true
   matomo-html:
     name: propmap-dev_matomo-html
+    external: true
   mailpit:
     name: propmap-dev_mailpit
+    external: true
   tor-data:
     name: propmap-dev_tor-data
+    external: true
 
 networks:
   public:
