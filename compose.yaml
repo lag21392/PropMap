@@ -3,8 +3,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: propmap:local
-    container_name: propmap
+    image: propmap:prod
+    container_name: propmap-prod
+    networks:
+      default: {}
+      public:
+        aliases:
+          - propmap
     init: true
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     restart: unless-stopped
@@ -45,8 +50,6 @@ services:
       TOR_SOCKS: "${TOR_SOCKS:-socks5h://tor:9050}"
       TOR_CIRCUITS: "${TOR_CIRCUITS:-4}"
       SCRAPE_PROXIES: "${SCRAPE_PROXIES:-}"
-      # Último recurso cuando Tor y los proxys quedan bloqueados, con espera
-      # mínima entre salidas y tope por día para no exponer la IP de casa.
       SCRAPE_USE_LOCAL: "${SCRAPE_USE_LOCAL:-1}"
       SCRAPE_LOCAL_GAP_SEC: "${SCRAPE_LOCAL_GAP_SEC:-20}"
       SCRAPE_LOCAL_PARALLEL: "${SCRAPE_LOCAL_PARALLEL:-4}"
@@ -86,10 +89,9 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # SOCKS interno (9050). No publicar al host: el scrape habla por TOR_SOCKS.
   tor:
     image: ghcr.io/oorabona/tor:latest
-    container_name: propmap-tor
+    container_name: propmap-prod-tor
     restart: unless-stopped
     environment:
       TZ: America/Argentina/Buenos_Aires
@@ -109,7 +111,7 @@ services:
 
   matomo-db:
     image: mariadb:lts
-    container_name: propmap-matomo-db
+    container_name: propmap-prod-matomo-db
     restart: unless-stopped
     command: --max-allowed-packet=64MB
     env_file:
@@ -130,7 +132,7 @@ services:
 
   matomo:
     image: matomo:latest
-    container_name: propmap-matomo
+    container_name: propmap-prod-matomo
     restart: unless-stopped
     depends_on:
       matomo-db:
@@ -149,7 +151,7 @@ services:
 
   matomo-cron:
     image: matomo:latest
-    container_name: propmap-matomo-cron
+    container_name: propmap-prod-matomo-cron
     restart: unless-stopped
     user: www-data
     depends_on:
@@ -163,7 +165,7 @@ services:
 
   matomo-init:
     image: matomo:latest
-    container_name: propmap-matomo-init
+    container_name: propmap-prod-matomo-init
     restart: unless-stopped
     env_file:
       - .env
@@ -188,7 +190,7 @@ services:
 
   propmap-mail:
     image: axllent/mailpit:latest
-    container_name: propmap-mail
+    container_name: propmap-prod-mail
     restart: unless-stopped
     ports:
       - "7500:8025"
@@ -209,7 +211,7 @@ services:
       context: .
       dockerfile: Dockerfile.llm
     image: propmap-llm:cuda61
-    container_name: propmap-llm
+    container_name: propmap-prod-llm
     restart: unless-stopped
     runtime: nvidia
     ports:
@@ -246,6 +248,19 @@ services:
 
 volumes:
   matomo-db:
+    name: propmap_matomo-db
+    external: true
   matomo-html:
+    name: propmap_matomo-html
+    external: true
   mailpit:
+    name: propmap_mailpit
+    external: true
   tor-data:
+    name: propmap_tor-data
+    external: true
+
+networks:
+  public:
+    name: propmap_default
+    external: true
