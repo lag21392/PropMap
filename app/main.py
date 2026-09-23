@@ -81,6 +81,12 @@ class SecureHeaders:
                 headers["X-Frame-Options"] = "DENY"
                 headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
                 headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+                from .seo import noindex_path, wants_hsts
+
+                if noindex_path(path):
+                    headers["X-Robots-Tag"] = "noindex, nofollow"
+                if wants_hsts(scope):
+                    headers["Strict-Transport-Security"] = "max-age=31536000"
                 if path.startswith("/stats"):
                     query = (scope.get("query_string") or b"").decode("latin-1")
                     headers["X-Frame-Options"] = "SAMEORIGIN"
@@ -113,18 +119,32 @@ class CachedStatic(StaticFiles):
 
 
 class SkipListingsGZip:
-    """No comprimir /api/listings en el pedido: el gzip ya está precocinado en disco."""
+    """No comprimir /api/listings en el pedido: el gzip ya está precocinado en disco.
+
+    Si el cliente acepta brotli y el paquete está instalado, el resto de las
+    respuestas de texto sale en br. Si no, queda el gzip de siempre.
+    """
 
     def __init__(self, app: ASGIApp, minimum_size: int = 800):
         self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
         self.app = app
+        self.minimum_size = minimum_size
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        path = str(scope.get("path") or "")
-        if scope.get("type") == "http" and (
-            path.startswith("/api/listings") or path == "/api/alive"
-        ):
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+        if path.startswith("/api/listings") or path == "/api/alive":
+            await self.app(scope, receive, send)
+            return
+        from starlette.datastructures import Headers
+
+        from .compress import BrotliOnce, brotli_ready, encoding_for
+
+        accept = Headers(scope=scope).get("accept-encoding", "")
+        if encoding_for(accept, brotli_ok=brotli_ready()) == "br":
+            await BrotliOnce(self.app, minimum_size=self.minimum_size)(scope, receive, send)
             return
         await self.gzip(scope, receive, send)
 
@@ -284,7 +304,7 @@ async def matomo_tracker(request: Request) -> Response:
     return proxy_tracker(request, body)
 
 
-def _html_page(request: Request) -> FileResponse:
+def _html_page(request: Request) -> Response:
     from .analytics import record_later, stamp_cookie, visitor_from_request
 
     vid = visitor_from_request(request)
@@ -309,22 +329,44 @@ def _html_page(request: Request) -> FileResponse:
         query=request.url.query,
         name="pageview",
     )
-    response = FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
+    from .seo import render_html
+
+    headers = {"Cache-Control": "no-store"}
+    indexable = request.url.path == "/" and not request.url.query
+    if request.url.path != "/":
+        headers["X-Robots-Tag"] = "noindex, nofollow"
+    elif request.url.query:
+        headers["X-Robots-Tag"] = "noindex, follow"
+    response = Response(
+        render_html("index.html", request, indexable=indexable),
+        media_type="text/html; charset=utf-8",
+        headers=headers,
+    )
     stamp_cookie(response, vid)
     return response
 
 
 @app.get("/")
-async def index(request: Request) -> FileResponse:
+async def index(request: Request) -> Response:
     return _html_page(request)
 
 
 @app.get("/legal")
+async def legal_page(request: Request) -> Response:
+    from .seo import render_html
+
+    return Response(
+        render_html("legal.html", request),
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/privacidad")
 @app.get("/terminos")
 @app.get("/aviso")
-async def legal_page() -> FileResponse:
-    return FileResponse(STATIC / "legal.html", headers={"Cache-Control": "no-store"})
+def legal_aliases() -> RedirectResponse:
+    return RedirectResponse("/legal", status_code=301)
 
 
 @app.get("/verificar")
@@ -412,7 +454,7 @@ def auth_import_pins(payload: PinsImportIn, request: Request) -> dict:
 
 
 @app.get("/admin")
-async def admin(request: Request) -> FileResponse:
+async def admin(request: Request) -> Response:
     return _html_page(request)
 
 
@@ -502,17 +544,44 @@ def lineage_graph(payload: AdminStatsIn, request: Request) -> dict:
 
 
 @app.get("/robots.txt")
-def robots_txt() -> Response:
-    body = (
-        "User-agent: *\n"
-        "Allow: /\n"
-        "Disallow: /stats\n"
-        "Disallow: /stats/\n"
-        "Disallow: /tablero\n"
-        "Disallow: /flujo\n"
-        "Disallow: /admin\n"
-    )
-    return Response(body, media_type="text/plain; charset=utf-8")
+def robots_txt(request: Request) -> Response:
+    from .seo import robots_body
+
+    return Response(robots_body(request), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/sitemap.xml")
+def sitemap_xml(request: Request) -> Response:
+    from .seo import sitemap_xml as build_sitemap
+
+    return Response(build_sitemap(request), media_type="application/xml; charset=utf-8")
+
+
+@app.get("/sitemap-cities.xml")
+def sitemap_cities_xml(request: Request) -> Response:
+    from .seo import sitemap_cities_xml as build_sitemap
+
+    return Response(build_sitemap(request), media_type="application/xml; charset=utf-8")
+
+
+@app.get("/ciudades")
+def cities_page(request: Request) -> Response:
+    from .seo import cities_page as build_page
+
+    body, status, headers = build_page(request)
+    return Response(body, status_code=status, media_type="text/html; charset=utf-8", headers=headers)
+
+
+@app.get("/ciudad/{slug}")
+@app.get("/ciudad/{slug}/{tipo}")
+def city_page(request: Request, slug: str, tipo: str | None = None) -> Response:
+    from .seo import city_page as build_page
+
+    body, status, headers = build_page(request, slug, tipo)
+    media = "text/html; charset=utf-8"
+    if status == 301:
+        return RedirectResponse(body, status_code=301)
+    return Response(body, status_code=status, media_type=media, headers=headers)
 
 
 @app.get("/stats")

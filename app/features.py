@@ -20,13 +20,16 @@ CREDIT_RE = re.compile(
 
 FEATURE_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("cochera", ("cochera", "garage", "estacionamiento", "parking")),
-    ("balcón", ("balcon", "balcón", "terraza")),
-    ("patio", ("patio", "jardin", "jardín", "parque")),
+    ("balcón", ("balcon", "balcón")),
+    ("terraza", ("terraza",)),
+    ("patio", ("patio", "jardin", "jardín")),
     ("pileta", ("pileta", "piscina", "pool")),
     ("parrilla", ("parrilla", "quincho", "asador")),
     ("ascensor", ("ascensor", "elevador")),
-    ("luminoso", ("luminoso", "luminosa", "luz natural", "mucho sol")),
-    ("vista al mar", ("vista al mar", "vista al golfo", "frente al mar", "al agua")),
+    ("luminoso", ("luminoso", "luminosa", "luz natural", "mucho sol", "mucha luz", "muy luminoso")),
+    ("vista abierta", ("vista abierta", "vista panoramica", "vista panorámica", "vista despejada")),
+    ("vista al mar", ("vista al mar", "vista al golfo", "frente al mar")),
+    ("barrio en crecimiento", ("barrio en crecimiento", "zona en crecimiento", "barrio en expansion", "barrio en expansión", "zona en desarrollo", "en pleno crecimiento")),
     ("apto crédito", ("apto credito", "apto crédito", "apto bancario", "credito hipotecario", "crédito hipotecario", "procrear")),
     ("reciclado", ("reciclado", "reciclada", "a nuevo", "refaccionado")),
     ("calefacción", ("calefaccion", "calefacción", "piso radiante")),
@@ -96,6 +99,9 @@ def analyze(item: Listing) -> Listing:
     apply_layout_counts(item)
     item.quality_score = _quality(item, amenities)
     item.quality_label = _quality_label(item.quality_score)
+    from .listing_signals import apply_signals
+
+    apply_signals(item)
     return item
 
 

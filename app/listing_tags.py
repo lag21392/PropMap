@@ -30,6 +30,8 @@ EXTRA_TAGS = (
     "mascotas",
     "apto profesional",
     "terraza propia",
+    "barrio en crecimiento",
+    "vista abierta",
     "lote propio",
     "semipiso",
     "dúplex",

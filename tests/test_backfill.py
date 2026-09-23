@@ -168,7 +168,7 @@ def test_init_marks_unknown_city_after_llm_pass(tmp_path, monkeypatch):
 def test_pump_is_idle_in_tests():
     from app.backfill import pump
 
-    assert pump(prefer_cities=["caba"]) == {"details": 0, "llm": 0, "copy": 0}
+    assert pump(prefer_cities=["caba"]) == {"details": 0, "llm": 0, "copy": 0, "signals": 0}
 
 
 def test_llm_refill_fills_from_store(tmp_path, monkeypatch):

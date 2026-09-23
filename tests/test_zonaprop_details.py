@@ -111,6 +111,42 @@ def test_zonaprop_list_keeps_visibility_and_full_address():
     assert item.extra.get("between") or item.extra.get("intersection")
 
 
+def test_zonaprop_list_reads_nested_credit_and_particular():
+    from app.scrapers.zonaprop import _parse
+
+    item = _parse(
+        {
+            "postingId": "601",
+            "url": "/propiedades/dueño-601.html",
+            "title": "PH en venta",
+            "descriptionNormalized": "PH al frente.",
+            "publisher": {"name": "Juan", "publisherType": "PARTICULAR"},
+            "generalFeatures": {
+                "grupo": {
+                    "features": [
+                        {"label": "Apto crédito", "value": "Sí"},
+                        {"label": "Expensas bajas", "value": "Sí"},
+                    ]
+                }
+            },
+            "postingLocation": {
+                "address": {"name": "Mitre 100", "visibility": "EXACT"},
+                "postingGeolocation": {
+                    "geolocation": {"latitude": -42.77, "longitude": -65.04}
+                },
+            },
+            "priceOperationTypes": [{"prices": [{"amount": 90000, "currency": "USD"}]}],
+        },
+        "ph",
+        "puerto-madryn",
+    )
+    assert item is not None
+    assert item.extra.get("mortgage_credit") is True
+    assert item.extra.get("publisher_direct") is True
+    assert "Apto crédito" in (item.extra.get("amenities") or [])
+    assert "Expensas bajas" in (item.extra.get("amenities") or [])
+
+
 def test_listing_page_is_gone_detects_unpublished_copy():
     assert listing_page_is_gone("Esta propiedad ya no está disponible en ZonaProp") is True
     assert listing_page_is_gone("Lo sentimos, esta publicación inactiva ya no se puede ver") is True

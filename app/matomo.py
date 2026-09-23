@@ -515,17 +515,21 @@ def _configure(base: str) -> None:
             },
         )
         if site_id:
+            public = (os.environ.get("APP_PUBLIC_URL") or os.environ.get("MATOMO_SITE_URL") or "").rstrip("/")
             aliases = ["http://localhost:8000", "http://127.0.0.1:8000"]
-            public = (os.environ.get("APP_PUBLIC_URL") or "").rstrip("/")
             if public:
-                aliases.append(public)
+                aliases.insert(0, public)
+            previous = "https://propmaplag.duckdns.org"
+            if previous not in aliases:
+                aliases.append(previous)
             client.get(
                 "/index.php",
                 params={
                     **params,
-                    "method": "SitesManager.addSiteAliasUrls",
+                    "method": "SitesManager.updateSite",
                     "idSite": site_id,
-                    "urls": aliases,
+                    "siteName": os.environ.get("MATOMO_SITE_NAME") or "PropMap",
+                    **{f"urls[{i}]": url for i, url in enumerate(aliases)},
                 },
             )
 

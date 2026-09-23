@@ -1,17 +1,70 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="es-AR">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#2f5346" />
   <meta name="color-scheme" content="light" />
-  <title>PropMap · avisos en el mapa</title>
+  <title>Casas en venta en Argentina · Mapa con score | PropMap</title>
+  <meta name="description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="__ORIGIN__/" />
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <meta property="og:type" content="website" />
+  <meta property="og:locale" content="es_AR" />
+  <meta property="og:site_name" content="PropMap" />
+  <meta property="og:title" content="Casas en venta en Argentina · Mapa con score | PropMap" />
+  <meta property="og:description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
+  <meta property="og:url" content="__ORIGIN__/" />
+  <meta property="og:image" content="__ORIGIN__/static/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="PropMap, mapa de casas en venta con score de ganga" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Casas en venta en Argentina · Mapa con score | PropMap" />
+  <meta name="twitter:description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
+  <meta name="twitter:image" content="__ORIGIN__/static/og.png" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "@id": "__ORIGIN__/#website",
+        "name": "PropMap",
+        "url": "__ORIGIN__/",
+        "inLanguage": "es-AR",
+        "description": "Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga.",
+        "potentialAction": {
+          "@type": "SearchAction",
+          "target": {
+            "@type": "EntryPoint",
+            "urlTemplate": "__ORIGIN__/ciudades?q={search_term_string}"
+          },
+          "query-input": "required name=search_term_string"
+        }
+      },
+      {
+        "@type": "WebApplication",
+        "@id": "__ORIGIN__/#app",
+        "name": "PropMap",
+        "url": "__ORIGIN__/",
+        "applicationCategory": "BusinessApplication",
+        "operatingSystem": "Web",
+        "browserRequirements": "Requires JavaScript",
+        "isAccessibleForFree": true,
+        "inLanguage": "es-AR",
+        "description": "Visor de avisos inmobiliarios ya publicados. Compara el precio con la zona y muestra un score de ganga."
+      }
+    ]
+  }
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui30" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui38" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui83" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui95" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -19,7 +72,7 @@
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui30" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui38" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -27,10 +80,10 @@
     <aside class="panel" id="pane-market" data-pane="market">
       <header class="brand">
         <div class="brand-top">
-          <h1 class="logo">
+          <div class="logo">
             <span class="logo-mark" aria-hidden="true"></span>
             <span class="logo-word">PROPMAP</span>
-          </h1>
+          </div>
           <div class="brand-actions">
             <button type="button" class="account-btn" id="accountBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu" title="Cuenta">
               Cuenta
@@ -41,6 +94,7 @@
             </button>
           </div>
         </div>
+        <h1 class="brand-tagline">Casas, departamentos y terrenos en venta en Argentina, comparados en el mapa.</h1>
       </header>
 
       <div class="filters">
@@ -72,6 +126,97 @@
         <label>Hasta USD
           <input id="maxPrice" type="number" min="0" step="5000" placeholder="sin tope" />
         </label>
+        <label>m² desde
+          <input id="minM2" type="number" min="0" step="10" inputmode="numeric" placeholder="sin mínimo" />
+        </label>
+        <label>m² hasta
+          <input id="maxM2" type="number" min="0" step="10" inputmode="numeric" placeholder="sin tope" />
+        </label>
+        <div class="size-counts">
+          <label>Dormitorios
+            <select id="minBeds">
+              <option value="">Cualquiera</option>
+              <option value="1">1+</option>
+              <option value="2">2+</option>
+              <option value="3">3+</option>
+              <option value="4">4+</option>
+              <option value="5">5+</option>
+            </select>
+          </label>
+          <label>Ambientes
+            <select id="minRooms">
+              <option value="">Cualquiera</option>
+              <option value="1">1+</option>
+              <option value="2">2+</option>
+              <option value="3">3+</option>
+              <option value="4">4+</option>
+              <option value="5">5+</option>
+              <option value="6">6+</option>
+            </select>
+          </label>
+          <label>Baños
+            <select id="minBaths">
+              <option value="">Cualquiera</option>
+              <option value="1">1+</option>
+              <option value="2">2+</option>
+              <option value="3">3+</option>
+            </select>
+          </label>
+        </div>
+        <div class="trait-filters" role="group" aria-label="Del aviso">
+          <label>
+            <input type="checkbox" name="listingTrait" value="credit" />
+            <span>Apto crédito</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="owner" />
+            <span>Dueño directo</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="expenses" />
+            <span>Expensas bajas</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="urgent" />
+            <span>Venta urgente</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="quiet" />
+            <span>Tranquilo</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="good" />
+            <span>Buen estado</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="balcony" />
+            <span>Balcón</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="bright" />
+            <span>Luminoso</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="growing" />
+            <span>Barrio en crecimiento</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="view" />
+            <span>Vista abierta</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="patio" />
+            <span>Patio</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="garage" />
+            <span>Cochera</span>
+          </label>
+          <label>
+            <input type="checkbox" name="listingTrait" value="terrace" />
+            <span>Terraza</span>
+          </label>
+        </div>
         <label>Ordenar
           <select id="sortBy">
             <option value="deal">Ganga / score</option>
@@ -160,6 +305,7 @@
           <a href="/legal#terminos">Términos</a>
           · <a href="/legal#privacidad">Privacidad (Ley 25.326)</a>
           · <a href="/legal#aviso">Derechos reservados</a>
+          · __CITY_NAV__
           · <a data-site-mail href="mailto:cuenta@propmap.local">cuenta@propmap.local</a>
           · <a data-mail-inbox hidden href="http://127.0.0.1:7500" target="_blank" rel="noopener">Bandeja</a>
         </p>
@@ -210,7 +356,7 @@
         </ul>
       </aside>
       <p class="map-hint">Arrastrá el mapa · rueda = zoom · redondo = ubicación real · cuadrado = manzana del aviso</p>
-      <p class="map-legal"><a href="/legal">Términos, privacidad y derechos reservados</a> · avisos de terceros · Ley 25.326</p>
+      <p class="map-legal"><a href="/ciudades">Ciudades</a> · <a href="/legal">Términos, privacidad y derechos reservados</a> · avisos de terceros · Ley 25.326</p>
       <section class="stats-card" id="statsCard">
         <div class="stats-head">
           <h2>Promedios por barrio</h2>
@@ -331,7 +477,7 @@
     <form method="dialog">
       <h2 id="helpTitle">Cómo usar PropMap</h2>
       <ul class="help-list">
-        <li>Escribí una ciudad; si hay varias con el mismo nombre, elegí la de la provincia que corresponde. Filtrá tipo / barrio / precio y ordená la lista.</li>
+        <li>Escribí una ciudad; si hay varias con el mismo nombre, elegí la de la provincia que corresponde. Filtrá tipo, barrio, precio, m², dormitorios, ambientes y baños, y ordená la lista.</li>
         <li>Tocá un pin o una tarjeta para abrir la ficha a la derecha. Si hay varios avisos en el mismo punto, el mapa solo sirve para elegir cuál.</li>
         <li>El color compara el USD/m² con el mismo tipo en esa zona.</li>
         <li>El punto redondo es ubicación real (calle y altura o esquina). El cuadrado es la manzana aproximada del aviso. Si no hay ni eso, queda marcado como sin ubicación.</li>
@@ -425,6 +571,6 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
-  <script defer src="/static/app.js?v=ui83"></script>
+  <script defer src="/static/app.js?v=ui95"></script>
 </body>
 </html>

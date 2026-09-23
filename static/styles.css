@@ -209,6 +209,16 @@ h1, h2 {
   line-height: 1;
   text-transform: uppercase;
 }
+.brand-tagline {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-family: "Atkinson Hyperlegible", system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.35;
+  text-transform: none;
+}
 .brand-actions {
   display: flex;
   align-items: center;
@@ -505,8 +515,21 @@ button:disabled { opacity: 0.55; cursor: wait; }
   min-width: 0;
 }
 .filters .place-wrap,
-.filters .span-2 {
+.filters .span-2,
+.filters .trait-filters,
+.filters .size-counts {
   grid-column: 1 / -1;
+}
+.size-counts {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+}
+.size-counts label {
+  min-width: 0;
+}
+.size-counts select:disabled {
+  opacity: 0.45;
 }
 .place-wrap { position: relative; }
 .place-suggest {
@@ -541,9 +564,17 @@ button:disabled { opacity: 0.55; cursor: wait; }
 }
 .card-top {
   display: flex;
-  justify-content: space-between;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+.card-top .kind { flex: 0 1 auto; min-width: 0; }
+.card-top .price {
+  margin-left: auto;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 1.2;
 }
 .fav-btn {
   background: transparent;
@@ -762,6 +793,54 @@ input, select, textarea {
   gap: 8px !important;
   margin-top: 0;
   padding-bottom: 6px;
+}
+.trait-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.filters .trait-filters label {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin: 0;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+  box-shadow: none;
+}
+.filters .trait-filters label:hover {
+  border-color: var(--teal);
+  background: #fff;
+}
+.filters .trait-filters label:has(input:checked) {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: var(--paper);
+  font-weight: 700;
+}
+.trait-filters input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  overflow: hidden;
+}
+.filters .trait-filters label:focus-within {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
 }
 .block { margin-top: 8px; }
 .leaflet-div-icon.prop-pin,
@@ -1251,6 +1330,42 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
   font-size: 14px;
 }
 .legal-toc a { color: var(--teal); }
+.city-figure { margin: 8px 0 18px; }
+.city-figure-num {
+  display: block;
+  font-family: Newsreader, Georgia, serif;
+  font-size: clamp(52px, 8vw, 76px);
+  line-height: 0.9;
+  letter-spacing: -0.03em;
+}
+.city-figure-unit {
+  display: block;
+  margin-top: 6px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sand);
+}
+.city-jump { margin: 0 0 18px; }
+.city-jump a, .city-nav a { color: var(--teal); }
+.city-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0 0 18px;
+}
+.city-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 48px;
+}
+.city-list { padding-left: 18px; }
+.city-list li { margin: 0 0 10px; }
+.city-list span { display: block; color: var(--muted); font-size: 14px; }
+.seo-dir { padding-left: 18px; }
+.seo-dir > li { margin: 0 0 14px; }
+.seo-dir ul { margin: 4px 0 0; padding-left: 16px; }
 .legal-note { margin-top: 28px; color: var(--muted); font-size: 13px; }
 .approx-cell { pointer-events: none; }
 @media (prefers-reduced-motion: reduce) {
@@ -1290,6 +1405,8 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 .kind.ph { background: rgba(226, 196, 142, 0.2); color: var(--sand); }
 .kind.casa { background: rgba(125, 255, 179, 0.12); color: var(--deal); }
 .kind.credit { background: rgba(226, 196, 142, 0.18); color: #e2c48e; }
+.kind.owner { background: rgba(125, 255, 179, 0.12); color: var(--deal); }
+.kind.urgent { background: rgba(226, 140, 110, 0.18); color: #f0b49a; }
 .kind.lost { background: rgba(196, 154, 108, 0.22); color: #e2c48e; }
 .kind.real { background: rgba(46, 196, 182, 0.16); color: #7ee0d4; }
 .loc-missing {
@@ -1302,6 +1419,11 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 }
 .headline { font-size: 13px; margin: 2px 0 4px; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.card .chips {
+  flex-wrap: nowrap;
+  overflow: hidden;
+  max-height: 22px;
+}
 .chip {
   font-size: 10px;
   padding: 2px 6px;
@@ -1342,7 +1464,36 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 .edit-hint { margin: 0; font-size: 12px; }
 .detail h3 { margin: 8px 0 4px; font-size: 16px; }
 .detail .desc { color: var(--muted); max-height: 42vh; overflow: auto; white-space: pre-wrap; }
-.detail-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.detail-head {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+.detail-kicker {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+.detail-kicker .kind { flex: 0 1 auto; min-width: 0; }
+.detail-price {
+  flex: 0 0 auto;
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--sand);
+  white-space: nowrap;
+  letter-spacing: -0.02em;
+}
+.detail-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .detail-link {
   display: block;
   word-break: break-all;
@@ -1350,14 +1501,34 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
   font-size: 12px;
   margin: 6px 0 12px;
 }
+.detail-photos { margin: 0 0 10px; }
 .detail-hero {
   width: 100%;
-  height: 160px;
-  aspect-ratio: 4 / 1;
+  height: auto;
+  max-height: 280px;
+  aspect-ratio: 3 / 2;
   object-fit: cover;
   border-radius: 12px;
-  margin-bottom: 10px;
   background: #123;
+}
+.detail-film {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.detail-film button {
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+}
+.detail-film button.is-on { border-color: var(--teal); }
+.detail-film img {
+  width: 64px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 7px;
+  display: block;
 }
 .detail h4 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
 .muted { color: var(--muted); }

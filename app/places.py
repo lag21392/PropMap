@@ -84,6 +84,7 @@ _BLOCKED_KINDS = {
 _NOT_CITY_CATEGORIAS = {"paraje", "pje"}
 _PLACE_META_KEYS = ("kind", "addresstype", "municipio", "localidad_censal", "categoria")
 _purged_unofficial = False
+_restored_loaded = False
 
 
 def is_cache_artifact_id(city_id: str | None) -> bool:
@@ -1090,6 +1091,51 @@ def _purge_duplicate_labels() -> list[str]:
     return dropped
 
 
+def _catalog_count(cid: str, counts: dict[str, int]) -> int:
+    token = _canonical_listed_id(cid) or cid
+    total = 0
+    for key, val in counts.items():
+        got = _canonical_listed_id(key) or key
+        if got == token:
+            total += int(val or 0)
+    return total
+
+
+def _georef_rejects_city(query: str) -> bool:
+    """True solo si Georef contestó y el nombre es un barrio, no una ciudad.
+
+    Si la API no responde, no se borra nada: un corte no puede vaciar el desplegable.
+    """
+    try:
+        rows = list(search_city_places(query, limit=6))
+    except Exception:
+        return False
+    matched: list[dict] = []
+    for place in rows:
+        parsed = _from_georef_place(place)
+        if parsed and _official_name_matches(query, parsed):
+            matched.append(parsed)
+    if not matched:
+        return False
+    return not any(_search_hit_ok(row) for row in matched)
+
+
+def _should_forget_unofficial(cid: str, cfg: dict, counts: dict[str, int]) -> bool:
+    """Una ciudad con avisos cargados no se borra si Georef no contesta."""
+    if not cid or cid == DEFAULT_CITY or cid in CABA_IDS or cfg.get("builtin"):
+        return False
+    if _junk_place_row(cid, cfg):
+        return True
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return False
+    label = str(cfg.get("label") or cid)
+    if _georef_rejects_city(label):
+        return True
+    if listing_count_for_catalog(_catalog_count(cid, counts)):
+        return False
+    return official_place(label) is None
+
+
 def _unlist_ghost_places() -> list[str]:
     """Saca del catálogo pueblos que nadie buscó y no tienen masa de avisos. Sin pegarle a la red."""
     if os.environ.get("PROPMAP_TEST") == "1":
@@ -1117,6 +1163,12 @@ def purge_unofficial_places() -> list[str]:
         cid = str(cfg.get("id") or "")
         if cid and not cfg.get("builtin"):
             candidates.append(cid)
+    counts: dict[str, int] = {}
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            counts = store.city_listing_counts()
+        except Exception:
+            counts = {}
     for cid in candidates:
         if cid in seen or cid == DEFAULT_CITY or cid in CABA_IDS:
             continue
@@ -1124,10 +1176,7 @@ def purge_unofficial_places() -> list[str]:
         cfg = CITIES.get(cid) or {}
         if cfg.get("builtin"):
             continue
-        junk = _junk_place_row(cid, cfg)
-        if not junk and os.environ.get("PROPMAP_TEST") != "1":
-            junk = official_place(str(cfg.get("label") or cid)) is None
-        if junk and forget_place(cid):
+        if _should_forget_unofficial(cid, cfg, counts) and forget_place(cid):
             dropped.append(cid)
     dropped.extend(_purge_duplicate_labels())
     if os.environ.get("PROPMAP_TEST") != "1":
@@ -1161,7 +1210,8 @@ def catalog_place_ids(*, extra_have: set[str] | None = None) -> set[str]:
     if extra_have:
         have |= {cid for cid in extra_have if cid}
     wanted = {DEFAULT_CITY}
-    for cid in listed_place_ids():
+    pool = set(listed_place_ids()) | set(have)
+    for cid in pool:
         token = _canonical_listed_id(cid) or cid
         if not token or token in _LISTED_SKIP:
             continue
@@ -1219,8 +1269,11 @@ def listed_cities(listings: list | None = None) -> list[dict]:
             return
         if cid != DEFAULT_CITY and cid not in CABA_IDS and not _listed_row_is_city(cid, cfg):
             return
+        n = int(counts.get(cid) or 0)
+        if os.environ.get("PROPMAP_TEST") != "1" and not listing_count_for_catalog(n):
+            return
         row = _public_city(cfg)
-        row["n"] = int(counts.get(cid) or 0)
+        row["n"] = n
         seen[cid] = row
 
     for cfg in list(CITIES.values()):
@@ -1313,6 +1366,122 @@ def ensure_default_city() -> str:
     return DEFAULT_CITY
 
 
+def _restore_hit(token: str, *, lat: float | None = None, lon: float | None = None) -> dict | None:
+    """Ciudad de Georef que coincide con el id de los avisos y cae cerca de esos pines."""
+    query = token.replace("-", " ")
+    hits: list[dict] = []
+    for place in search_city_places(query, limit=6):
+        parsed = _from_georef_place(place)
+        if not parsed or not _search_hit_ok(parsed) or not _official_name_matches(query, parsed):
+            continue
+        if lat is not None and lon is not None and parsed.get("lat") is not None and parsed.get("lon") is not None:
+            if distance_km(lat, lon, float(parsed["lat"]), float(parsed["lon"])) > 80:
+                continue
+        hits.append(parsed)
+    if not hits:
+        return None
+
+    def rank(row: dict) -> tuple[int, int]:
+        prov = province_slug(str(row.get("province") or ""))
+        aligned = token == str(row.get("id") or "") or (bool(prov) and token.endswith(f"-{prov}"))
+        named = _same_place_token(token, str(row.get("label") or ""))
+        return (1 if aligned else 0, 1 if named else 0)
+
+    return max(hits, key=rank)
+
+
+def _listing_centroids() -> dict[str, tuple[float, float]]:
+    try:
+        with store.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT city, AVG(lat), AVG(lon)
+                FROM listings
+                WHERE city IS NOT NULL AND city != ''
+                  AND lat IS NOT NULL AND lon IS NOT NULL
+                GROUP BY city
+                """
+            ).fetchall()
+    except Exception:
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for row in rows:
+        cid = str(row[0] or "")
+        if not cid:
+            continue
+        try:
+            out[cid] = (float(row[1]), float(row[2]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _restore_loaded_cities() -> None:
+    """Vuelve a registrar ciudades que tienen avisos y la limpieza había sacado."""
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return
+    try:
+        counts = store.city_listing_counts()
+    except Exception:
+        log.exception("no pude leer ciudades cargadas")
+        return
+    centroids = _listing_centroids()
+    restored = 0
+    for cid, n in counts.items():
+        token = _canonical_listed_id(cid) or cid
+        if not token or token in _LISTED_SKIP or is_cache_artifact_id(token):
+            continue
+        if not listing_count_for_catalog(n):
+            continue
+        cfg = CITIES.get(token) or {}
+        if _has_map_coords(cfg):
+            continue
+        center = centroids.get(cid) or centroids.get(token)
+        lat, lon = center if center else (None, None)
+        try:
+            hit = _restore_hit(token, lat=lat, lon=lon)
+        except Exception:
+            log.exception("no pude reponer %s", token)
+            continue
+        if not hit:
+            continue
+        _register_view_city(
+            token,
+            label=str(hit.get("label") or token),
+            lat=float(hit["lat"]),
+            lon=float(hit["lon"]),
+            province=str(hit.get("province") or ""),
+            zoom=int(hit.get("zoom") or 13),
+            slug=hit.get("slug"),
+            meta=hit,
+        )
+        restored += 1
+    if not restored:
+        return
+    log.info("ciudades cargadas repuestas: %s", restored)
+    try:
+        from .listings_cache import rewrite_snap_cities
+
+        rewrite_snap_cities()
+    except Exception:
+        log.exception("no pude actualizar el desplegable de ciudades")
+
+
+def _kick_restore_loaded_cities() -> None:
+    global _restored_loaded
+    if _restored_loaded or os.environ.get("PROPMAP_TEST") == "1":
+        return
+    _restored_loaded = True
+
+    def _job() -> None:
+        try:
+            _restore_loaded_cities()
+        except Exception:
+            log.exception("no pude reponer ciudades cargadas")
+
+    threading.Thread(target=_job, daemon=True, name="restore-cities").start()
+
+
 def load_custom_places() -> None:
     if os.environ.get("PROPMAP_TEST") == "1":
         ensure_default_city()
@@ -1354,6 +1523,7 @@ def load_custom_places() -> None:
                 _persist()
     ensure_default_city()
     _unlist_ghost_places()
+    _kick_restore_loaded_cities()
     _kick_unofficial_purge()
 
 

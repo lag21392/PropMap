@@ -9,8 +9,9 @@ from .models import Listing
 from .osm_poi import CAT_LABEL
 from .scoring import useful_m2
 
-PROFILE_VERSION = "5"
+PROFILE_VERSION = "6"
 AXES = ("price_m2", "zona", "ambientes", "alquiler", "servicios")
+LOT_AXES = ("price_m2", "zona", "servicios")
 AXIS_LABELS = {
     "price_m2": "USD/m²",
     "zona": "Zona",
@@ -126,9 +127,15 @@ def _pending_state(axis: dict[str, Any]) -> str:
     return "pending"
 
 
-def pending_axes(axes: dict[str, Any] | None) -> list[dict[str, Any]]:
+def axes_for(item: Listing) -> tuple[str, ...]:
+    if (item.property_type or "") == "terreno":
+        return LOT_AXES
+    return AXES
+
+
+def pending_axes(axes: dict[str, Any] | None, order: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
     rows = []
-    for key in AXES:
+    for key in order or AXES:
         axis = (axes or {}).get(key) or {}
         if axis.get("score") is not None:
             continue
@@ -143,28 +150,32 @@ def pending_axes(axes: dict[str, Any] | None) -> list[dict[str, Any]]:
     return rows
 
 
-def total_score(axes: dict[str, Any] | None) -> dict[str, Any]:
+def total_score(axes: dict[str, Any] | None, order: tuple[str, ...] | None = None) -> dict[str, Any]:
+    keys = order or AXES
     scores = []
-    for key in AXES:
+    for key in keys:
         score = ((axes or {}).get(key) or {}).get("score")
         if score is not None:
             scores.append(float(score))
-    pending = pending_axes(axes)
+    pending = pending_axes(axes, keys)
     if not scores:
-        return {"score": None, "n": 0, "of": len(AXES), "pending": pending}
+        return {"score": None, "n": 0, "of": len(keys), "pending": pending}
     return {
         "score": round(sum(scores) / len(scores), 1),
         "n": len(scores),
-        "of": len(AXES),
+        "of": len(keys),
         "pending": pending,
     }
 
 
 def stamp_profile(profile: dict[str, Any]) -> dict[str, Any]:
     axes = profile.get("axes") if isinstance(profile.get("axes"), dict) else {}
-    total = total_score(axes)
+    raw_order = profile.get("order")
+    order = tuple(raw_order) if isinstance(raw_order, (list, tuple)) and raw_order else AXES
+    total = total_score(axes, order)
+    profile["order"] = list(order)
     profile["version"] = profile.get("version") or PROFILE_VERSION
-    profile["labels"] = dict(AXIS_LABELS)
+    profile["labels"] = {key: AXIS_LABELS[key] for key in order if key in AXIS_LABELS}
     profile["total"] = total.get("score")
     profile["total_n"] = total.get("n")
     profile["pending"] = total.get("pending") or []
@@ -183,19 +194,22 @@ def compute_profile(item: Listing, pois: dict[str, list[dict]] | None = None) ->
         access = stored
     else:
         access = compute_access(item, pois)
-    axes = {
-        "price_m2": _price_axis(item),
-        "zona": _zona_axis(item),
-        "ambientes": _ambientes_axis(item),
-        "alquiler": _alquiler_axis(item),
-        "servicios": _servicios_axis(item, access),
+    order = axes_for(item)
+    builders = {
+        "price_m2": lambda: _price_axis(item),
+        "zona": lambda: _zona_axis(item),
+        "ambientes": lambda: _ambientes_axis(item),
+        "alquiler": lambda: _alquiler_axis(item),
+        "servicios": lambda: _servicios_axis(item, access),
     }
+    axes = {key: builders[key]() for key in order}
     return stamp_profile(
         {
             "version": PROFILE_VERSION,
+            "order": list(order),
             "pin_grade": pin_grade(item),
             "axes": axes,
-            "labels": AXIS_LABELS,
+            "labels": {key: AXIS_LABELS[key] for key in order},
             "access": access,
         }
     )

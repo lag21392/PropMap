@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 from . import crawl, freshness, store
 from .features import analyze
+from .listing_signals import apply_signals
 from .dedupe import DEDUPE_VERSION, collapse_duplicates
 from .geo import (
     CITIES,
@@ -663,6 +664,7 @@ def _scrape_one_city(
                 if item.price and not item.price_usd:
                     item.price_usd = to_usd(item.price, item.currency, rate)
                 apply_unit_price(item, rate)
+                apply_signals(item)
                 if not freshness.is_known(item.id):
                     new_n += 1
                     if not country:

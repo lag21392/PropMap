@@ -12,7 +12,7 @@ from ..features import analyze, extract_features
 from ..http_client import decode_js_object, fetch_bytes, fetch_text
 from ..models import Listing
 from ..text_quality import address_quality, clean_portal_address, looks_like_intersection, title_quality
-from . import attach_location_facts, detect_type, parse_number
+from . import attach_location_facts, collect_feature_labels, detect_type, parse_number, publisher_bits, structured_credit
 
 DETAILS_PARSER = "9"
 PDF_HREF = re.compile(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', re.I)
@@ -197,18 +197,17 @@ def _from_zonaprop_state(item: Listing, html: str) -> None:
         expenses = posting.get("expenses") or {}
         amount = parse_number(str(expenses.get("amount") or expenses.get("formattedAmount") or ""))
         extra = dict(item.extra or {})
+        extra.update(publisher_bits(posting))
         if amount:
             extra["expenses"] = amount
-        amenities = list(extra.get("amenities") or [])
-        features = posting.get("mainFeatures") or posting.get("generalFeatures") or {}
-        if isinstance(features, dict):
-            for node in features.values():
-                if not isinstance(node, dict):
-                    continue
-                label = str(node.get("label") or node.get("value") or "").strip()
-                if label and label not in amenities:
-                    amenities.append(label)
+        amenities = list(dict.fromkeys(
+            list(extra.get("amenities") or [])
+            + collect_feature_labels(posting.get("mainFeatures"), posting.get("generalFeatures"))
+        ))
         extra["amenities"] = amenities
+        credit = structured_credit(posting.get("mainFeatures"), posting.get("generalFeatures"))
+        if credit is not None and extra.get("mortgage_credit") is None:
+            extra["mortgage_credit"] = credit
         item.extra = extra
         pictures = ((posting.get("visiblePictures") or {}).get("pictures") or [])
         photo_urls = []

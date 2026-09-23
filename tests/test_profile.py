@@ -246,6 +246,25 @@ def test_profile_reports_pending_axes_instead_of_fake_scores():
     assert all(row["state"] in {"pending", "blocked"} for row in profile["pending"])
 
 
+def test_terreno_profile_uses_three_axes():
+    lot = _depto(
+        property_type="terreno",
+        title="Lote 300 m2",
+        rooms=None,
+        bedrooms=None,
+        covered_m2=None,
+        total_m2=300,
+    )
+    profile = compute_profile(lot)
+    assert profile["order"] == ["price_m2", "zona", "servicios"]
+    assert set(profile["axes"]) == {"price_m2", "zona", "servicios"}
+    assert "ambientes" not in profile["labels"]
+    assert "alquiler" not in profile["labels"]
+    assert all(row["key"] not in {"ambientes", "alquiler"} for row in profile["pending"])
+    house = compute_profile(_depto())
+    assert house["order"] == ["price_m2", "zona", "ambientes", "alquiler", "servicios"]
+
+
 def test_ambientes_axis_scores_when_only_bedrooms_are_known():
     item = _depto(rooms=None, bedrooms=2, covered_m2=70)
     profile = compute_profile(item)

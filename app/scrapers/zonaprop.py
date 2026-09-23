@@ -3,7 +3,15 @@ from __future__ import annotations
 from ..http_client import decode_js_object, fetch_text
 from ..models import Listing
 from . import detect_type as detect_type
-from . import locate_item, paginate, parse_number, portal_neighborhood
+from . import (
+    collect_feature_labels,
+    locate_item,
+    paginate,
+    parse_number,
+    portal_neighborhood,
+    publisher_bits,
+    structured_credit,
+)
 from .urls import zonaprop_paths
 
 BASE = "https://www.zonaprop.com.ar"
@@ -95,7 +103,8 @@ def _parse(raw: dict, fallback_type: str, city: str) -> Listing | None:
             photo_urls.append(href)
     if photo_urls:
         image = photo_urls[0]
-    publisher = ((raw.get("publisher") or {}).get("name") or "").strip()
+    pub = raw.get("publisher") if isinstance(raw.get("publisher"), dict) else {}
+    publisher = str((pub or {}).get("name") or "").strip()
     title = raw.get("title") or raw.get("generatedTitle") or "Propiedad en venta"
     text = " ".join(
         [
@@ -113,16 +122,13 @@ def _parse(raw: dict, fallback_type: str, city: str) -> Listing | None:
             ptype = fallback_type
         else:
             return None
-    amenities = []
-    features = raw.get("mainFeatures") or {}
-    if isinstance(features, dict):
-        for node in features.values():
-            if isinstance(node, dict):
-                label = str(node.get("label") or node.get("value") or "").strip()
-                if label:
-                    amenities.append(label)
+    amenities = collect_feature_labels(raw.get("mainFeatures"), raw.get("generalFeatures"))
     expenses = raw.get("expenses") or {}
     extra = {"amenities": amenities}
+    extra.update(publisher_bits(raw))
+    credit = structured_credit(raw.get("mainFeatures"), raw.get("generalFeatures"))
+    if credit is not None:
+        extra["mortgage_credit"] = credit
     if photo_urls:
         extra["photos"] = photo_urls[:24]
     if neighborhood:

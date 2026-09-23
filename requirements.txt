@@ -7,3 +7,5 @@ argon2-cffi>=23.1.0
 cryptography>=43.0.0
 itsdangerous>=2.2.0
 orjson>=3.10.0
+laya>=0.1.0
+brotli>=1.1.0

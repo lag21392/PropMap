@@ -37,6 +37,12 @@
       "skillPath": "skills/just-scrape/SKILL.md",
       "computedHash": "7ff431b36eeb9ba5b2cdb3c31f422b11533ad067720601b69cf49a368577cf62"
     },
+    "seo": {
+      "source": "addyosmani/web-quality-skills",
+      "sourceType": "github",
+      "skillPath": "skills/seo/SKILL.md",
+      "computedHash": "01a735ac18ceb15536ac40b11a5712b3ab8f78ebe94748b3ebc3afc7f58a6f2f"
+    },
     "web-design-guidelines": {
       "source": "vercel-labs/agent-skills",
       "sourceType": "github",

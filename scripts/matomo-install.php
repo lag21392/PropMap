@@ -299,10 +299,15 @@ if ($phase === 'finalize' || $phase === 'all') {
             $urlStmt->execute([$siteId, 'http://localhost:8000']);
         }
     }
-    $publicApp = rtrim((string) (getenv('APP_PUBLIC_URL') ?: ''), '/');
+    $publicApp = rtrim((string) (getenv('APP_PUBLIC_URL') ?: getenv('MATOMO_SITE_URL') ?: ''), '/');
     if ($siteId && $publicApp !== '') {
+        $pdo->prepare('UPDATE matomo_site SET main_url = ? WHERE idsite = ?')->execute([$publicApp, $siteId]);
         $alias = $pdo->prepare('INSERT IGNORE INTO matomo_site_url (idsite, url) VALUES (?, ?)');
         $alias->execute([$siteId, $publicApp]);
+        $previous = 'https://propmaplag.duckdns.org';
+        if ($previous !== $publicApp) {
+            $alias->execute([$siteId, $previous]);
+        }
     }
 
     upsert_option($pdo, 'usercountry.location_provider', 'geoip2php');

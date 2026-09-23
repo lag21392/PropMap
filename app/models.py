@@ -50,6 +50,21 @@ class Listing:
     city: str = "caba"
     quality_score: float | None = None
     quality_label: str = ""
+    # Laya decisions (System 1 structured decisions)
+    laya_quality_score: float | None = None
+    laya_quality_confidence: float | None = None
+    laya_is_owner_direct: bool | None = None
+    laya_owner_confidence: float | None = None
+    laya_is_mortgage_eligible: bool | None = None
+    laya_mortgage_confidence: float | None = None
+    laya_has_low_expenses: bool | None = None
+    laya_expenses_confidence: float | None = None
+    laya_shows_urgency: bool | None = None
+    laya_urgency_confidence: float | None = None
+    laya_environment_noise: str = ""
+    laya_noise_confidence: float | None = None
+    laya_property_condition: str = ""
+    laya_condition_confidence: float | None = None
     details_scraped: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -65,7 +80,9 @@ class Listing:
     def to_public_dict(self) -> dict[str, Any]:
         from .geo import apply_public_location
         from .layout import apply_layout_counts
+        from .listing_signals import apply_signals
 
+        apply_signals(self)
         apply_layout_counts(self)
         data = {
             "id": self.id,
@@ -147,9 +164,21 @@ class Listing:
             "portal_approx": bool((self.extra or {}).get("portal_approx")),
             "pin_kind": (self.extra or {}).get("pin_kind") or "",
             "mortgage_credit": (self.extra or {}).get("mortgage_credit"),
+            "owner_direct": (self.extra or {}).get("owner_direct"),
+            "low_expenses": (self.extra or {}).get("low_expenses"),
+            "urgent_sale": (self.extra or {}).get("urgent_sale"),
+            "environment": (self.extra or {}).get("environment") or "",
+            "has_balcony": (self.extra or {}).get("has_balcony"),
+            "bright": (self.extra or {}).get("bright"),
+            "growing_area": (self.extra or {}).get("growing_area"),
+            "open_view": (self.extra or {}).get("open_view"),
+            "has_patio": (self.extra or {}).get("has_patio"),
+            "has_garage": (self.extra or {}).get("has_garage"),
+            "has_terrace": (self.extra or {}).get("has_terrace"),
             "floor": (self.extra or {}).get("llm", {}).get("floor") if isinstance((self.extra or {}).get("llm"), dict) else None,
             "orientation": (self.extra or {}).get("llm", {}).get("orientation") if isinstance((self.extra or {}).get("llm"), dict) else None,
-            "condition": (self.extra or {}).get("llm", {}).get("condition") if isinstance((self.extra or {}).get("llm"), dict) else None,
+            "condition": (self.extra or {}).get("condition")
+            or ((self.extra or {}).get("llm", {}).get("condition") if isinstance((self.extra or {}).get("llm"), dict) else None),
             "lot_m2": self.total_m2,
             "source_label": SOURCE_LABELS.get(self.source, self.source),
             "sources": (self.extra or {}).get("sources") or [
@@ -197,6 +226,11 @@ class Listing:
         from .profile import compute_profile
 
         data["profile"] = compute_profile(self, {})
+        from .listing_signals import signals_for
+
+        data.update(signals_for(self))
+        data["property_type"] = self.property_type
+        data["data_fixes"] = (self.extra or {}).get("data_fixes") or []
         return apply_public_location(data)
 
 

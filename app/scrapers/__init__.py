@@ -41,6 +41,80 @@ def parse_number(text: str | None) -> float | None:
     return value if value > 0 else None
 
 
+_YES_VAL = {"si", "sí", "yes", "true", "1", "ok"}
+_NO_VAL = {"no", "false", "0"}
+
+
+def iter_feature_pairs(node: object):
+    """Recorre mainFeatures / generalFeatures anidados de Navent y rinde (label, value)."""
+    if isinstance(node, dict):
+        feats = node.get("features")
+        if isinstance(feats, list):
+            for feat in feats:
+                yield from iter_feature_pairs(feat)
+            return
+        label = str(node.get("label") or node.get("name") or "").strip()
+        if label:
+            yield label, node.get("value")
+            return
+        for child in node.values():
+            if isinstance(child, (dict, list)):
+                yield from iter_feature_pairs(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from iter_feature_pairs(child)
+
+
+def collect_feature_labels(*blobs: object) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for blob in blobs:
+        for label, value in iter_feature_pairs(blob):
+            token = str(value or "").strip().lower()
+            if token in _NO_VAL:
+                continue
+            key = label.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            labels.append(label)
+    return labels
+
+
+def structured_credit(*blobs: object) -> bool | None:
+    found = None
+    for blob in blobs:
+        for label, value in iter_feature_pairs(blob):
+            if not re.search(r"apto\s+cr[eé]dito|cr[eé]dito\s+hipotecario|apto\s+bancario", label, re.I):
+                continue
+            token = str(value or "").strip().lower()
+            if token in _NO_VAL:
+                return False
+            found = True
+    return found
+
+
+def publisher_bits(raw: dict | None) -> dict:
+    pub = (raw or {}).get("publisher") if isinstance(raw, dict) else None
+    if not isinstance(pub, dict):
+        return {}
+    name = str(pub.get("name") or "").strip()
+    url = str(pub.get("url") or pub.get("urlFriendly") or "").strip()
+    kind = str(pub.get("publisherType") or pub.get("type") or pub.get("realEstateType") or "").strip()
+    out: dict = {}
+    if url:
+        out["publisher_url"] = url
+    if kind:
+        out["publisher_kind"] = kind
+    low = f"{name} {url} {kind}".lower()
+    kind_l = kind.lower()
+    if any(tok in kind_l for tok in ("particular", "owner", "dueño", "dueno")):
+        out["publisher_direct"] = True
+    elif any(tok in low for tok in ("inmobiliaria", "realestate", "agency", "martillero")):
+        out["publisher_direct"] = False
+    return out
+
+
 def first_int(text: str, pattern: str) -> int | None:
     match = re.search(pattern, text, re.I)
     if not match:
@@ -73,13 +147,18 @@ _DWELLING_HEAD = re.compile(
 
 
 def detect_type(text: str, fallback: str) -> str:
+    from ..property_kind import dwelling_on_lot, dwelling_type_from_text
+
     t = (text or "").lower()
     if "departamento" in t or "depto" in t or "apartamento" in t or "monoambiente" in t:
         return "departamento"
     if re.search(r"\bph\b", t) or "duplex" in t or "dúplex" in t or "triplex" in t:
         return "ph"
+    built = dwelling_type_from_text(text)
+    if built:
+        return built
     lot = fallback == "terreno" or bool(_LOT_RE.search(t))
-    if lot and not _DWELLING_HEAD.search((text or "").strip()):
+    if lot and not _DWELLING_HEAD.search((text or "").strip()) and not dwelling_on_lot(text):
         return "terreno"
     if "casa" in t or "chalet" in t or "quinta" in t or "multifamiliar" in t:
         return "casa"

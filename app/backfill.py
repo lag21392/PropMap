@@ -15,11 +15,12 @@ _lock = threading.Lock()
 def pump(prefer_cities: list[str] | None = None) -> dict[str, int]:
     """Llena huecos en las colas. Barato si ya están llenas."""
     if os.environ.get("PROPMAP_TEST") == "1":
-        return {"details": 0, "llm": 0, "copy": 0}
+        return {"details": 0, "llm": 0, "copy": 0, "signals": 0}
     prefer = next((cid for cid in (prefer_cities or []) if cid), "")
     details_n = 0
     llm_n = 0
     copy_n = 0
+    signals_n = 0
     try:
         from .detail_fetch import refill as refill_details
 
@@ -38,7 +39,13 @@ def pump(prefer_cities: list[str] | None = None) -> dict[str, int]:
         copy_n = refill_copy(prefer)
     except Exception:
         log.exception("backfill copy")
-    return {"details": details_n, "llm": llm_n, "copy": copy_n}
+    try:
+        from .listing_signals import refill as refill_signals
+
+        signals_n = refill_signals(prefer)
+    except Exception:
+        log.exception("backfill etiquetas")
+    return {"details": details_n, "llm": llm_n, "copy": copy_n, "signals": signals_n}
 
 
 def start() -> None:

@@ -69,6 +69,7 @@ def _loads_extra(raw, *, map_row: bool = False) -> dict:
         "total_n": prof.get("total_n"),
         "pending": prof.get("pending") or [],
         "labels": prof.get("labels") or {},
+        "order": prof.get("order") or [],
         "version": prof.get("version"),
     }
     return extra
@@ -197,7 +198,21 @@ def init() -> None:
                 llm_ver INTEGER NOT NULL DEFAULT 0,
                 llm_partial INTEGER NOT NULL DEFAULT 0,
                 llm_await INTEGER NOT NULL DEFAULT 0,
-                llm_fix INTEGER NOT NULL DEFAULT 0
+                llm_fix INTEGER NOT NULL DEFAULT 0,
+                laya_quality_score REAL,
+                laya_quality_confidence REAL,
+                laya_is_owner_direct INTEGER,
+                laya_owner_confidence REAL,
+                laya_is_mortgage_eligible INTEGER,
+                laya_mortgage_confidence REAL,
+                laya_has_low_expenses INTEGER,
+                laya_expenses_confidence REAL,
+                laya_shows_urgency INTEGER,
+                laya_urgency_confidence REAL,
+                laya_environment_noise TEXT,
+                laya_noise_confidence REAL,
+                laya_property_condition TEXT,
+                laya_condition_confidence REAL
             )
             """
         )
@@ -241,6 +256,26 @@ def init() -> None:
             conn.execute("ALTER TABLE listings ADD COLUMN quality_label TEXT")
         if "details_scraped" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN details_scraped INTEGER DEFAULT 0")
+        # Laya columns migration (add if missing)
+        laya_cols = {
+            "laya_quality_score": "REAL",
+            "laya_quality_confidence": "REAL",
+            "laya_is_owner_direct": "INTEGER",
+            "laya_owner_confidence": "REAL",
+            "laya_is_mortgage_eligible": "INTEGER",
+            "laya_mortgage_confidence": "REAL",
+            "laya_has_low_expenses": "INTEGER",
+            "laya_expenses_confidence": "REAL",
+            "laya_shows_urgency": "INTEGER",
+            "laya_urgency_confidence": "REAL",
+            "laya_environment_noise": "TEXT",
+            "laya_noise_confidence": "REAL",
+            "laya_property_condition": "TEXT",
+            "laya_condition_confidence": "REAL",
+        }
+        for col, ctype in laya_cols.items():
+            if col not in cols:
+                conn.execute(f"ALTER TABLE listings ADD COLUMN {col} {ctype}")
         _ensure_listing_query_columns(conn)
         pin_cols = {row[1] for row in conn.execute("PRAGMA table_info(pins)").fetchall()}
         if "contacted" not in pin_cols:
@@ -570,7 +605,14 @@ INSERT OR REPLACE INTO listings (
     description, published_at, price_m2, score, deal_label, vs_barrio_pct,
     fingerprint, extra_json, scraped_at, has_exact_location, city,
     quality_score, quality_label, details_scraped,
-    needs_llm, is_hidden, llm_ready, llm_ver, llm_partial, llm_await, llm_fix
+    needs_llm, is_hidden, llm_ready, llm_ver, llm_partial, llm_await, llm_fix,
+    laya_quality_score, laya_quality_confidence,
+    laya_is_owner_direct, laya_owner_confidence,
+    laya_is_mortgage_eligible, laya_mortgage_confidence,
+    laya_has_low_expenses, laya_expenses_confidence,
+    laya_shows_urgency, laya_urgency_confidence,
+    laya_environment_noise, laya_noise_confidence,
+    laya_property_condition, laya_condition_confidence
 ) VALUES (
     :id, :source, :source_id, :url, :title, :property_type, :price, :currency,
     :price_usd, :address, :barrio, :zona, :lat, :lon, :covered_m2, :total_m2,
@@ -578,7 +620,14 @@ INSERT OR REPLACE INTO listings (
     :description, :published_at, :price_m2, :score, :deal_label, :vs_barrio_pct,
     :fingerprint, :extra_json, :scraped_at, :has_exact_location, :city,
     :quality_score, :quality_label, :details_scraped,
-    :needs_llm, :is_hidden, :llm_ready, :llm_ver, :llm_partial, :llm_await, :llm_fix
+    :needs_llm, :is_hidden, :llm_ready, :llm_ver, :llm_partial, :llm_await, :llm_fix,
+    :laya_quality_score, :laya_quality_confidence,
+    :laya_is_owner_direct, :laya_owner_confidence,
+    :laya_is_mortgage_eligible, :laya_mortgage_confidence,
+    :laya_has_low_expenses, :laya_expenses_confidence,
+    :laya_shows_urgency, :laya_urgency_confidence,
+    :laya_environment_noise, :laya_noise_confidence,
+    :laya_property_condition, :laya_condition_confidence
 )
 """
 
@@ -593,6 +642,12 @@ def _rows_by_ids(conn: sqlite3.Connection, ids: list[str]) -> dict[str, sqlite3.
         for row in conn.execute(f"SELECT * FROM listings WHERE id IN ({marks})", chunk):
             out[row["id"]] = row
     return out
+
+
+def _tri(value: bool | None) -> int | None:
+    if value is None:
+        return None
+    return 1 if value else 0
 
 
 def _upsert_params(item: Listing, now: str) -> dict:
@@ -636,6 +691,20 @@ def _upsert_params(item: Listing, now: str) -> dict:
         "has_exact_location": 1 if item.has_exact_location else 0,
         "details_scraped": 1 if item.details_scraped else 0,
         **flags,
+        "laya_quality_score": item.laya_quality_score,
+        "laya_quality_confidence": item.laya_quality_confidence,
+        "laya_is_owner_direct": _tri(item.laya_is_owner_direct),
+        "laya_owner_confidence": item.laya_owner_confidence,
+        "laya_is_mortgage_eligible": _tri(item.laya_is_mortgage_eligible),
+        "laya_mortgage_confidence": item.laya_mortgage_confidence,
+        "laya_has_low_expenses": _tri(item.laya_has_low_expenses),
+        "laya_expenses_confidence": item.laya_expenses_confidence,
+        "laya_shows_urgency": _tri(item.laya_shows_urgency),
+        "laya_urgency_confidence": item.laya_urgency_confidence,
+        "laya_environment_noise": item.laya_environment_noise or "",
+        "laya_noise_confidence": item.laya_noise_confidence,
+        "laya_property_condition": item.laya_property_condition or "",
+        "laya_condition_confidence": item.laya_condition_confidence,
     }
 
 
@@ -729,6 +798,21 @@ def _listing_from_row(row: sqlite3.Row, pin, *, map_row: bool = False) -> Listin
         quality_score=row["quality_score"] if "quality_score" in row.keys() else None,
         quality_label=(row["quality_label"] if "quality_label" in row.keys() else "") or "",
         details_scraped=bool(row["details_scraped"] if "details_scraped" in row.keys() else 0),
+        # Laya fields (read from DB columns if present, else None)
+        laya_quality_score=row["laya_quality_score"] if "laya_quality_score" in row.keys() else None,
+        laya_quality_confidence=row["laya_quality_confidence"] if "laya_quality_confidence" in row.keys() else None,
+        laya_is_owner_direct=bool(row["laya_is_owner_direct"]) if "laya_is_owner_direct" in row.keys() and row["laya_is_owner_direct"] is not None else None,
+        laya_owner_confidence=row["laya_owner_confidence"] if "laya_owner_confidence" in row.keys() else None,
+        laya_is_mortgage_eligible=bool(row["laya_is_mortgage_eligible"]) if "laya_is_mortgage_eligible" in row.keys() and row["laya_is_mortgage_eligible"] is not None else None,
+        laya_mortgage_confidence=row["laya_mortgage_confidence"] if "laya_mortgage_confidence" in row.keys() else None,
+        laya_has_low_expenses=bool(row["laya_has_low_expenses"]) if "laya_has_low_expenses" in row.keys() and row["laya_has_low_expenses"] is not None else None,
+        laya_expenses_confidence=row["laya_expenses_confidence"] if "laya_expenses_confidence" in row.keys() else None,
+        laya_shows_urgency=bool(row["laya_shows_urgency"]) if "laya_shows_urgency" in row.keys() and row["laya_shows_urgency"] is not None else None,
+        laya_urgency_confidence=row["laya_urgency_confidence"] if "laya_urgency_confidence" in row.keys() else None,
+        laya_environment_noise=row["laya_environment_noise"] if "laya_environment_noise" in row.keys() and row["laya_environment_noise"] else "",
+        laya_noise_confidence=row["laya_noise_confidence"] if "laya_noise_confidence" in row.keys() else None,
+        laya_property_condition=row["laya_property_condition"] if "laya_property_condition" in row.keys() and row["laya_property_condition"] else "",
+        laya_condition_confidence=row["laya_condition_confidence"] if "laya_condition_confidence" in row.keys() else None,
         favorite=bool(pin["favorite"] if pin else 0),
         notes=(pin["notes"] if pin else "") or "",
         contacted=bool(
@@ -985,6 +1069,26 @@ def fetch_copy_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
         LIMIT ?
     """
     return _fetch_backlog_rows(sql, (int(LIST_TEXT_MIN), int(COPY_SCHEMA), prefer, n))
+
+
+def fetch_signals_backlog(limit: int, prefer_city: str = "", ver: str = "2") -> list[Listing]:
+    """Avisos sin la pasada actual de etiquetas (cochera, terraza, tipo, etc.)."""
+    n = max(1, min(120, int(limit or 1)))
+    prefer = (prefer_city or "").strip()
+    stamp = str(ver or "")
+    sql = """
+        SELECT * FROM listings
+        WHERE is_hidden = 0
+          AND IFNULL(json_extract(extra_json, '$.duplicate_of'), '') = ''
+          AND IFNULL(json_extract(extra_json, '$.dedupe_hidden'), 0) = 0
+          AND IFNULL(json_extract(extra_json, '$.signals_ver'), '') != ?
+        ORDER BY
+          CASE WHEN property_type = 'terreno' THEN 0 ELSE 1 END,
+          CASE WHEN city = ? THEN 0 ELSE 1 END,
+          scraped_at DESC
+        LIMIT ?
+    """
+    return _fetch_backlog_rows(sql, (stamp, prefer, n))
 
 
 def _fetch_backlog_rows(sql: str, params: tuple) -> list[Listing]:

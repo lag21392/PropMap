@@ -311,6 +311,84 @@ def test_place_from_suggestion_rejects_cache_artifact():
         )
 
 
+def test_loaded_city_is_not_forgotten_when_lookup_fails(monkeypatch):
+    from app.places import _should_forget_unofficial
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    monkeypatch.setattr("app.places.official_place", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.places.search_city_places", lambda *_a, **_k: [])
+    city = {"id": "cordoba", "label": "Córdoba", "province": "cordoba", "lat": -31.4, "lon": -64.18}
+    barrio = {"id": "paraje-x", "label": "Paraje X", "categoria": "paraje", "lat": -31.4, "lon": -64.18}
+    assert _should_forget_unofficial("cordoba", city, {"cordoba": 40}) is False
+    assert _should_forget_unofficial("cordoba", city, {"cordoba": 2}) is True
+    assert _should_forget_unofficial("paraje-x", barrio, {"paraje-x": 40}) is True
+
+
+def test_barrio_with_listings_is_forgotten_when_georef_says_so(monkeypatch):
+    from app.places import _should_forget_unofficial
+
+    monkeypatch.setenv("PROPMAP_TEST", "0")
+    monkeypatch.setattr(
+        "app.places.search_city_places",
+        lambda *_a, **_k: [
+            {
+                "name": "Florida",
+                "kind": "localidad",
+                "province": "Buenos Aires",
+                "lat": -34.53,
+                "lon": -58.49,
+                "municipio": "Vicente López",
+                "localidad_censal": "Vicente López",
+            }
+        ],
+    )
+    florida = {"id": "florida", "label": "Florida", "province": "buenos-aires", "lat": -34.53, "lon": -58.49}
+    assert _should_forget_unofficial("florida", florida, {"florida": 27}) is True
+
+
+def test_restore_hit_uses_georef_near_the_listings(monkeypatch):
+    from app.places import _restore_hit
+
+    def search(query, limit=6):
+        if "villa" in query:
+            return [
+                {
+                    "name": "Villa del Parque",
+                    "kind": "localidad",
+                    "province": "Ciudad Autónoma de Buenos Aires",
+                    "lat": -34.61,
+                    "lon": -58.49,
+                    "municipio": "Comuna 11",
+                    "localidad_censal": "Ciudad Autónoma de Buenos Aires",
+                },
+                {
+                    "name": "Villa del Parque",
+                    "kind": "localidad",
+                    "province": "Río Negro",
+                    "lat": -39.1,
+                    "lon": -66.1,
+                    "municipio": "Chichinales",
+                    "localidad_censal": "Villa del Parque",
+                },
+            ]
+        return [
+            {
+                "name": "Córdoba",
+                "kind": "localidad",
+                "province": "Córdoba",
+                "lat": -31.42,
+                "lon": -64.18,
+                "municipio": "Córdoba",
+                "localidad_censal": "Córdoba",
+            }
+        ]
+
+    monkeypatch.setattr("app.places.search_city_places", search)
+    cordoba = _restore_hit("cordoba", lat=-31.4, lon=-64.2)
+    assert cordoba and cordoba["label"] == "Córdoba"
+    assert _restore_hit("villa-del-parque", lat=-34.60, lon=-58.49) is None
+
+
 def test_official_place_requires_real_name():
     from app.places import is_cache_artifact_id, official_place
 

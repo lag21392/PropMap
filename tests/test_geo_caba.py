@@ -194,6 +194,33 @@ def test_listing_count_for_catalog_skips_tiny_places():
     assert listing_count_for_catalog(80) is True
 
 
+def test_listed_cities_shows_a_loaded_city_that_nobody_searched(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, register_city
+    from app.places import forget_place, listed_cities, reset_listed_places
+
+    reset_listed_places()
+    register_city(
+        "rosario",
+        label="Rosario",
+        lat=-32.95,
+        lon=-60.64,
+        province="santa-fe",
+        builtin=False,
+    )
+    monkeypatch.setattr("app.places._ids_with_saved_listings", lambda: {"rosario"})
+    try:
+        ids = {row["id"] for row in listed_cities([])}
+        assert "rosario" in ids
+        assert "caba" in ids
+    finally:
+        forget_place("rosario")
+        CITIES.pop("rosario", None)
+        for token, owner in list(CITY_ALIASES.items()):
+            if owner == "rosario" or token == "rosario":
+                CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
+
 def test_listed_cities_includes_places_that_have_listings(monkeypatch):
     from app.places import reset_listed_places
     from app.schedule import reset

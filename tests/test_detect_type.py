@@ -22,6 +22,21 @@ def test_lote_with_proyecto_de_casa_is_terreno():
     assert detect_type(text, "casa") == "terreno"
 
 
+def test_lote_con_casa_is_not_vacant_land():
+    text = "Lote con casa de 3 dormitorios en El Doradillo. Vivienda existente, lista para habitar."
+    assert detect_type(text, "terreno") == "casa"
+
+
+def test_terreno_con_duplex_is_ph():
+    text = "Terreno con dúplex a terminar. Living comedor y dos dormitorios."
+    assert detect_type(text, "terreno") == "ph"
+
+
+def test_ideal_para_construir_casa_stays_terreno():
+    text = "Lote en venta. Ideal para construir una casa. Todos los servicios."
+    assert detect_type(text, "casa") == "terreno"
+
+
 def test_portal_exact_beats_street_name_without_number():
     STREETS.append(("llao llao", -42.77855, -65.02582, "Villa del Parque"))
     try:

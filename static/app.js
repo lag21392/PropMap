@@ -119,6 +119,65 @@ function listingsWaitHtml(copy) {
   </div>`;
 }
 
+function clearLoadedListings() {
+  viewSeq += 1;
+  allListings = [];
+  listWindowItems = [];
+  listWinRange = "";
+  lastListingsFp = "";
+  listingsRev = 0;
+  selectedId = null;
+  mapPaintGen += 1;
+  exactCluster.clearLayers();
+  zoneLayer.clearLayers();
+  markersById = {};
+  zoneMarkersByKey = {};
+  stackMarkers = [];
+  if (approxBox) {
+    map.removeLayer(approxBox);
+    approxBox = null;
+  }
+  map.closePopup();
+  poiLayer.clearLayers();
+  const pane = $("detailPane");
+  if (pane) {
+    pane.classList.add("is-empty");
+    pane.innerHTML = `<p class="muted">Elegí un aviso en la lista o en el mapa para ver la ficha.</p>`;
+  }
+  showListingsWait("city");
+}
+
+function forgetCityWithoutListings(cityId) {
+  const rows = (window.lastCities || []).filter((c) => String(c.id) !== String(cityId));
+  window.lastCities = rows;
+  window.knownCities = rows;
+  const select = $("cityFilter");
+  if (select) {
+    [...select.options].filter((o) => o.value === cityId).forEach((o) => o.remove());
+  }
+  if (!rows.length) {
+    if (select) select.innerHTML = "";
+    localStorage.removeItem("propmap.city");
+    showListingsWait("city");
+    if ($("statusLine")) $("statusLine").textContent = "No hay ciudades con avisos.";
+    return;
+  }
+  fillCities(rows, { source: "catalog" });
+  const next = select?.value;
+  if (!next || next === cityId) return;
+  localStorage.setItem("propmap.city", next);
+  if ($("placeQuery")) {
+    const opt = select.selectedOptions[0];
+    $("placeQuery").value = opt ? opt.textContent : "";
+  }
+  pickedPlace = placeFromCityFilter();
+  rememberCityView(pickedPlace);
+  focusedCity = next;
+  focusCity(next);
+  clearLoadedListings();
+  load({ waitKind: "city" });
+}
+
 function showListingsWait(kind) {
   listingsReady = false;
   const copy = waitCopy(kind);
@@ -330,6 +389,14 @@ async function load(opts = {}) {
     }
     hideListingsWait();
     return;
+  }
+  if (!data.warming && data.layer !== "pins" && !(data.listings || []).length) {
+    const row = (data.cities || []).find((c) => c.id === city);
+    const n = Number(row?.n);
+    if (!Number.isFinite(n) || n < 8) {
+      forgetCityWithoutListings(city);
+      return;
+    }
   }
   applyListingsPayload(data, city, seq, { keepStatus: opts.keepStatus, live: opts.live });
 }
@@ -575,10 +642,8 @@ function cityReadyForCatalog(c) {
   const id = String(c.id);
   if (id.endsWith("-pins") || id.includes("-pins-") || id.includes(".pins")) return false;
   if (!isLocatableCity(c)) return false;
-  if (id === "caba") return true;
   const n = Number(c.n);
-  if (Number.isFinite(n)) return n >= 8;
-  return true;
+  return Number.isFinite(n) && n >= 8;
 }
 
 function fillCities(cities, opts = {}) {
@@ -591,23 +656,27 @@ function fillCities(cities, opts = {}) {
   const previous = window.lastCities || window.knownCities || [];
   const incoming = cities || [];
   const source = opts.source || "listings";
-  const take = (c, { keep = false } = {}) => {
+  const take = (c) => {
     if (!c || !c.id) return;
     const id = String(c.id);
     if (id.endsWith("-pins") || id.includes("-pins-") || id.includes(".pins")) return;
     const label = String(c.label || "").toLowerCase().trim();
     if (label.startsWith("barrio ") || label.startsWith("departamento ")) return;
-    if (!keep && !cityReadyForCatalog(c)) return;
-    byId.set(id, { ...(byId.get(id) || {}), ...c });
+    const merged = { ...(byId.get(id) || {}), ...c };
+    if (!cityReadyForCatalog(merged)) {
+      byId.delete(id);
+      return;
+    }
+    byId.set(id, merged);
   };
   if (source === "catalog" && incoming.length) {
     incoming.forEach((c) => take(c));
   } else if (!previous.length) {
     incoming.forEach((c) => take(c));
   } else {
-    previous.forEach((c) => take(c, { keep: true }));
+    previous.forEach((c) => take(c));
     incoming.forEach((c) => {
-      if (byId.has(String(c.id))) take(c, { keep: true });
+      if (byId.has(String(c.id)) || !cityReadyForCatalog(c)) take(c);
     });
   }
   if (
@@ -626,7 +695,11 @@ function fillCities(cities, opts = {}) {
   });
   window.knownCities = rows;
   window.lastCities = rows;
-  if (!rows.length) return;
+  if (!rows.length) {
+    select.innerHTML = "";
+    if (manual) manual.innerHTML = "";
+    return;
+  }
   const options = rows.map((c) => `<option value="${c.id}">${placeCaption(c)}</option>`).join("");
   select.innerHTML = options;
   if (manual) manual.innerHTML = options;
@@ -670,17 +743,80 @@ function fillBarrios() {
   const fromKnown = (window.placeBarrios && window.placeBarrios[city]) || [];
   const names = [...new Set([...fromItems, ...fromKnown])].sort((a, b) => a.localeCompare(b, "es"));
   select.innerHTML = `<option value="">Todos</option>` + names.map((n) => `<option>${escapeHtml(n)}</option>`).join("");
-  select.value = names.includes(current) ? current : "";
+  let next = names.includes(current) ? current : "";
+  if (landingBarrio && names.includes(landingBarrio)) {
+    next = landingBarrio;
+    landingBarrio = "";
+  }
+  select.value = next;
 }
 
 function ambientesOf(item) {
-  const rooms = Number(item?.rooms);
-  if (Number.isFinite(rooms) && rooms > 0) return rooms;
   const type = item?.property_type || "";
   if (type === "terreno" || type === "local" || type === "oficina" || type === "galpon") return null;
+  const rooms = Number(item?.rooms);
+  if (Number.isFinite(rooms) && rooms > 0) return rooms;
   const beds = Number(item?.bedrooms);
   if (Number.isFinite(beds) && beds > 0) return beds + 1;
   return null;
+}
+
+function bedroomsOf(item) {
+  const type = item?.property_type || "";
+  if (type === "terreno" || type === "local" || type === "oficina" || type === "galpon") return null;
+  const beds = Number(item?.bedrooms);
+  if (Number.isFinite(beds) && beds >= 0) return beds;
+  const rooms = Number(item?.rooms);
+  if (Number.isFinite(rooms) && rooms > 0) return Math.max(0, rooms - 1);
+  return null;
+}
+
+function bathroomsOf(item) {
+  if ((item?.property_type || "") === "terreno") return null;
+  const baths = Number(item?.bathrooms);
+  return Number.isFinite(baths) && baths >= 0 ? baths : null;
+}
+
+function listingM2(item) {
+  if (!item) return 0;
+  const lot = Number(item.lot_m2 || item.total_m2 || 0) || 0;
+  const covered = Number(item.covered_m2 || 0) || 0;
+  if (item.property_type === "terreno") return lot || covered;
+  return covered || lot;
+}
+
+function minChosen(id) {
+  const raw = $(id)?.value;
+  if (raw == null || raw === "") return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function passesSize(item) {
+  const minM2 = minChosen("minM2");
+  const maxM2 = minChosen("maxM2");
+  if (minM2 || maxM2) {
+    const m2 = listingM2(item);
+    if (!m2) return false;
+    if (minM2 && m2 < minM2) return false;
+    if (maxM2 && m2 > maxM2) return false;
+  }
+  if ($("typeFilter")?.value === "terreno") return true;
+  const minBeds = minChosen("minBeds");
+  const minRooms = minChosen("minRooms");
+  const minBaths = minChosen("minBaths");
+  if (minBeds && !(bedroomsOf(item) >= minBeds)) return false;
+  if (minRooms && !(ambientesOf(item) >= minRooms)) return false;
+  if (minBaths && !(bathroomsOf(item) >= minBaths)) return false;
+  return true;
+}
+
+function syncRoomFilters() {
+  const lot = $("typeFilter")?.value === "terreno";
+  ["minBeds", "minRooms", "minBaths"].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = lot;
+  });
 }
 
 function cityDealScore(item) {
@@ -702,6 +838,10 @@ function filtered() {
   const max = Number($("maxPrice").value || 0);
   const minDeal = Number($("dealBar")?.value || 0);
   const favs = $("favOnly").checked;
+  const traits = new Set(
+    Array.from(document.querySelectorAll('input[name="listingTrait"]:checked')).map((el) => el.value)
+  );
+
   return allListings.filter((item) => {
     if (city && !belongsToCity(item, city)) return false;
     if (type && item.property_type !== type) return false;
@@ -711,6 +851,20 @@ function filtered() {
     if (minDeal > 0 && cityDealScore(item) < minDeal) return false;
     if (minDeal >= 40 && item.is_outlier) return false;
     if (favs && !item.favorite) return false;
+    if (traits.has("credit") && item.mortgage_credit !== true) return false;
+    if (traits.has("owner") && item.owner_direct !== true) return false;
+    if (traits.has("expenses") && item.low_expenses !== true) return false;
+    if (traits.has("urgent") && item.urgent_sale !== true) return false;
+    if (traits.has("quiet") && item.environment !== "quiet") return false;
+    if (traits.has("good") && !isGoodCondition(item)) return false;
+    if (traits.has("balcony") && item.has_balcony !== true) return false;
+    if (traits.has("bright") && item.bright !== true) return false;
+    if (traits.has("growing") && item.growing_area !== true) return false;
+    if (traits.has("view") && item.open_view !== true) return false;
+    if (traits.has("patio") && item.has_patio !== true) return false;
+    if (traits.has("garage") && item.has_garage !== true) return false;
+    if (traits.has("terrace") && item.has_terrace !== true) return false;
+    if (!passesSize(item)) return false;
     return true;
   });
 }
@@ -850,6 +1004,7 @@ function applyNearToProfile(item, data) {
   if (!item || !data) return;
   if (!item.profile) item.profile = { axes: {} };
   if (!item.profile.axes) item.profile.axes = {};
+  if (item.property_type === "terreno") item.profile.order = ["price_m2", "zona", "servicios"];
   if (!item.access) item.access = {};
   if (data.walk_km) item.access.walk_km = data.walk_km;
   const score = data.pending ? null : data.score;
@@ -869,14 +1024,14 @@ function redrawPentagon(item) {
   const card = document.querySelector(".ficha-bundle > .radar-card");
   if (card) {
     const wrap = document.createElement("div");
-    wrap.innerHTML = pentagonChart(item.profile);
+    wrap.innerHTML = pentagonChart(item.profile, { kind: item.property_type });
     const next = wrap.firstElementChild;
     if (next) card.replaceWith(next);
   }
   const mini = document.querySelector(`#card-${cssId(item.id)} .radar-card`);
   if (mini) {
     const wrap = document.createElement("div");
-    wrap.innerHTML = pentagonChart(item.profile, { mini: true });
+    wrap.innerHTML = pentagonChart(item.profile, { mini: true, kind: item.property_type });
     const next = wrap.firstElementChild;
     if (next) mini.replaceWith(next);
   }
@@ -1072,15 +1227,12 @@ function openPickPopup(latlng, items, title) {
 function sorted(items) {
   const key = $("sortBy")?.value || "deal";
   const copy = items.slice();
-  const usefulM2 = (x) => (x.property_type === "terreno"
-    ? (x.lot_m2 || x.total_m2 || x.covered_m2 || 0)
-    : (x.covered_m2 || x.total_m2 || 0));
   copy.sort((a, b) => {
     if (a.favorite !== b.favorite) return a.favorite ? -1 : 1;
     let cmp = 0;
     if (key === "price-asc") cmp = (a.price_usd || 1e15) - (b.price_usd || 1e15);
     else if (key === "price-desc") cmp = (b.price_usd || 0) - (a.price_usd || 0);
-    else if (key === "m2") cmp = usefulM2(b) - usefulM2(a);
+    else if (key === "m2") cmp = listingM2(b) - listingM2(a);
     else if (key === "m2price") cmp = (a.price_m2 || 1e15) - (b.price_m2 || 1e15);
     else if (key === "type") cmp = typeLabel(a).localeCompare(typeLabel(b), "es");
     else if (key === "barrio") cmp = (a.barrio || "").localeCompare(b.barrio || "", "es");
@@ -1114,7 +1266,7 @@ function ensureListVirtual() {
 function paintListWindow(force = false) {
   const list = $("list");
   const items = listWindowItems;
-  if (!list || !items.length) return;
+  if (!listingsReady || !list || !items.length) return;
   const h = listCardHeight(list);
   const view = list.clientHeight || 640;
   const start = Math.max(0, Math.floor(list.scrollTop / h) - 6);
@@ -1380,10 +1532,53 @@ function locationLine(item) {
   return parts.join(" · ") || locationKindLabel(item);
 }
 
+function isGoodCondition(item) {
+  const cond = String(item.condition || "").trim().toLowerCase();
+  return cond === "a estrenar" || cond === "reciclado";
+}
+
+function listingKindFlags(item) {
+  const flags = [];
+  if (item.mortgage_credit === true) flags.push(["credit", "Apto crédito"]);
+  if (item.owner_direct === true) flags.push(["owner", "Dueño directo"]);
+  if (item.urgent_sale === true) flags.push(["urgent", "Venta urgente"]);
+  if (item.has_balcony === true) flags.push(["", "Balcón"]);
+  if (item.bright === true) flags.push(["", "Luminoso"]);
+  if (item.growing_area === true) flags.push(["", "En crecimiento"]);
+  if (item.open_view === true) flags.push(["", "Vista abierta"]);
+  if (item.has_patio === true) flags.push(["", "Patio"]);
+  if (item.has_garage === true) flags.push(["", "Cochera"]);
+  if (item.has_terrace === true) flags.push(["", "Terraza"]);
+  if (isLocationMissing(item)) flags.push(["lost", "Sin ubicación"]);
+  else if (isExactPin(item)) flags.push(["real", "Ubicación real"]);
+  return flags;
+}
+
+function listingTraits(item) {
+  const out = [];
+  if (item.mortgage_credit === true) out.push("apto crédito");
+  if (item.owner_direct === true) out.push("dueño directo");
+  if (item.low_expenses === true) out.push("expensas bajas");
+  if (item.urgent_sale === true) out.push("venta urgente");
+  if (item.environment === "quiet") out.push("tranquilo");
+  if (item.has_balcony === true) out.push("balcón");
+  if (item.bright === true) out.push("luminoso");
+  if (item.growing_area === true) out.push("en crecimiento");
+  if (item.open_view === true) out.push("vista abierta");
+  if (item.has_patio === true) out.push("patio");
+  if (item.has_garage === true) out.push("cochera");
+  if (item.has_terrace === true) out.push("terraza");
+  const cond = String(item.condition || "").trim().toLowerCase();
+  if (cond === "a estrenar" || cond === "reciclado" || cond === "en pozo" || cond === "a reciclar") {
+    out.push(cond);
+  }
+  return out;
+}
+
 function listingTags(item) {
   const seen = new Set();
   const out = [];
-  for (const raw of [...(item.place_tags || []), ...(item.tags || []), ...(item.amenities || [])]) {
+  for (const raw of [...listingTraits(item), ...(item.place_tags || []), ...(item.tags || []), ...(item.amenities || [])]) {
     const tag = String(raw || "").trim();
     const key = tag.toLowerCase();
     if (!tag || seen.has(key)) continue;
@@ -1434,12 +1629,23 @@ function rentEstimate(item) {
   </div>`;
 }
 
+const CHART_AXES = ["price_m2", "zona", "ambientes", "alquiler", "servicios"];
+const LOT_AXES = ["price_m2", "zona", "servicios"];
+const CHART_LABELS = {
+  price_m2: "USD/m²", zona: "Zona", ambientes: "Ambientes", alquiler: "Alquiler", servicios: "POIs cercanos",
+};
+
+function chartOrder(profile) {
+  const order = profile?.order;
+  if (Array.isArray(order) && order.length >= 3) return order;
+  return CHART_AXES;
+}
+
 function stampProfile(profile) {
   if (!profile) return profile;
-  const order = ["price_m2", "zona", "ambientes", "alquiler", "servicios"];
-  profile.labels = {
-    price_m2: "USD/m²", zona: "Zona", ambientes: "Ambientes", alquiler: "Alquiler", servicios: "POIs cercanos",
-  };
+  const order = chartOrder(profile);
+  profile.order = order.slice();
+  profile.labels = Object.fromEntries(order.map((key) => [key, CHART_LABELS[key] || key]));
   const scores = [];
   const pending = [];
   order.forEach((key) => {
@@ -1463,20 +1669,22 @@ function stampProfile(profile) {
   return profile;
 }
 
-function pentagonChart(profile, { mini = false } = {}) {
+function pentagonChart(profile, { mini = false, kind = "" } = {}) {
   profile = profile && typeof profile === "object" ? profile : {};
   if (!profile.axes) profile.axes = {};
+  if (kind === "terreno") profile.order = LOT_AXES.slice();
+  else if (kind) profile.order = CHART_AXES.slice();
   stampProfile(profile);
-  const order = ["price_m2", "zona", "ambientes", "alquiler", "servicios"];
-  const labels = profile.labels || {
-    price_m2: "USD/m²", zona: "Zona", ambientes: "Ambientes", alquiler: "Alquiler", servicios: "POIs cercanos",
-  };
-  const w = mini ? 84 : 280;
-  const h = mini ? 84 : 268;
+  const order = chartOrder(profile);
+  const labels = profile.labels || CHART_LABELS;
+  const n = order.length;
+  const w = mini ? 84 : (n === 3 ? 320 : 280);
+  const h = mini ? 84 : (n === 3 ? 248 : 268);
   const cx = w / 2;
-  const cy = mini ? h / 2 : 128;
-  const r = mini ? 30 : 78;
-  const angle = (i) => -Math.PI / 2 + (i * 2 * Math.PI) / 5;
+  const cy = mini ? h / 2 : (n === 3 ? 112 : 128);
+  const r = mini ? 30 : (n === 3 ? 70 : 78);
+  const labelR = n === 3 ? r + 24 : r + 28;
+  const angle = (i) => -Math.PI / 2 + (i * 2 * Math.PI) / n;
   const xy = (i, rr) => [cx + Math.cos(angle(i)) * rr, cy + Math.sin(angle(i)) * rr];
   const ring = (frac) => order.map((_, i) => xy(i, r * frac).map((n) => n.toFixed(1)).join(",")).join(" ");
   const valuePts = [];
@@ -1497,7 +1705,7 @@ function pentagonChart(profile, { mini = false } = {}) {
       dots.push(`<circle class="radar-miss" cx="${ex.toFixed(1)}" cy="${ey.toFixed(1)}" r="3" />`);
     }
     if (!mini) {
-      const [lx, ly] = xy(i, r + 28);
+      const [lx, ly] = xy(i, labelR);
       const muted = missing || axis.confidence === "none" ? " is-missing" : "";
       const anchor = Math.abs(lx - cx) < 14 ? "middle" : (lx < cx ? "end" : "start");
       const words = String(labels[key] || key).split(/\s+/);
@@ -1541,7 +1749,7 @@ function pentagonChart(profile, { mini = false } = {}) {
   return `<div class="radar-card${mini ? " is-mini" : ""}">
     ${mini ? "" : `<h4>Perfil del aviso</h4><p class="muted">${escapeHtml(pin)}</p>`}
     <div class="radar-plot">
-    <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Pentágono de scores, total ${totalLabel}">
+    <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${n === 3 ? "Triángulo" : "Pentágono"} de scores, total ${totalLabel}">
       <polygon class="radar-grid" points="${ring(1)}" />
       <polygon class="radar-grid" points="${ring(0.7)}" />
       <polygon class="radar-grid" points="${ring(0.4)}" />
@@ -1604,9 +1812,9 @@ function sizeBits(item) {
   return bits;
 }
 function cardHtml(item) {
-  const img = listingImage(item.image);
+  const img = listingImage(item.image, "thumb");
   const thumb = img
-    ? `<img src="${img}" alt="" width="86" height="74" loading="lazy" decoding="async" />`
+    ? `<img src="${img}" alt="${escapeHtml(item.title || "Aviso en venta")}" width="86" height="74" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`
     : `<span class="card-ph" aria-hidden="true"></span>`;
   const kind = typeLabel(item);
   const bits = sizeBits(item);
@@ -1623,14 +1831,14 @@ function cardHtml(item) {
     <div>
       <div class="card-top">
         <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
+        <div class="price">${money(item)}</div>
         <button class="fav-btn" type="button" data-fav="${item.id}" title="Favorito">${item.favorite ? "\u2605" : "\u2606"}</button>
       </div>
-      <div class="price">${money(item)}</div>
       <div class="headline">${escapeHtml(bits.join(" · ") || item.title || "")}</div>
-      <div class="meta">${escapeHtml(place)}${escapeHtml(crossing)}${escapeHtml(between)} · ${escapeHtml(sourceSummary(item))}${locBit}${item.mortgage_credit === true ? " · apto crédito" : ""}${item.contacted ? " · contactado" : ""}</div>
+      <div class="meta">${escapeHtml(place)}${escapeHtml(crossing)}${escapeHtml(between)} · ${escapeHtml(sourceSummary(item))}${locBit}${item.mortgage_credit === true ? " · apto crédito" : ""}${item.owner_direct === true ? " · dueño" : ""}${item.contacted ? " · contactado" : ""}</div>
       <span class="tag ${cssId(item.deal_label || "")}">${escapeHtml(item.deal_label || "")}${item.vs_barrio_pct != null ? ` · ${item.vs_barrio_pct > 0 ? "-" : "+"}${Math.abs(item.vs_barrio_pct)}% vs barrio` : ""}</span>
       ${rentStrip(item)}
-      ${pentagonChart(item.profile, { mini: true })}
+      ${pentagonChart(item.profile, { mini: true, kind: item.property_type })}
       ${item.quality_label ? `<span class="tag quality">${escapeHtml(item.quality_label)} · ${fmt(item.quality_score)}</span>` : ""}
       ${chips ? `<div class="chips">${chips}</div>` : ""}
     </div>
@@ -1863,13 +2071,23 @@ function showDetail(item) {
     ["Ambientes", ambientesOf(item) ?? "—"],
     ["Dormitorios", item.bedrooms ?? "—"],
     ["Baños", item.bathrooms ?? "—"],
-    ["Cochera", item.parking ? "Sí" : "—"],
     ["Antigüedad", item.age_years != null ? `${item.age_years} años` : "—"],
     ["Expensas", item.expenses ? `USD ${fmt(item.expenses)}` : "—"],
     ["USD/m²", item.price_m2 ? `USD ${fmt(item.price_m2)}` : "—"],
     ["Score ganga", cityDealScore(item) ? fmt(cityDealScore(item)) : "—"],
     ["Calidad", item.quality_score != null ? `${fmt(item.quality_score)} · ${item.quality_label || ""}` : "—"],
-    ["Apto crédito", item.mortgage_credit === true ? "Sí" : item.mortgage_credit === false ? "No dice" : "—"],
+    ["Apto crédito", item.mortgage_credit === true ? "Sí" : item.mortgage_credit === false ? "No" : "—"],
+    ["Dueño directo", item.owner_direct === true ? "Sí" : "—"],
+    ["Expensas bajas", item.low_expenses === true ? "Sí" : "—"],
+    ["Venta urgente", item.urgent_sale === true ? "Sí" : "—"],
+    ["Entorno", item.environment === "quiet" ? "Tranquilo (lo dice el aviso)" : "—"],
+    ["Balcón", item.has_balcony === true ? "Sí" : "—"],
+    ["Luminoso", item.bright === true ? "Sí" : "—"],
+    ["Barrio en crecimiento", item.growing_area === true ? "Sí" : "—"],
+    ["Vista abierta", item.open_view === true ? "Sí" : "—"],
+    ["Patio", item.has_patio === true ? "Sí" : "—"],
+    ["Cochera", item.has_garage === true || item.parking ? "Sí" : "—"],
+    ["Terraza", item.has_terrace === true ? "Sí" : "—"],
     ["Piso", item.floor ?? "—"],
     ["Orientación", item.orientation || "—"],
     ["Estado", item.condition || "—"],
@@ -1877,28 +2095,41 @@ function showDetail(item) {
     ["Inmobiliaria", item.publisher || "—"],
     ["Fuente", sourceSummary(item)],
   ].filter(([k, v]) => {
-    if (["Ubicación aproximada", "Entre calles"].includes(k) && (v === "—" || !v)) return false;
+    if (item.property_type === "terreno" && ["Ambientes", "Dormitorios", "Baños"].includes(k)) return false;
+    if (["Ubicación aproximada", "Entre calles", "Dueño directo", "Expensas bajas", "Venta urgente", "Entorno", "Balcón", "Luminoso", "Barrio en crecimiento", "Vista abierta", "Patio", "Cochera", "Terraza"].includes(k) && (v === "—" || !v)) return false;
     return true;
   }).map(([k, v]) => `<div class="fact"><span>${escapeHtml(String(k))}</span><b>${escapeHtml(String(v))}</b></div>`).join("");
-  const hero = listingImage(item.image);
+  const photos = photoSet(item);
+  const hero = listingImage(photos[0], "hero");
+  const film = photos.length > 1
+    ? `<div class="detail-film">${photos.map((url, i) => {
+        const thumb = listingImage(url, "thumb");
+        const full = listingImage(url, "hero");
+        return `<button type="button" class="${i === 0 ? "is-on" : ""}" data-photo="${full}" aria-label="Foto ${i + 1}"><img src="${thumb}" alt="" width="64" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer" /></button>`;
+      }).join("")}</div>`
+    : "";
   const missingMark = isLocationMissing(item)
     ? `<p class="loc-missing">Sin dirección, intersección ni ubicación aproximada del aviso.</p>`
     : "";
+  const flags = listingKindFlags(item).map(([cls, label]) => (
+    `<span class="kind ${cls}">${escapeHtml(label)}</span>`
+  )).join("");
   pane.innerHTML = `
     <button type="button" class="ghost detail-close" id="closeDetail">cerrar</button>
-    ${hero ? `<img class="detail-hero" src="${hero}" alt="" width="640" height="160" decoding="async" />` : ""}
+    ${hero ? `<figure class="detail-photos"><img class="detail-hero" src="${hero}" alt="${escapeHtml(item.title || "Foto del aviso")}" width="640" height="420" decoding="async" referrerpolicy="no-referrer" />${film}</figure>` : ""}
     <div class="detail-head">
-      <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
-      ${item.mortgage_credit === true ? `<span class="kind credit">Apto crédito</span>` : ""}
-      ${isLocationMissing(item) ? `<span class="kind lost">Sin ubicación</span>` : isExactPin(item) ? `<span class="kind real">Ubicación real</span>` : ""}
-      <strong>${money(item)}</strong>
+      <div class="detail-kicker">
+        <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
+        <strong class="detail-price">${money(item)}</strong>
+      </div>
+      ${flags ? `<div class="detail-flags">${flags}</div>` : ""}
     </div>
     <h3>${escapeHtml(kind)} · ${escapeHtml(item.title)}</h3>
     <p class="meta">${escapeHtml(locLine)} · ${escapeHtml(sourceSummary(item))}</p>
     ${missingMark}
     ${sourceLinkHtml(item, "detail-link") || "<p class='muted'>Sin link al aviso original</p>"}
     <div class="ficha-bundle">
-      ${pentagonChart(item.profile)}
+      ${pentagonChart(item.profile, { kind: item.property_type })}
       <details class="fold ficha-fold" open>
         <summary>Ficha</summary>
         <div class="facts">${facts}</div>
@@ -1909,10 +2140,10 @@ function showDetail(item) {
         ${chips ? `<div class="chips">${chips}</div>` : ""}
       </details>
     </div>
-    <details class="fold" open>
+    ${item.property_type === "terreno" ? "" : `<details class="fold" open>
       <summary>Cuánto podría alquilar</summary>
       ${rentEstimate(item) || "<p class='muted'>Sin estimación de alquiler para este aviso.</p>"}
-    </details>
+    </details>`}
     <details class="fold near-fold">
       <summary>Cerca en el mapa</summary>
       <div id="nearBox">${nearbyHtml(item, groupNearby(item.nearby || []), isExactPin(item) && !(item.nearby || []).length)}</div>
@@ -1944,6 +2175,15 @@ function showDetail(item) {
     ` : ""}
   `;
   $("closeDetail")?.addEventListener("click", closeDetail);
+  pane.querySelectorAll(".detail-film button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const heroEl = pane.querySelector(".detail-hero");
+      if (!heroEl || !btn.dataset.photo) return;
+      heroEl.hidden = false;
+      heroEl.src = btn.dataset.photo;
+      pane.querySelectorAll(".detail-film button").forEach((el) => el.classList.toggle("is-on", el === btn));
+    });
+  });
   document.querySelector(".near-fold")?.addEventListener("toggle", () => {
     if (selectedId !== item.id) return;
     if (document.querySelector(".near-fold")?.open) fillNearby(item);
@@ -2199,23 +2439,96 @@ function escapeHtml(value) {
   return String(value || "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
 }
 
-function listingImage(url) {
-  if (!url) return "";
-  return escapeHtml(String(url).replace(/^http:\/\//i, "https://"));
+function photoSet(item) {
+  const urls = [];
+  const push = (url) => {
+    const href = String(url || "").trim();
+    if (href && !urls.includes(href)) urls.push(href);
+  };
+  push(item?.image);
+  for (const url of item?.photos || []) push(url);
+  return urls.slice(0, 4);
 }
+
+function sizedPhoto(url, role) {
+  if (!url) return "";
+  let href = String(url).trim().replace(/^http:\/\//i, "https://");
+  const thumb = role === "thumb";
+  if (/zonapropcdn\.com/i.test(href)) {
+    const size = thumb ? "360x266" : "720x532";
+    return href.replace(/\/\d{2,4}x\d{2,4}\//, `/${size}/`);
+  }
+  if (/mlstatic\.com/i.test(href)) {
+    const next = thumb ? "-I.webp" : "-O.jpg";
+    return href.replace(/-[A-Z](\.[a-z0-9]+)(?=$|\?)/i, next);
+  }
+  if (/img\.properati\.com\//i.test(href)) {
+    return properatiSize(href, thumb ? [160, 120] : [640, 480]);
+  }
+  if (/argenprop\.com/i.test(href) && !thumb) {
+    return href.replace("_u_small", "_u_medium");
+  }
+  return href;
+}
+
+function properatiSize(href, size) {
+  try {
+    const token = href.split("/").pop().split("?")[0];
+    const pad = token + "=".repeat((4 - (token.length % 4)) % 4);
+    const payload = JSON.parse(atob(pad.replace(/-/g, "+").replace(/_/g, "/")));
+    payload.edits = payload.edits || {};
+    payload.edits.resize = { width: size[0], height: size[1], fit: "cover" };
+    const encoded = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return `https://img.properati.com/${encoded}`;
+  } catch {
+    return href;
+  }
+}
+
+function listingImage(url, role) {
+  const href = sizedPhoto(url, role || "hero");
+  return href ? escapeHtml(href) : "";
+}
+
+document.addEventListener("error", (ev) => {
+  const img = ev.target;
+  if (!(img instanceof HTMLImageElement)) return;
+  if (img.classList.contains("detail-hero")) {
+    img.closest(".detail-photos")?.remove();
+    return;
+  }
+  if (img.closest(".detail-film")) {
+    img.closest("button")?.remove();
+    return;
+  }
+  if (img.closest(".card")) {
+    const ph = document.createElement("span");
+    ph.className = "card-ph";
+    ph.setAttribute("aria-hidden", "true");
+    img.replaceWith(ph);
+  }
+}, true);
 
 function cssId(value) {
   return String(value || "").replace(/[^a-z0-9]+/gi, "-");
 }
 
-["typeFilter", "zonaFilter", "barrioFilter", "maxPrice", "favOnly", "dealBar", "sortBy"].forEach((id) => {
+["typeFilter", "zonaFilter", "barrioFilter", "maxPrice", "minM2", "maxM2", "minBeds", "minRooms", "minBaths", "favOnly", "dealBar", "sortBy"].forEach((id) => {
   if (!$(id)) return;
   $(id).addEventListener("input", () => {
     render();
   });
   $(id).addEventListener("change", () => {
+    if (id === "typeFilter") syncRoomFilters();
     render();
     if (id === "typeFilter") loadMarket();
+  });
+});
+syncRoomFilters();
+
+document.querySelectorAll('input[name="listingTrait"]').forEach((el) => {
+  el.addEventListener("change", () => {
+    render();
   });
 });
 
@@ -2223,19 +2536,17 @@ let ignoreCityChange = false;
 
 $("cityFilter")?.addEventListener("change", () => {
   if (ignoreCityChange) return;
-  lastListingsFp = "";
-  allListings = [];
-  listingsRev = 0;
-  localStorage.setItem("propmap.city", currentCity());
+  const next = $("cityFilter").value;
+  localStorage.setItem("propmap.city", next);
   if ($("placeQuery")) {
     const opt = $("cityFilter").selectedOptions[0];
     $("placeQuery").value = opt ? opt.textContent : "";
   }
   pickedPlace = placeFromCityFilter();
   rememberCityView(pickedPlace);
-  focusedCity = currentCity();
-  focusCity(currentCity());
-  showListingsWait("city");
+  focusedCity = next;
+  focusCity(next);
+  clearLoadedListings();
   load({ waitKind: "city" });
 });
 
@@ -2245,6 +2556,7 @@ $("dealBar")?.addEventListener("input", () => {
   if (!bar) return;
   bar.title = v <= 0 ? "Sin filtro de ganga" : `Ganga en esta ciudad · score ≥ ${v}`;
 });
+
 document.addEventListener("click", (ev) => {
   document.querySelectorAll(".deal-help[open]").forEach((el) => {
     if (!el.contains(ev.target)) el.removeAttribute("open");
@@ -3395,6 +3707,20 @@ function whenIdle(fn) {
   }
   setTimeout(fn, 1200);
 }
+
+const landingQuery = new URLSearchParams(location.search);
+let landingBarrio = landingQuery.get("barrio") || "";
+const landingCity = landingQuery.get("ciudad") || "";
+const landingType = landingQuery.get("tipo") || "";
+const landingText = landingQuery.get("q") || "";
+if (landingCity) {
+  try { localStorage.setItem("propmap.city", landingCity); } catch (_) {}
+}
+if (landingType && $("typeFilter") && [...$("typeFilter").options].some((opt) => opt.value === landingType)) {
+  $("typeFilter").value = landingType;
+  syncRoomFilters();
+}
+if (landingText && $("placeQuery")) $("placeQuery").value = landingText;
 
 bindFolds();
 hydrateAuth().finally(() => {

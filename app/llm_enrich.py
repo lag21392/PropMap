@@ -918,8 +918,16 @@ def _mark_no_city_skip_details(item: Listing) -> None:
         item.extra = extra
 
 
+def _enrich_with_laya(item: Listing) -> None:
+    """Señales de producto: portal + regex, y Laya para los huecos."""
+    from .listing_signals import enrich_with_laya
+
+    enrich_with_laya(item)
+
 def _commit_llm_ok(item: Listing, data: dict[str, Any]) -> None:
     apply_analysis(item, data)
+    # Enrich with Laya decisions (fast, non-autoregressive)
+    _enrich_with_laya(item)
     extra = dict(item.extra or {})
     extra["llm_ready"] = True
     extra["await_llm"] = False
@@ -964,6 +972,8 @@ def _commit_llm_fail(listing_id: str, item: Listing) -> None:
     extra["llm_tries"] = int(extra.get("llm_tries") or 0) + 1
     item.extra = extra
     if extra["llm_tries"] >= MAX_TRIES:
+        # Enrich with Laya even on partial failure
+        _enrich_with_laya(item)
         extra["llm_ready"] = True
         extra["llm_partial"] = True
         extra["llm_ver"] = LLM_SCHEMA

@@ -63,8 +63,8 @@ KEEP_CITY_GAP_SEC = 1.2
 MAX_RAM_SNAPS = 4
 HYDRATE_RAM = 3
 RAM_SOFT_KB = 3_800_000
-SNAP_VER = "17"
-SNAP_READ_VERS = frozenset({"17"})
+SNAP_VER = "25"
+SNAP_READ_VERS = frozenset({"25"})
 MIN_TRUSTED_SNAP = 80
 TINY_SNAP = 8
 PIN_FLUSH_FIRST = 80
@@ -89,6 +89,7 @@ PIN_KEYS = (
     "total_m2",
     "rooms",
     "bedrooms",
+    "bathrooms",
     "image",
     "deal_label",
     "deal_score",
@@ -1051,6 +1052,7 @@ def _load_city_body(city_id: str) -> None:
         rows: list[dict[str, Any]] = []
         last_flush = 0
         last_disk = 0
+        type_fixed: list = []
         for i, item in enumerate(items):
             if i % 20 == 0:
                 time.sleep(0)
@@ -1063,7 +1065,11 @@ def _load_city_body(city_id: str) -> None:
                 if not tagged:
                     item.city = city_id
             apply_unit_price(item, rate)
-            rows.append(item.to_public_dict())
+            before = item.property_type
+            public = item.to_public_dict()
+            if (item.extra or {}).get("type_fix") and item.property_type != before:
+                type_fixed.append(item)
+            rows.append(public)
             n = len(rows)
             if n == PIN_FLUSH_FIRST or n - last_flush >= PIN_FLUSH_STEP:
                 persist_warm = n == PIN_FLUSH_FIRST or n - last_disk >= PIN_FLUSH_DISK
@@ -1074,6 +1080,12 @@ def _load_city_body(city_id: str) -> None:
                 log.warning("mapa de %s: %s pines", city_id, n)
         with _lock:
             _db_loaded.add(city_id)
+        if type_fixed:
+            try:
+                store.upsert_listings(type_fixed, notify=False)
+                log.warning("corregí %s terrenos que eran vivienda en %s", len(type_fixed), city_id)
+            except Exception:
+                log.exception("no pude guardar correcciones de tipo en %s", city_id)
         if rows:
             _commit_snap(city_id, rows, warming=False, persist=True, db_n=sqlite_n)
             log.warning("cache de %s en disco: %s fichas", city_id, len(rows))
@@ -1230,6 +1242,7 @@ def _pin_row(item: Listing) -> dict[str, Any]:
         "total_m2": item.total_m2,
         "rooms": item.rooms,
         "bedrooms": item.bedrooms,
+        "bathrooms": item.bathrooms,
         "image": item.image,
         "deal_label": item.deal_label,
         "deal_score": extra.get("deal_score"),
@@ -1280,6 +1293,7 @@ def _slim_profile(extra: dict[str, Any] | None) -> dict[str, Any]:
             "total_n": profile.get("total_n"),
             "pending": profile.get("pending") or [],
             "labels": profile.get("labels") or {},
+            "order": profile.get("order") or [],
             "version": profile.get("version"),
         }
     return {
@@ -1289,6 +1303,7 @@ def _slim_profile(extra: dict[str, Any] | None) -> dict[str, Any]:
         "total_n": profile.get("total_n"),
         "pending": profile.get("pending") or [],
         "labels": profile.get("labels") or {},
+        "order": profile.get("order") or [],
         "version": profile.get("version"),
     }
 
@@ -2356,7 +2371,7 @@ def keep_catalog_cached() -> None:
 
 def _with_view_city(cities: list[dict], view_city: str | None) -> list[dict]:
     from .geo import CABA_IDS, CITIES, DEFAULT_CITY
-    from .places import _listed_row_is_city, is_cache_artifact_id, public_place
+    from .places import _listed_row_is_city, is_cache_artifact_id, listing_count_for_catalog, public_place
 
     rows = list(cities or [])
     if view_city and is_cache_artifact_id(view_city):
@@ -2370,6 +2385,8 @@ def _with_view_city(cities: list[dict], view_city: str | None) -> list[dict]:
         except Exception:
             extra = {"id": view_city, "label": view_city.replace("-", " ").title()}
         extra["n"] = int(extra.get("n") or 0)
+        if not listing_count_for_catalog(extra["n"]):
+            return rows
         rows.append(extra)
     return rows
 
