@@ -5,6 +5,7 @@ venv/
 .env
 .env.*
 !.env.example
+data-dev/
 data/*.sqlite
 data/*.sqlite-journal
 data/*.sqlite-wal

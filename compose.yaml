@@ -4,16 +4,23 @@ services:
       context: .
       dockerfile: Dockerfile
     image: propmap:local
-    container_name: propmap
+    container_name: propmap-dev
+    networks:
+      default: {}
+      public:
+        aliases:
+          - propmap-dev
     init: true
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     ports:
-      - "8000:8000"
+      - "8010:8000"
     volumes:
-      - ./data:/app/data
+      - ./data-dev:/app/data
       - ./static:/app/static:ro
       - ./app:/app/app:ro
     environment:
@@ -31,7 +38,7 @@ services:
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
       SMTP_FROM: "${SMTP_FROM:-PropMap <no-reply@propmap.com.ar>}"
       MAIL_ADDRESS: "${MAIL_ADDRESS:-no-reply@propmap.com.ar}"
-      MAIL_UI_URL: "${MAIL_UI_URL:-http://127.0.0.1:7500}"
+      MAIL_UI_URL: "${MAIL_UI_URL:-http://127.0.0.1:7512}"
       LLM_URL: "${LLM_URL:-http://propmap-llm:8080}"
       SYSTEMONE_URL: "${SYSTEMONE_URL:-}"
       LLM_PROVIDER: "${LLM_PROVIDER:-local}"
@@ -89,7 +96,7 @@ services:
   # SOCKS interno (9050). No publicar al host: el scrape habla por TOR_SOCKS.
   tor:
     image: ghcr.io/oorabona/tor:latest
-    container_name: propmap-tor
+    container_name: propmap-dev-tor
     restart: unless-stopped
     environment:
       TZ: America/Argentina/Buenos_Aires
@@ -109,7 +116,7 @@ services:
 
   matomo-db:
     image: mariadb:lts
-    container_name: propmap-matomo-db
+    container_name: propmap-dev-matomo-db
     restart: unless-stopped
     command: --max-allowed-packet=64MB
     env_file:
@@ -130,7 +137,7 @@ services:
 
   matomo:
     image: matomo:latest
-    container_name: propmap-matomo
+    container_name: propmap-dev-matomo
     restart: unless-stopped
     depends_on:
       matomo-db:
@@ -145,11 +152,11 @@ services:
     volumes:
       - matomo-html:/var/www/html
     ports:
-      - "127.0.0.1:3102:80"
+      - "127.0.0.1:3112:80"
 
   matomo-cron:
     image: matomo:latest
-    container_name: propmap-matomo-cron
+    container_name: propmap-dev-matomo-cron
     restart: unless-stopped
     user: www-data
     depends_on:
@@ -163,7 +170,7 @@ services:
 
   matomo-init:
     image: matomo:latest
-    container_name: propmap-matomo-init
+    container_name: propmap-dev-matomo-init
     restart: unless-stopped
     env_file:
       - .env
@@ -188,10 +195,10 @@ services:
 
   propmap-mail:
     image: axllent/mailpit:latest
-    container_name: propmap-mail
+    container_name: propmap-dev-mail
     restart: unless-stopped
     ports:
-      - "7500:8025"
+      - "7512:8025"
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "1"
       MP_SMTP_AUTH_ALLOW_INSECURE: "1"
@@ -209,11 +216,11 @@ services:
       context: .
       dockerfile: Dockerfile.llm
     image: propmap-llm:cuda61
-    container_name: propmap-llm
+    container_name: propmap-dev-llm
     restart: unless-stopped
     runtime: nvidia
     ports:
-      - "7510:8080"
+      - "7520:8080"
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -230,7 +237,7 @@ services:
       MODEL_FILE: "${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
       MODEL_URL: "${MODEL_URL:-https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf}"
     volumes:
-      - ./data/llm:/models
+      - ./data-dev/llm:/models
       - ./scripts/llm-serve.sh:/init/serve.sh:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
@@ -246,6 +253,16 @@ services:
 
 volumes:
   matomo-db:
+    name: propmap-dev_matomo-db
   matomo-html:
+    name: propmap-dev_matomo-html
   mailpit:
+    name: propmap-dev_mailpit
   tor-data:
+    name: propmap-dev_tor-data
+
+networks:
+  public:
+    name: propmap_default
+    external: true
+
