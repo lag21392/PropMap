@@ -616,18 +616,28 @@ def ingest(listings: list[Listing] | None) -> None:
     if not listings:
         return
     rate = _read_rate()
+    from .llm_enrich import should_publish
+
+    # La ficha pública y el filtro geográfico no van bajo el candado: si no,
+    # CABA deja el mapa trabado y el watchdog mata el proceso a mitad de pasada.
+    prepared: list[tuple[Listing, dict[str, Any] | None]] = []
+    for item in listings:
+        apply_unit_price(item, rate)
+        public = item.to_public_dict() if should_publish(item) else None
+        prepared.append((item, public))
+    peeked = _peek_snap_cities(prepared)
+    rows = [public for _item, public in prepared if public]
+    fits_by_city = {cid: _fits_for_rows(cid, rows) for cid in peeked}
     missing: list[str] = []
     encode_ids: list[str] = []
-    got = _lock.acquire(timeout=0.4)
-    if not got:
+    late: list[str] = []
+    if not _lock.acquire(timeout=0.4):
         return
     try:
-        from .llm_enrich import should_publish
-
         dropped = False
         affected: set[str] = set()
-        for item in listings:
-            if not should_publish(item):
+        for item, public in prepared:
+            if public is None:
                 old = _by_id.pop(item.id, None)
                 if old is not None:
                     dropped = True
@@ -638,8 +648,7 @@ def ingest(listings: list[Listing] | None) -> None:
             old = _by_id.get(item.id)
             old_city = (old or {}).get("city") or ""
             old_search = (old or {}).get("search_city") or ""
-            apply_unit_price(item, rate)
-            _put_locked(item)
+            _put_locked(item, public=public)
             extra = item.extra or {}
             for cid in (item.city, old_city, extra.get("search_city"), old_search):
                 token = str(cid or "").strip()
@@ -649,13 +658,18 @@ def ingest(listings: list[Listing] | None) -> None:
         if dropped:
             _rev_bump_locked()
         rebuilt = _ready
-        patched_rows = [_by_id[item.id] for item in listings if item.id in _by_id]
-        drop_ids = [item.id for item in listings if item.id not in _by_id]
+        patched_rows = [_by_id[item.id] for item, _public in prepared if item.id in _by_id]
+        drop_ids = [item.id for item, _public in prepared if item.id not in _by_id]
         for cid in affected:
             if not cid:
                 continue
             if cid in _city_snaps and (_city_snaps[cid].get("listings")):
-                _upsert_snap_rows_locked(cid, patched_rows, drop_ids=drop_ids)
+                if cid not in fits_by_city:
+                    late.append(cid)
+                    continue
+                _upsert_snap_rows_locked(
+                    cid, patched_rows, drop_ids=drop_ids, fits=fits_by_city[cid]
+                )
                 encode_ids.append(cid)
             else:
                 missing.append(cid)
@@ -663,15 +677,22 @@ def ingest(listings: list[Listing] | None) -> None:
         _usd = rate
     finally:
         _lock.release()
+    for cid in late:
+        fits = _fits_for_rows(cid, patched_rows)
+        with _lock:
+            if cid in _city_snaps and (_city_snaps[cid].get("listings")):
+                _upsert_snap_rows_locked(cid, patched_rows, drop_ids=drop_ids, fits=fits)
+                encode_ids.append(cid)
     for cid in encode_ids:
         _schedule_encode(cid)
     cities_to_enrich = list(affected)
     for cid in missing:
         loaded = _read_disk(cid)
         if loaded and loaded.get("listings"):
+            fits = _fits_for_rows(cid, patched_rows)
             with _lock:
                 _city_snaps.setdefault(cid, loaded)
-                _upsert_snap_rows_locked(cid, patched_rows, drop_ids=drop_ids)
+                _upsert_snap_rows_locked(cid, patched_rows, drop_ids=drop_ids, fits=fits)
             _schedule_encode(cid)
         elif len(_by_id) < 400:
             _ensure_snap(cid, None)
@@ -686,10 +707,53 @@ def ingest(listings: list[Listing] | None) -> None:
             kick_access_later(cid)
 
 
+def _peek_snap_cities(prepared: list[tuple[Listing, dict[str, Any] | None]]) -> list[str]:
+    """Ciudades cuyo snap ya está en RAM, para filtrarlas sin el candado."""
+    if not _lock.acquire(timeout=0.15):
+        return []
+    try:
+        cities: list[str] = []
+        seen: set[str] = set()
+        for item, _public in prepared:
+            old = _by_id.get(item.id) or {}
+            extra = item.extra or {}
+            for cid in (item.city, old.get("city"), extra.get("search_city"), old.get("search_city")):
+                token = str(cid or "").strip()
+                if not token or token in {"fuera", "otros", "argentina"}:
+                    continue
+                token = resolve_city(token) or token
+                if token in seen:
+                    continue
+                seen.add(token)
+                snap = _city_snaps.get(token)
+                if snap and snap.get("listings"):
+                    cities.append(token)
+        return cities
+    finally:
+        _lock.release()
+
+
+def _fits_for_rows(city_id: str, rows: list[dict[str, Any]]) -> dict[str, bool]:
+    wanted = _wanted_ids(city_id)
+    fits: dict[str, bool] = {}
+    for row in rows:
+        lid = row.get("id")
+        if not lid:
+            continue
+        city = row.get("city") or ""
+        search = row.get("search_city") or ""
+        ok = wanted is None or city in wanted or search in wanted
+        if ok:
+            ok = public_row_fits_city(row, city_id)
+        fits[str(lid)] = ok
+    return fits
+
+
 def _upsert_snap_rows_locked(
     city_id: str,
     rows: list[dict[str, Any]],
     drop_ids: list[str] | None = None,
+    fits: dict[str, bool] | None = None,
 ) -> None:
     if not city_id or city_id == "*":
         return
@@ -711,16 +775,19 @@ def _upsert_snap_rows_locked(
             continue
         city = row.get("city") or ""
         search = row.get("search_city") or ""
-        fits = wanted is None or city in wanted or search in wanted
-        if fits:
-            fits = public_row_fits_city(row, city_id)
+        if fits is not None and str(lid) in fits:
+            ok = fits[str(lid)]
+        else:
+            ok = wanted is None or city in wanted or search in wanted
+            if ok:
+                ok = public_row_fits_city(row, city_id)
         if lid in index:
-            if fits:
+            if ok:
                 current[index[lid]] = row
             else:
                 current.pop(index[lid])
                 index = {r.get("id"): i for i, r in enumerate(current) if r.get("id")}
-        elif fits:
+        elif ok:
             current.append(row)
             index[lid] = len(current) - 1
     snap["listings"] = current

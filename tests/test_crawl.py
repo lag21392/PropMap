@@ -93,6 +93,17 @@ def test_host_paused_false_when_idle():
         crawl.reset()
 
 
+def test_wait_returns_during_a_block_cooldown():
+    crawl.reset()
+    try:
+        crawl.note_http(403, "www.zonaprop.com.ar", lane="tor-0")
+        started = time.time()
+        crawl.wait(host="www.zonaprop.com.ar", lane="tor-0")
+        assert time.time() - started < 0.5
+    finally:
+        crawl.reset()
+
+
 def test_403_on_one_lane_does_not_pause_another():
     crawl.reset()
     try:

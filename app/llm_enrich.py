@@ -31,7 +31,9 @@ _ready_cv = threading.Condition()
 _prep_workers = 0
 PREP_WORKERS = 2
 READY_CAP = 3
-_out_q: queue.Queue[Any] = queue.Queue(maxsize=16)
+# Sin tope: el único slot de GPU no puede quedarse esperando a que SQLite
+# termine de guardar. El hilo llm-apply drena la cola en orden.
+_out_q: queue.Queue[Any] = queue.Queue()
 _out_lock = threading.Lock()
 _out_worker: threading.Thread | None = None
 _prov_lock = threading.Lock()
@@ -918,16 +920,53 @@ def _mark_no_city_skip_details(item: Listing) -> None:
         item.extra = extra
 
 
+_laya_q: queue.Queue[str] = queue.Queue()
+_laya_worker: threading.Thread | None = None
+_laya_lock = threading.Lock()
+
+
 def _enrich_with_laya(item: Listing) -> None:
     """Señales de producto: portal + regex, y Laya para los huecos."""
     from .listing_signals import enrich_with_laya
 
     enrich_with_laya(item)
 
+
+def _laya_loop() -> None:
+    while True:
+        listing_id = _laya_q.get()
+        try:
+            item = store.get_listing(listing_id)
+            if item:
+                _enrich_with_laya(item)
+                _save_llm_item(item)
+        except Exception:
+            pass
+        finally:
+            _laya_q.task_done()
+
+
+def _ensure_laya_worker() -> None:
+    global _laya_worker
+    with _laya_lock:
+        if _laya_worker is not None and _laya_worker.is_alive():
+            return
+        _laya_worker = threading.Thread(target=_laya_loop, daemon=True, name="laya-signals")
+        _laya_worker.start()
+
+
+def _schedule_laya(item: Listing) -> None:
+    """Laya es un ModernBERT en CPU. No puede frenar el guardado del aviso."""
+    if os.environ.get("PROPMAP_TEST") == "1":
+        _enrich_with_laya(item)
+        return
+    _laya_q.put(item.id)
+    _ensure_laya_worker()
+
 def _commit_llm_ok(item: Listing, data: dict[str, Any]) -> None:
     apply_analysis(item, data)
-    # Enrich with Laya decisions (fast, non-autoregressive)
-    _enrich_with_laya(item)
+    if os.environ.get("PROPMAP_TEST") == "1":
+        _enrich_with_laya(item)
     extra = dict(item.extra or {})
     extra["llm_ready"] = True
     extra["await_llm"] = False
@@ -945,6 +984,8 @@ def _commit_llm_ok(item: Listing, data: dict[str, Any]) -> None:
     _save_llm_item(item)
     _ops_note("llm", outcome="ok")
     _queue_copy(item)
+    if os.environ.get("PROPMAP_TEST") != "1":
+        _schedule_laya(item)
 
 
 def _needs_details_first(listing_id: str, item: Listing) -> bool:
@@ -972,8 +1013,8 @@ def _commit_llm_fail(listing_id: str, item: Listing) -> None:
     extra["llm_tries"] = int(extra.get("llm_tries") or 0) + 1
     item.extra = extra
     if extra["llm_tries"] >= MAX_TRIES:
-        # Enrich with Laya even on partial failure
-        _enrich_with_laya(item)
+        if os.environ.get("PROPMAP_TEST") == "1":
+            _enrich_with_laya(item)
         extra["llm_ready"] = True
         extra["llm_partial"] = True
         extra["llm_ver"] = LLM_SCHEMA
@@ -985,6 +1026,8 @@ def _commit_llm_fail(listing_id: str, item: Listing) -> None:
         _mark_no_city_skip_details(item)
         _save_llm_item(item)
         _ops_note("llm", outcome="partial")
+        if os.environ.get("PROPMAP_TEST") != "1":
+            _schedule_laya(item)
         with _lock:
             _seen.discard(listing_id)
             _skip_until.pop(listing_id, None)

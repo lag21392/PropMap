@@ -537,6 +537,34 @@ def test_search_city_does_not_pull_ads_from_another_city(monkeypatch):
     reset()
 
 
+def test_updating_a_snap_filters_without_the_cache_lock(monkeypatch):
+    from app import listings_cache
+    from app.geo import public_row_fits_city as real_fits
+
+    monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
+    reset()
+    first = _item("snap-1", "caba")
+    ingest([first])
+    public = listings_cache._by_id[first.id]
+    listings_cache._city_snaps["caba"] = {
+        "listings": [dict(public)],
+        "rev": 1,
+        "loaded": True,
+    }
+
+    def unlocked(row, city):
+        got = listings_cache._lock.acquire(blocking=False)
+        assert got, "filtrar un snap ya armado no debe tomar el candado del cache"
+        listings_cache._lock.release()
+        return real_fits(row, city)
+
+    monkeypatch.setattr("app.listings_cache.public_row_fits_city", unlocked)
+    ingest([_item("snap-1", "caba")])
+    rows = listings_cache._city_snaps["caba"]["listings"]
+    assert any(row.get("id") == first.id for row in rows)
+    reset()
+
+
 def test_snap_filter_runs_without_cache_lock(monkeypatch):
     from app import listings_cache
     from app.geo import public_row_fits_city as real_fits

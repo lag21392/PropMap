@@ -184,7 +184,11 @@ def wait(should_stop=None, host: str = "", lane: str = "direct") -> None:
     key = _pace_key(host, lane)
     with _gate:
         now = time.time()
-        start = max(now, _host_busy.get(key, 0.0))
+        until = float(_host_busy.get(key, 0.0))
+        # Un 403 deja el carril en pausa larga. Dormir acá traba el turno 15 minutos.
+        if until - now >= COOL_SEC:
+            return
+        start = max(now, until)
         deadline = start + gap
         _host_busy[key] = deadline
         _state["busy_until"] = max(_host_busy.values())

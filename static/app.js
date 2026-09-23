@@ -424,7 +424,7 @@ function applyListingsPayload(data, city, seq, opts = {}) {
   fillZonas(cityItems());
   fillBarrios();
   render();
-  renderStats(data.stats || {});
+  renderStats();
   if (data.layer !== "pins") loadMarket();
   else if (!lastMarketKey) loadMarket();
   if (!opts.keepStatus) {
@@ -830,6 +830,30 @@ function cityDealScore(item) {
   return 0;
 }
 
+function selectedTraits() {
+  return new Set(
+    Array.from(document.querySelectorAll('input[name="listingTrait"]:checked')).map((el) => el.value)
+  );
+}
+
+function passesTraits(item, traits) {
+  if (!traits || !traits.size) return true;
+  if (traits.has("credit") && item.mortgage_credit !== true) return false;
+  if (traits.has("owner") && item.owner_direct !== true) return false;
+  if (traits.has("expenses") && item.low_expenses !== true) return false;
+  if (traits.has("urgent") && item.urgent_sale !== true) return false;
+  if (traits.has("quiet") && item.environment !== "quiet") return false;
+  if (traits.has("good") && !isGoodCondition(item)) return false;
+  if (traits.has("balcony") && item.has_balcony !== true) return false;
+  if (traits.has("bright") && item.bright !== true) return false;
+  if (traits.has("growing") && item.growing_area !== true) return false;
+  if (traits.has("view") && item.open_view !== true) return false;
+  if (traits.has("patio") && item.has_patio !== true) return false;
+  if (traits.has("garage") && item.has_garage !== true) return false;
+  if (traits.has("terrace") && item.has_terrace !== true) return false;
+  return true;
+}
+
 function filtered() {
   const city = currentCity();
   const type = $("typeFilter").value;
@@ -838,9 +862,7 @@ function filtered() {
   const max = Number($("maxPrice").value || 0);
   const minDeal = Number($("dealBar")?.value || 0);
   const favs = $("favOnly").checked;
-  const traits = new Set(
-    Array.from(document.querySelectorAll('input[name="listingTrait"]:checked')).map((el) => el.value)
-  );
+  const traits = selectedTraits();
 
   return allListings.filter((item) => {
     if (city && !belongsToCity(item, city)) return false;
@@ -851,19 +873,7 @@ function filtered() {
     if (minDeal > 0 && cityDealScore(item) < minDeal) return false;
     if (minDeal >= 40 && item.is_outlier) return false;
     if (favs && !item.favorite) return false;
-    if (traits.has("credit") && item.mortgage_credit !== true) return false;
-    if (traits.has("owner") && item.owner_direct !== true) return false;
-    if (traits.has("expenses") && item.low_expenses !== true) return false;
-    if (traits.has("urgent") && item.urgent_sale !== true) return false;
-    if (traits.has("quiet") && item.environment !== "quiet") return false;
-    if (traits.has("good") && !isGoodCondition(item)) return false;
-    if (traits.has("balcony") && item.has_balcony !== true) return false;
-    if (traits.has("bright") && item.bright !== true) return false;
-    if (traits.has("growing") && item.growing_area !== true) return false;
-    if (traits.has("view") && item.open_view !== true) return false;
-    if (traits.has("patio") && item.has_patio !== true) return false;
-    if (traits.has("garage") && item.has_garage !== true) return false;
-    if (traits.has("terrace") && item.has_terrace !== true) return false;
+    if (!passesTraits(item, traits)) return false;
     if (!passesSize(item)) return false;
     return true;
   });
@@ -1421,6 +1431,7 @@ function render() {
     }
   }
   requestAnimationFrame(() => paintMapMarkers(items));
+  renderStats();
 }
 
 function selectListing(item, { focusMap = true, at = null, keepPopup = false } = {}) {
@@ -2252,15 +2263,111 @@ async function saveListing(id, payload) {
   if (current) showDetail(current);
 }
 
-function renderStats(stats) {
+function quantile(sorted, p) {
+  const i = (sorted.length - 1) * p;
+  const lo = Math.floor(i);
+  const hi = Math.ceil(i);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+function medianOf(values) {
+  let nums = values.filter((n) => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
+  if (nums.length >= 6) {
+    const q1 = quantile(nums, 0.25);
+    const q3 = quantile(nums, 0.75);
+    const iqr = q3 - q1;
+    if (iqr > 0) {
+      const lo = q1 - 1.5 * iqr;
+      const hi = q3 + 1.5 * iqr;
+      const trimmed = nums.filter((n) => n >= lo && n <= hi);
+      if (trimmed.length >= 3) nums = trimmed;
+    }
+  }
+  if (nums.length >= 8) {
+    const lo = Math.floor(nums.length * 0.15);
+    const hi = Math.floor(nums.length * 0.85) || nums.length;
+    const cut = nums.slice(lo, hi);
+    if (cut.length) nums = cut;
+  }
+  if (!nums.length) return 0;
+  const mid = Math.floor(nums.length / 2);
+  return nums.length % 2 ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
+}
+
+function averageTitle() {
+  const names = {
+    casa: "casas",
+    departamento: "departamentos",
+    ph: "PH",
+    terreno: "terrenos",
+    local: "locales",
+    oficina: "oficinas",
+    galpon: "galpones",
+  };
+  const type = names[$("typeFilter")?.value || ""];
+  return type ? `Promedios por barrio · ${type}` : "Promedios por barrio";
+}
+
+function forBarrioAverage(item, traits) {
+  // Precio máximo, ganga y favoritos recortan la muestra que el promedio está midiendo.
+  if (item.is_outlier || item.exclude_from_comps) return false;
   const city = currentCity();
-  const rows = (stats.by_barrio || []).filter((r) => r.count && (!r.city || r.city === city));
-  $("statsBody").innerHTML = rows.map((r) => `<tr>
+  const type = $("typeFilter")?.value || "";
+  const zona = $("zonaFilter")?.value || "";
+  const barrio = $("barrioFilter")?.value || "";
+  if (city && !belongsToCity(item, city)) return false;
+  if (type && item.property_type !== type) return false;
+  if (zona && item.zona !== zona) return false;
+  if (barrio && item.barrio !== barrio) return false;
+  if (!passesTraits(item, traits)) return false;
+  if (!passesSize(item)) return false;
+  return true;
+}
+
+function barrioAverages() {
+  const traits = selectedTraits();
+  const groups = new Map();
+  for (const item of allListings) {
+    if (!forBarrioAverage(item, traits)) continue;
+    const name = item.barrio || "Sin clasificar";
+    let group = groups.get(name);
+    if (!group) {
+      group = { name, count: 0, usd: [], m2: [] };
+      groups.set(name, group);
+    }
+    group.count += 1;
+    const usd = Number(item.price_usd);
+    const m2 = Number(item.price_m2);
+    if (usd > 0) group.usd.push(usd);
+    if (m2 > 0) group.m2.push(m2);
+  }
+  return [...groups.values()]
+    .filter((group) => group.count)
+    .map((group) => ({
+      name: group.name,
+      count: group.count,
+      median_usd: Math.round(medianOf(group.usd) || 0),
+      median_m2: Math.round(medianOf(group.m2) || 0),
+    }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "es"));
+}
+
+function renderStats(stats) {
+  const body = $("statsBody");
+  if (!body) return;
+  const head = document.querySelector("#statsCard .fold-head");
+  if (head) head.textContent = averageTitle();
+  let rows;
+  if (listingsReady && allListings.length) {
+    rows = barrioAverages();
+  } else {
+    const city = currentCity();
+    rows = ((stats || window.lastStats || {}).by_barrio || []).filter((r) => r.count && (!r.city || r.city === city));
+  }
+  body.innerHTML = rows.map((r) => `<tr>
     <td>${escapeHtml(r.name)}</td>
-    <td>${r.count}</td>
     <td>${r.median_usd ? fmt(r.median_usd) : "—"}</td>
     <td>${r.median_m2 ? fmt(r.median_m2) : "—"}</td>
-    <td>${r.deals}</td>
   </tr>`).join("");
 }
 
@@ -2906,10 +3013,6 @@ function renderFacebook() {
   $("fbLinks").innerHTML = (facebook || []).map((x) => `<a href="${x.url}" target="_blank" rel="noopener">${x.label}</a>`).join(" · ");
 }
 
-$("toggleStats").onclick = () => {
-  $("statsCard").classList.toggle("collapsed");
-};
-
 $("togglePulse")?.addEventListener("click", () => {
   const box = $("marketPulse");
   if (!box) return;
@@ -3001,7 +3104,7 @@ function applyPlace(place) {
   fillZonas(cityItems());
   fillBarrios();
   if (listingsReady) render();
-  renderStats(window.lastStats || {});
+  else renderStats(window.lastStats || {});
 }
 
 let placeTimer = null;
@@ -3641,7 +3744,7 @@ function bindFolds() {
     const btn = box.querySelector(".fold-head");
     if (!btn) return;
     const key = `propmap.fold.${box.dataset.fold}`;
-    let open = true;
+    let open = box.dataset.foldDefault !== "closed";
     try {
       const stored = localStorage.getItem(key);
       if (stored === "0") open = false;
