@@ -1005,6 +1005,28 @@ def _stamp_skip_details_unknown_city(conn: sqlite3.Connection, *, force: bool = 
         return
 
 
+def count_detail_backlog() -> int:
+    """Cuántas fichas siguen sin bajar. Misma población que fetch_detail_backlog."""
+    sql = """
+        SELECT COUNT(*) FROM listings
+        WHERE details_scraped = 0
+          AND IFNULL(url, '') != ''
+          AND is_hidden = 0
+          AND NOT (
+            IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina')
+            AND (
+              IFNULL(json_extract(extra_json, '$.skip_details'), 0) != 0
+              OR IFNULL(json_extract(extra_json, '$.llm_city_ok'), 0) != 0
+              OR IFNULL(json_extract(extra_json, '$.llm_ready'), 0) != 0
+              OR length(trim(IFNULL(json_extract(extra_json, '$.llm_at'), ''))) > 0
+            )
+          )
+    """
+    with connect() as conn:
+        row = conn.execute(sql).fetchone()
+    return int(row[0] if row else 0)
+
+
 def fetch_detail_backlog(
     limit: int,
     prefer_city: str = "",

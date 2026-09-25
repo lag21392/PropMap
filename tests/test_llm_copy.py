@@ -147,6 +147,28 @@ def test_copy_refill_fills_even_if_extract_has_waiting_queue(tmp_path, monkeypat
         llm_enrich._queue.clear()
 
 
+def test_copy_waits_while_fichas_are_missing(tmp_path, monkeypatch):
+    from app import llm_copy, llm_enrich, store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    monkeypatch.setattr(llm_copy, "enabled", lambda: True)
+    monkeypatch.setattr(llm_copy, "_ensure_workers_locked", lambda: None)
+    monkeypatch.setattr(llm_copy, "fichas_pending", lambda: True)
+    llm_copy._queue.clear()
+    llm_copy._seen.clear()
+    llm_copy._ready.clear()
+    store.upsert_many([_ready(source_id="ready-copy")])
+    assert llm_copy.refill("caba") == 0
+    assert list(llm_copy._queue) == []
+    llm_copy._ready.append(("copy:hold", None, []))
+    llm_enrich._ready.clear()
+    kind, job = llm_enrich._next_gpu_job(0)
+    assert kind is None
+    assert job is None
+    llm_copy._ready.clear()
+
+
 def test_copy_backlog_skips_until_llm_done(tmp_path, monkeypatch):
     from app import store
 

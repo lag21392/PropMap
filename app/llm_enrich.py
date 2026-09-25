@@ -33,7 +33,7 @@ PREP_WORKERS = 2
 READY_CAP = 3
 # Sin tope: el único slot de GPU no puede quedarse esperando a que SQLite
 # termine de guardar. El hilo llm-apply drena la cola en orden.
-_out_q: queue.Queue[Any] = queue.Queue()
+_out_q: queue.Queue[Any] = queue.Queue(maxsize=64)
 _out_lock = threading.Lock()
 _out_worker: threading.Thread | None = None
 _prov_lock = threading.Lock()
@@ -45,7 +45,7 @@ _workers = 0
 MAX_TRIES = 2
 QUEUE_CAP = 48
 MAX_TOKENS = 96
-CHAT_TIMEOUT_SEC = 40.0
+CHAT_TIMEOUT_SEC = 20.0
 CHAT_CONNECT_SEC = 3.0
 STUCK_SEC = 15.0
 SKIP_FAIL_SEC = 90.0
@@ -281,6 +281,8 @@ def llm_model() -> str:
 
 def enabled() -> bool:
     if os.environ.get("PROPMAP_TEST") == "1":
+        return False
+    if llm_provider() in {"off", "none", "0", "disabled"}:
         return False
     if llm_provider() == "gemini":
         from .llm_gemini import api_key
@@ -683,8 +685,10 @@ def _ensure_workers_locked() -> None:
 
 def _take_copy_job() -> tuple | None:
     try:
-        from .llm_copy import take_ready
+        from .llm_copy import fichas_pending, take_ready
 
+        if fichas_pending():
+            return None
         return take_ready()
     except Exception:
         return None
@@ -1288,6 +1292,10 @@ def _chat(messages: list[dict[str, Any]], *, use_tools: bool = False, max_tokens
         body["tools"] = tools
     url = f"{llm_url()}/v1/chat/completions"
     wait = CHAT_TIMEOUT_SEC + STUCK_SEC
+    # Backoff exponencial con jitter simple antes de intentar
+    import random
+    backoff = 0.5 * (2 ** min(3, int(time.time() % 5)))
+    time.sleep(backoff + random.uniform(0, 0.3))
     ticket = _gpu.acquire_ticket(timeout=wait)
     if ticket is None:
         return {}

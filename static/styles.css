@@ -571,26 +571,33 @@ button:disabled { opacity: 0.55; cursor: wait; }
   font-size: 13px;
 }
 .card-top {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   min-width: 0;
 }
-.card-top .kind { flex: 0 1 auto; min-width: 0; }
-.card-top .price {
-  margin-left: auto;
-  flex: 0 0 auto;
+.card-top .kind {
   white-space: nowrap;
-  font-size: 14px;
+  letter-spacing: 0;
+  padding: 2px 5px;
+  font-size: 10px;
+}
+.card-top .price {
+  margin: 0;
+  justify-self: end;
+  min-width: 0;
+  white-space: nowrap;
+  font-size: 12px;
   line-height: 1.2;
 }
 .fav-btn {
   background: transparent;
   color: var(--sand);
-  font-size: 20px;
+  font-size: 16px;
   line-height: 1;
-  padding: 0 4px;
-  min-width: 28px;
+  padding: 0;
+  min-width: 18px;
 }
 .card.is-fav { border-color: rgba(226, 196, 142, 0.45); }
 .card.is-selected {
@@ -1520,7 +1527,7 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
   gap: 12px;
   min-width: 0;
 }
-.detail-kicker .kind { flex: 0 1 auto; min-width: 0; }
+.detail-kicker .kind { flex: 0 0 auto; white-space: nowrap; letter-spacing: 0; }
 .detail-price {
   flex: 0 0 auto;
   margin: 0;

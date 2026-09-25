@@ -52,6 +52,28 @@ def enabled() -> bool:
     return llm_on()
 
 
+_fichas_at = 0.0
+_fichas_n = 0
+
+
+def fichas_pending() -> bool:
+    """Hay fichas sin bajar: la GPU no redacta descripciones mientras tanto."""
+    global _fichas_at, _fichas_n
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return False
+    now = time.time()
+    if now - _fichas_at < 20:
+        return _fichas_n > 0
+    from .store import count_detail_backlog
+
+    try:
+        _fichas_n = count_detail_backlog()
+    except Exception:
+        _fichas_n = 0
+    _fichas_at = now
+    return _fichas_n > 0
+
+
 def copy_payload(item: Listing) -> dict[str, Any]:
     extra = item.extra or {}
     raw = extra.get("copy")
@@ -232,7 +254,7 @@ def queue_stats() -> dict[str, Any]:
 
 
 def enqueue(listings: list[Listing] | None) -> None:
-    if not enabled() or not listings:
+    if not enabled() or not listings or fichas_pending():
         return
     now = time.time()
     with _lock:
@@ -251,8 +273,8 @@ def enqueue(listings: list[Listing] | None) -> None:
 
 
 def refill(prefer_city: str = "") -> int:
-    """Mantiene la cola de descripciones llena. La GPU las toma cuando extract no tiene prompt."""
-    if not enabled():
+    """Mantiene la cola de descripciones llena. No corre si todavía faltan fichas."""
+    if not enabled() or fichas_pending():
         return 0
     with _lock:
         pending = len(_queue)
