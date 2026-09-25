@@ -1,0 +1,270 @@
+# Stack de producción. Desarrollo usa compose.yaml.
+# Levantar con: docker compose -f compose.prod.yaml up -d
+name: propmap-prod
+
+services:
+  propmap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: propmap:prod
+    container_name: propmap-prod
+    networks:
+      default: {}
+      public:
+        aliases:
+          - propmap
+    init: true
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./static:/app/static:ro
+      - ./app:/app/app:ro
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DATA_DIR: /app/data
+      SEARCH_PASSWORD: "${SEARCH_PASSWORD}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
+      AUTH_SECRET: "${AUTH_SECRET:-}"
+      AUTH_DEV_SHOW_LINK: "${AUTH_DEV_SHOW_LINK:-0}"
+      SMTP_HOST: "${SMTP_HOST:-propmap-mail}"
+      SMTP_PORT: "${SMTP_PORT:-1025}"
+      SMTP_TLS: "${SMTP_TLS:-0}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM: "${SMTP_FROM:-PropMap <no-reply@propmap.com.ar>}"
+      MAIL_ADDRESS: "${MAIL_ADDRESS:-no-reply@propmap.com.ar}"
+      MAIL_UI_URL: "${MAIL_UI_URL:-http://127.0.0.1:7500}"
+      LLM_URL: "${LLM_URL:-http://propmap-llm:8080}"
+      SYSTEMONE_URL: "${SYSTEMONE_URL:-}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-local}"
+      LLM_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
+      LLM_WORKERS: "${LLM_WORKERS:-1}"
+      LLM_CTX: "${LLM_CTX:-2048}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      OLLAMA_URL: "${LLM_URL:-http://propmap-llm:8080}"
+      OLLAMA_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
+      TOR_ENABLED: "${TOR_ENABLED:-1}"
+      TOR_SOCKS: "${TOR_SOCKS:-socks5h://tor:9050}"
+      TOR_CIRCUITS: "${TOR_CIRCUITS:-4}"
+      SCRAPE_PROXIES: "${SCRAPE_PROXIES:-}"
+      SCRAPE_USE_LOCAL: "${SCRAPE_USE_LOCAL:-1}"
+      SCRAPE_LOCAL_GAP_SEC: "${SCRAPE_LOCAL_GAP_SEC:-20}"
+      SCRAPE_LOCAL_PARALLEL: "${SCRAPE_LOCAL_PARALLEL:-4}"
+      SCRAPE_LOCAL_MAX_DAY: "${SCRAPE_LOCAL_MAX_DAY:-600}"
+      MATOMO_INTERNAL_URL: "${MATOMO_INTERNAL_URL}"
+      MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL}"
+      MATOMO_SITE_ID: "${MATOMO_SITE_ID:-1}"
+      MATOMO_USER: "${MATOMO_USER}"
+      MATOMO_PASSWORD: "${MATOMO_PASSWORD}"
+      MATOMO_EMAIL: "${MATOMO_EMAIL}"
+      MATOMO_SITE_NAME: "${MATOMO_SITE_NAME}"
+      MATOMO_SITE_URL: "${MATOMO_SITE_URL}"
+      MATOMO_TIMEZONE: "${MATOMO_TIMEZONE}"
+      MATOMO_DB_HOST: "matomo-db"
+      MATOMO_DB_NAME: "${MATOMO_DB_NAME}"
+      MATOMO_DB_USER: "${MATOMO_DB_USER}"
+      MATOMO_DB_PASSWORD: "${MATOMO_DB_PASSWORD}"
+    depends_on:
+      - matomo
+      - propmap-mail
+      - tor
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys,time; from pathlib import Path; p=Path('/app/data/heartbeat'); sys.exit(0 if p.is_file() and time.time()-p.stat().st_mtime<12 else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tor:
+    image: ghcr.io/oorabona/tor:latest
+    container_name: propmap-prod-tor
+    restart: unless-stopped
+    environment:
+      TZ: America/Argentina/Buenos_Aires
+      SOCKS_BIND: "0.0.0.0"
+      SOCKS_PORT: "9050"
+    volumes:
+      - tor-data:/var/lib/tor
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"
+
+  matomo-db:
+    image: mariadb:lts
+    container_name: propmap-prod-matomo-db
+    restart: unless-stopped
+    command: --max-allowed-packet=64MB
+    env_file:
+      - .env
+    environment:
+      MARIADB_AUTO_UPGRADE: "1"
+      MARIADB_DATABASE: "${MATOMO_DB_NAME}"
+      MARIADB_USER: "${MATOMO_DB_USER}"
+      MARIADB_PASSWORD: "${MATOMO_DB_PASSWORD}"
+      MARIADB_ROOT_PASSWORD: "${MATOMO_DB_ROOT_PASSWORD}"
+    volumes:
+      - matomo-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 8s
+      timeout: 5s
+      retries: 20
+
+  matomo:
+    image: matomo:latest
+    container_name: propmap-prod-matomo
+    restart: unless-stopped
+    depends_on:
+      matomo-db:
+        condition: service_healthy
+    environment:
+      MATOMO_DATABASE_ADAPTER: mysql
+      MATOMO_DATABASE_TABLES_PREFIX: matomo_
+      MATOMO_DATABASE_HOST: matomo-db
+      MATOMO_DATABASE_USERNAME: "${MATOMO_DB_USER}"
+      MATOMO_DATABASE_PASSWORD: "${MATOMO_DB_PASSWORD}"
+      MATOMO_DATABASE_DBNAME: "${MATOMO_DB_NAME}"
+    volumes:
+      - matomo-html:/var/www/html
+    ports:
+      - "127.0.0.1:3102:80"
+
+  matomo-cron:
+    image: matomo:latest
+    container_name: propmap-prod-matomo-cron
+    restart: unless-stopped
+    user: www-data
+    depends_on:
+      - matomo
+    volumes:
+      - matomo-html:/var/www/html
+    entrypoint:
+      - /bin/sh
+      - -c
+      - while true; do php /var/www/html/console core:archive --url=http://matomo/ || true; sleep 300; done
+
+  matomo-init:
+    image: matomo:latest
+    container_name: propmap-prod-matomo-init
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MATOMO_DATABASE_HOST: matomo-db
+      MATOMO_DATABASE_USERNAME: "${MATOMO_DB_USER}"
+      MATOMO_DATABASE_PASSWORD: "${MATOMO_DB_PASSWORD}"
+      MATOMO_DATABASE_DBNAME: "${MATOMO_DB_NAME}"
+      MATOMO_DATABASE_TABLES_PREFIX: matomo_
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
+      MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL:-}"
+    depends_on:
+      matomo-db:
+        condition: service_healthy
+      matomo:
+        condition: service_started
+    volumes:
+      - matomo-html:/var/www/html
+      - ./scripts/matomo-bootstrap.sh:/init/bootstrap.sh:ro
+      - ./scripts/matomo-install.php:/init/install.php:ro
+    entrypoint: ["/bin/bash", "/init/bootstrap.sh"]
+
+  propmap-mail:
+    image: axllent/mailpit:latest
+    container_name: propmap-prod-mail
+    restart: unless-stopped
+    ports:
+      - "7500:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      MP_MAX_MESSAGES: "2000"
+    volumes:
+      - mailpit:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  propmap-llm:
+    build:
+      context: .
+      dockerfile: Dockerfile.llm
+    image: propmap-llm:cuda61
+    container_name: propmap-prod-llm
+    restart: unless-stopped
+    runtime: nvidia
+    ports:
+      - "7510:8080"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      LLM_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
+      LLM_PARALLEL: "${LLM_PARALLEL:-1}"
+      LLM_CTX: "${LLM_CTX:-2048}"
+      LLM_CACHE_TYPE: "${LLM_CACHE_TYPE:-q8_0}"
+      LLM_THREADS: "${LLM_THREADS:-1}"
+      LLM_BATCH: "${LLM_BATCH:-512}"
+      LLM_UBATCH: "${LLM_UBATCH:-256}"
+      LLM_FIT: "${LLM_FIT:-on}"
+      LLM_FIT_TARGET: "${LLM_FIT_TARGET:-64}"
+      MODEL_DIR: /models
+      MODEL_FILE: "${MODEL_FILE:-gemma-4-E4B-it-Q4_K_M.gguf}"
+      MODEL_URL: "${MODEL_URL:-https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf}"
+    volumes:
+      - ./data/llm:/models
+      - ./scripts/llm-serve.sh:/init/serve.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+      start_period: 300s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+volumes:
+  matomo-db:
+    name: propmap_matomo-db
+    external: true
+  matomo-html:
+    name: propmap_matomo-html
+    external: true
+  mailpit:
+    name: propmap_mailpit
+    external: true
+  tor-data:
+    name: propmap_tor-data
+    external: true
+
+networks:
+  public:
+    name: propmap_default
+    external: true
