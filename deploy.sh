@@ -31,10 +31,15 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   echo "[deploy] Ya estás en origin/main ($(git rev-parse --short HEAD))."
 else
   echo "[deploy] Actualizando a origin/main..."
-  # Sin git clean: data/ apunta a la base real y un clean la borraría.
+  # Sin git clean: data/ es la base de producción.
   git reset --hard origin/main
   echo "[deploy] Actualizado a $(git rev-parse --short HEAD)."
 fi
+
+# El compose.yaml del repo es el de desarrollo. En esta carpeta queda el de producción.
+cp "$REPO_DIR/compose.prod.yaml" "$REPO_DIR/compose.yaml"
+rm -f "$REPO_DIR/compose.override.yaml"
+echo "[deploy] compose.yaml de producción listo."
 
 BUILD=()
 if [ "${1:-}" = "--build" ]; then
