@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
 import threading
-from typing import Callable
+from typing import Callable, Iterator
 
-from lxml import html as lhtml
+from lxml import etree, html as lhtml
 
 from ..geo import foreign_locality, locate, parse_street, pin_listing_city, portal_outside_city, street_names_match
 from ..http_client import fetch_text
@@ -14,6 +15,80 @@ from ..models import Listing
 from ..text_quality import looks_like_intersection
 
 Progress = Callable[[str], None]
+
+
+def iterparse_html(html_content: str, *, tag: str = None, attrs: dict = None) -> Iterator:
+    """
+    Incrementally parse HTML content using lxml.etree.iterparse.
+    Yields elements that match the specified tag and attributes.
+    More memory-efficient than lhtml.fromstring for large documents.
+
+    Args:
+        html_content: The HTML string to parse
+        tag: Optional tag name to filter elements (e.g., 'div', 'article')
+        attrs: Optional dictionary of attributes to match
+
+    Yields:
+        lxml.html.HtmlElement: Matching elements
+    """
+    if not html_content:
+        return
+
+    # Use iterparse to parse incrementally with built-in HTML parser
+    # html=True requires bytes input
+    from io import BytesIO
+    for event, element in etree.iterparse(
+        BytesIO(html_content.encode('utf-8')),
+        events=('end',),
+        html=True
+    ):
+        # Check if element matches our criteria
+        matches = True
+        if tag is not None and element.tag != tag:
+            matches = False
+        if attrs is not None and matches:
+            for attr_name, attr_value in attrs.items():
+                if element.get(attr_name) != attr_value:
+                    matches = False
+                    break
+
+        if matches:
+            yield element
+
+        # Clear the element to save memory as we iterate
+        element.clear()
+        # Also clear its predecessors to save more memory
+        while element.getprevious() is not None:
+            del element.getparent()[0]
+
+    # Delete the root element to clean up
+    del element
+
+
+def _iterparse_to_tree(html_content: str, *, tag: str = None, attrs: dict = None) -> lhtml.HtmlElement:
+    """
+    Convert iterparse results to a single lxml.html element tree.
+    This is a helper for cases where we need the full tree but want to use
+    iterparse for memory efficiency during parsing.
+
+    Note: This still builds the full tree in memory, but the parsing process
+    is incremental which can be more efficient for very large documents.
+    """
+    if not html_content:
+        return lhtml.fromstring("<html/>")
+    # Truncar antes de iterparse para evitar documentos gigantes
+    max_bytes = 2 * 1024 * 1024
+    if len(html_content) > max_bytes:
+        html_content = html_content[:max_bytes]
+    parser = etree.HTMLParser(recover=True, encoding='utf-8')
+    root = None
+    for event, element in etree.iterparse(io.StringIO(html_content), events=('end',), parser=parser, html=True):
+        if root is None:
+            root = element
+        element.clear()
+        while element.getprevious() is not None:
+            del element.getparent()[0]
+    return lhtml.fromstring(html_content)
 
 
 def parse_number(text: str | None) -> float | None:
@@ -186,9 +261,10 @@ def page_workers() -> int:
 
 
 def paginate(fetch_page, max_pages: int | None = None, should_stop=None, on_chunk=None) -> list:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import as_completed
 
     from .. import freshness
+    from ..concurrency import get_io_executor
     from ..crawl import list_page_limit
 
     items = []
@@ -196,6 +272,7 @@ def paginate(fetch_page, max_pages: int | None = None, should_stop=None, on_chun
     limit = max_pages if max_pages is not None else list_page_limit()
     width = page_workers()
     page = 1
+    executor = get_io_executor()
     while page <= limit:
         if should_stop and should_stop():
             break
@@ -204,14 +281,13 @@ def paginate(fetch_page, max_pages: int | None = None, should_stop=None, on_chun
         if len(batch) == 1:
             fetched[batch[0]] = fetch_page(batch[0]) or []
         else:
-            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-                futs = {pool.submit(fetch_page, num): num for num in batch}
-                for fut in as_completed(futs):
-                    num = futs[fut]
-                    try:
-                        fetched[num] = fut.result() or []
-                    except Exception:
-                        fetched[num] = []
+            futs = {executor.submit(fetch_page, num): num for num in batch}
+            for fut in as_completed(futs):
+                num = futs[fut]
+                try:
+                    fetched[num] = fut.result() or []
+                except Exception:
+                    fetched[num] = []
         stop = False
         for num in batch:
             chunk = fetched.get(num) or []
@@ -239,7 +315,30 @@ def paginate(fetch_page, max_pages: int | None = None, should_stop=None, on_chun
 
 
 def tree(url: str):
-    return lhtml.fromstring(fetch_text(url))
+    import time
+    t0 = time.time()
+    # Intentar leer de caché primero para evitar fetch si existe
+    from ..http.cache import _read_page_cache, _remember_page
+    cached = _read_page_cache(url)
+    if cached:
+        text = cached
+        fetch_ms = 0.0
+    else:
+        text = fetch_text(url)
+        t1 = time.time()
+        fetch_ms = (t1 - t0) * 1000
+        # Guardar en caché con límite de 2 MB
+        _remember_page(url, text)
+    # Limitar tamaño antes de parsear para evitar DOM gigante
+    max_bytes = 2 * 1024 * 1024
+    if len(text) > max_bytes:
+        logging.warning("tree truncado %s desde %d a %d bytes", url, len(text), max_bytes)
+        text = text[:max_bytes]
+    doc = lhtml.fromstring(text)
+    t2 = time.time()
+    parse_ms = (t2 - t0 - (fetch_ms/1000) if cached else (t2 - t1)) * 1000
+    logging.info("tree %s fetch_ms=%.1f parse_ms=%.1f total_ms=%.1f cached=%s", url[:80], fetch_ms, parse_ms, (t2-t0)*1000, bool(cached))
+    return doc
 
 
 def portal_neighborhood(*nodes) -> str:

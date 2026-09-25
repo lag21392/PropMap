@@ -38,15 +38,23 @@ def scrape(progress=lambda _m: None, city: str | None = None, should_stop=None, 
 
 def _page(url: str, fallback_type: str, page: int, city: str | None = None) -> list[Listing]:
     from ..geo import default_city
+    from . import iterparse_html
 
     city = city or default_city()
     page_url = url if page == 1 else f"{url}/{page}"
     html = fetch_text(page_url)
-    doc = lhtml.fromstring(html)
+    max_bytes = 2 * 1024 * 1024
+    if len(html) > max_bytes:
+        html = html[:max_bytes]
     geo_by_id = _ld_geo(html)
-    cards = doc.xpath('//article[contains(@class,"snippet") or @data-url]')
     items: list[Listing] = []
-    for card in cards:
+    from lxml import html as lhtml
+    for card_el in iterparse_html(html, tag='article'):
+        class_attr = card_el.get('class') or ''
+        if not (card_el.get('data-url') or 'snippet' in class_attr.lower()):
+            continue
+        card_html = lhtml.tostring(card_el, encoding='unicode')
+        card = lhtml.fromstring(card_html)
         href = card.get("data-url") or (card.xpath(".//a/@href") or [""])[0]
         source_id = card.get("data-idanuncio") or href.rsplit("/", 1)[-1]
         if not href or not source_id:

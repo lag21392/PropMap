@@ -60,13 +60,101 @@ def _page(url: str, fallback_type: str, page: int, city: str) -> list[Listing]:
 
 
 def _from_cards(html: str, fallback_type: str, city: str) -> list[Listing]:
-    try:
-        tree = lhtml.fromstring(html)
-    except Exception:
-        return []
+    from . import iterparse_html
+    # Híbrido: iterparse solo para HTML grande para ahorrar memoria
+    max_bytes = 2 * 1024 * 1024
+    if len(html) > max_bytes:
+        html = html[:max_bytes]
     items: list[Listing] = []
     seen: set[str] = set()
-    for card in tree.xpath('//*[contains(@class,"poly-card__content")]'):
+    from lxml import html as lhtml
+    # Umbral para usar iterparse
+    use_iterparse = len(html) > 100 * 1024
+    if not use_iterparse:
+        try:
+            tree = lhtml.fromstring(html)
+        except Exception:
+            return []
+        cards = tree.xpath('//*[contains(@class,"poly-card__content")]')
+        for card in cards:
+            # ... processing continues as before
+            hrefs = card.xpath('.//a[contains(@href,"MLA")]/@href')
+            if not hrefs:
+                continue
+            url_item = hrefs[0].split("#")[0].strip()
+            source_id = _id_from_url(url_item)
+            if not source_id or source_id in seen:
+                continue
+            seen.add(source_id)
+            title = _first_text(card, "poly-component__title") or "Propiedad en venta"
+            address = clean_portal_address(_first_text(card, "poly-component__location"))
+            price_text = _first_text(card, "poly-component__price") or _first_text(card, "andes-money-amount__fraction")
+            currency_text = _first_text(card, "andes-money-amount__currency-symbol")
+            currency = "USD" if "US" in (currency_text or price_text or "").upper() else "ARS"
+            image = ""
+            imgs = card.xpath(".//img/@src | .//img/@data-src | .//img/@data-srcset")
+            if imgs:
+                image = str(imgs[0]).split(" ")[0]
+            items.append(
+                Listing(
+                    source="mercadolibre",
+                    source_id=source_id,
+                    url=url_item,
+                    title=title,
+                    property_type=detect_type(f"{title} {url_item} {address}", fallback_type),
+                    price=parse_number(price_text),
+                    currency=currency,
+                    address=address,
+                    image=image,
+                    description=title[:900],
+                    city=city,
+                    extra={"photos": [image]} if image else {},
+                )
+            )
+        return items
+    # Iterparse para HTML grande
+    for el in iterparse_html(html, tag='div'):
+        class_attr = el.get('class') or ''
+        if 'poly-card__content' not in class_attr:
+            continue
+        card_html = lhtml.tostring(el, encoding='unicode')
+        try:
+            card = lhtml.fromstring(card_html)
+        except Exception:
+            continue
+        hrefs = card.xpath('.//a[contains(@href,"MLA")]/@href')
+        if not hrefs:
+            continue
+        url_item = hrefs[0].split("#")[0].strip()
+        source_id = _id_from_url(url_item)
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        title = _first_text(card, "poly-component__title") or "Propiedad en venta"
+        address = clean_portal_address(_first_text(card, "poly-component__location"))
+        price_text = _first_text(card, "poly-component__price") or _first_text(card, "andes-money-amount__fraction")
+        currency_text = _first_text(card, "andes-money-amount__currency-symbol")
+        currency = "USD" if "US" in (currency_text or price_text or "").upper() else "ARS"
+        image = ""
+        imgs = card.xpath(".//img/@src | .//img/@data-src | .//img/@data-srcset")
+        if imgs:
+            image = str(imgs[0]).split(" ")[0]
+        items.append(
+            Listing(
+                source="mercadolibre",
+                source_id=source_id,
+                url=url_item,
+                title=title,
+                property_type=detect_type(f"{title} {url_item} {address}", fallback_type),
+                price=parse_number(price_text),
+                currency=currency,
+                address=address,
+                image=image,
+                description=title[:900],
+                city=city,
+                extra={"photos": [image]} if image else {},
+            )
+        )
         hrefs = card.xpath('.//a[contains(@href,"MLA")]/@href')
         if not hrefs:
             continue
