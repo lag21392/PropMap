@@ -185,7 +185,7 @@ def _disk_snap_complete(meta: dict[str, Any] | None) -> bool:
         return False
     n = int(meta.get("n") or 0)
     if n <= 0:
-        return False
+        return bool(meta.get("db_loaded"))
     if n < MIN_TRUSTED_SNAP and not meta.get("db_loaded"):
         return False
     return True
@@ -1058,9 +1058,9 @@ def request_city_bytes(city: str | None, *, refresh: bool = False) -> None:
         incomplete = n < MIN_TRUSTED_SNAP and view_city not in _db_loaded
         if not refresh:
             if view_city in _db_loaded and not incomplete:
-                if n == 0:
+                if n == 0 and not snap.get("warming") and (snap.get("encoded") or snap.get("encoded_gzip")):
                     return
-                if snap.get("encoded") and not snap.get("warming"):
+                if n and snap.get("encoded") and not snap.get("warming"):
                     return
                 if n and not snap.get("warming"):
                     _schedule_encode(view_city)
@@ -1154,8 +1154,19 @@ def _load_city_body(city_id: str) -> None:
             except Exception:
                 log.exception("no pude guardar correcciones de tipo en %s", city_id)
         if rows:
+            from .places import clear_empty_view
+
+            if clear_empty_view(city_id):
+                _refresh_meta(force=True)
             _commit_snap(city_id, rows, warming=False, persist=True, db_n=sqlite_n)
             log.warning("cache de %s en disco: %s fichas", city_id, len(rows))
+        else:
+            from .places import mark_empty_view
+
+            if sqlite_n >= 8:
+                mark_empty_view(city_id)
+                _refresh_meta(force=True)
+            _commit_snap(city_id, [], warming=False, persist=True, db_n=sqlite_n)
         log.warning("cache de %s listo: %s avisos", city_id, len(rows))
     except Exception:
         log.exception("no pude armar cache de %s", city_id)
@@ -1706,7 +1717,7 @@ def _write_http_artifacts(
     folder = _disk_dir()
     if folder is None or not city_id or city_id == "*":
         return
-    if n <= 0:
+    if n <= 0 and not (db_loaded and not warming):
         return
     meta = _read_meta(city_id, allow_stale=True)
     if warming and meta and _disk_snap_complete(meta):
@@ -2130,7 +2141,12 @@ def _read_disk_bytes(city_id: str, *, allow_stale: bool = False, allow_incomplet
             allow_stale or time.time() - path.stat().st_mtime <= CITY_CACHE_TTL_SEC
         ):
             raw = path.read_bytes()
-            if raw and not (b'"listings":[]' in raw[:160]) and _snap_ver_ok_bytes(raw):
+            finished_empty = bool(
+                meta and meta.get("db_loaded") and not meta.get("warming") and int(meta.get("n") or 0) <= 0
+            )
+            if raw and _snap_ver_ok_bytes(raw) and (
+                finished_empty or b'"listings":[]' not in raw[:160]
+            ):
                 return raw
     except OSError:
         pass

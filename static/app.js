@@ -147,7 +147,29 @@ function clearLoadedListings() {
   showListingsWait("city");
 }
 
+const emptyPlaces = new Set();
+try {
+  JSON.parse(localStorage.getItem("propmap.emptyPlaces") || "[]").forEach((id) => {
+    if (id) emptyPlaces.add(String(id));
+  });
+} catch (err) {}
+
+function rememberEmptyPlace(cityId) {
+  const id = String(cityId || "");
+  if (!id || emptyPlaces.has(id)) return;
+  emptyPlaces.add(id);
+  localStorage.setItem("propmap.emptyPlaces", JSON.stringify([...emptyPlaces]));
+}
+
+function forgetEmptyPlace(cityId) {
+  const id = String(cityId || "");
+  if (!emptyPlaces.has(id)) return;
+  emptyPlaces.delete(id);
+  localStorage.setItem("propmap.emptyPlaces", JSON.stringify([...emptyPlaces]));
+}
+
 function forgetCityWithoutListings(cityId) {
+  rememberEmptyPlace(cityId);
   const rows = (window.lastCities || []).filter((c) => String(c.id) !== String(cityId));
   window.lastCities = rows;
   window.knownCities = rows;
@@ -391,13 +413,12 @@ async function load(opts = {}) {
     return;
   }
   if (!data.warming && data.layer !== "pins" && !(data.listings || []).length) {
-    const row = (data.cities || []).find((c) => c.id === city);
-    const n = Number(row?.n);
-    if (!Number.isFinite(n) || n < 8) {
+    if (city !== "caba" && city !== "capital-federal") {
       forgetCityWithoutListings(city);
       return;
     }
   }
+  if ((data.listings || []).length) forgetEmptyPlace(city);
   applyListingsPayload(data, city, seq, { keepStatus: opts.keepStatus, live: opts.live });
 }
 
@@ -640,6 +661,7 @@ function placeCatalogKey(c) {
 function cityReadyForCatalog(c) {
   if (!c || !c.id) return false;
   const id = String(c.id);
+  if (emptyPlaces.has(id)) return false;
   if (id.endsWith("-pins") || id.includes("-pins-") || id.includes(".pins")) return false;
   if (!isLocatableCity(c)) return false;
   const n = Number(c.n);
@@ -3184,6 +3206,7 @@ function showSuggest(places, opts = {}) {
 
 async function choosePlace(place) {
   if (!place || !place.id) return;
+  forgetEmptyPlace(place.id);
   pickedPlace = place;
   hideSuggest();
   lastListingsFp = "";
