@@ -1,0 +1,67 @@
+"""HTTP client management with thread-local clients."""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Any
+
+import httpx
+
+from . import policy
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
+
+PROXY_HEADERS = {
+    **HEADERS,
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+PROXY_HOSTS = ("properati.com",)
+LOCAL_HOSTS = ("zonaprop.com", "argenprop.com", "mercadolibre.com")
+
+_tls = threading.local()
+
+def _client_kwargs(timeout: float, headers: dict[str, str], proxy: str | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "headers": headers,
+        "follow_redirects": True,
+        "timeout": timeout,
+    }
+    if proxy:
+        kwargs["proxy"] = proxy
+    return kwargs
+
+def _httpx_get(
+    url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    proxy: str | None = None,
+) -> httpx.Response:
+    hdrs = headers or HEADERS
+    wait_s = max(timeout, 25.0 if proxy else 20.0)
+    if os.environ.get("PROPMAP_TEST") == "1":
+        with httpx.Client(**_client_kwargs(timeout, hdrs, proxy)) as client:
+            return client.get(url)
+    clients = getattr(_tls, "clients", None)
+    if not isinstance(clients, dict):
+        clients = {}
+        _tls.clients = clients
+    key = f"{id(hdrs) if hdrs is HEADERS else 'custom'}|{proxy or ''}"
+    client = clients.get(key)
+    if client is None:
+        client = httpx.Client(
+            **_client_kwargs(wait_s, hdrs, proxy),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+        clients[key] = client
+    return client.get(url)
