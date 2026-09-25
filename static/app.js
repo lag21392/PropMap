@@ -1837,21 +1837,22 @@ function cardHtml(item) {
   const crossing = item.intersection ? ` · intersección ${item.intersection}` : "";
   const between = item.between ? ` · entre ${item.between}` : "";
   const locBit = isExactPin(item) ? " · ubicación real" : isLocationMissing(item) ? " · sin ubicación" : " · ubicación aprox.";
+  const dealNote = (item.deal_label || "").startsWith("revisar") ? ` · ${escapeHtml(item.deal_label)}` : "";
   return `<article class="card${item.favorite ? " is-fav" : ""}${selected}${contacted}${approx}" id="card-${cssId(item.id)}" data-id="${item.id}">
-    ${thumb}
-    <div>
+    <div class="card-left">
+      ${thumb}
+      ${pentagonChart(item.profile, { mini: true, kind: item.property_type })}
+      ${chips ? `<div class="chips card-chips">${chips}</div>` : ""}
+    </div>
+    <div class="card-body">
       <div class="card-top">
         <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
         <div class="price">${money(item)}</div>
         <button class="fav-btn" type="button" data-fav="${item.id}" title="Favorito">${item.favorite ? "\u2605" : "\u2606"}</button>
       </div>
       <div class="headline">${escapeHtml(bits.join(" · ") || item.title || "")}</div>
-      <div class="meta">${escapeHtml(place)}${escapeHtml(crossing)}${escapeHtml(between)} · ${escapeHtml(sourceSummary(item))}${locBit}${item.mortgage_credit === true ? " · apto crédito" : ""}${item.owner_direct === true ? " · dueño" : ""}${item.contacted ? " · contactado" : ""}</div>
-      <span class="tag ${cssId(item.deal_label || "")}">${escapeHtml(item.deal_label || "")}${item.vs_barrio_pct != null ? ` · ${item.vs_barrio_pct > 0 ? "-" : "+"}${Math.abs(item.vs_barrio_pct)}% vs barrio` : ""}</span>
+      <div class="meta">${escapeHtml(place)}${escapeHtml(crossing)}${escapeHtml(between)} · ${escapeHtml(sourceSummary(item))}${locBit}${item.mortgage_credit === true ? " · apto crédito" : ""}${item.owner_direct === true ? " · dueño" : ""}${item.contacted ? " · contactado" : ""}${dealNote}</div>
       ${rentStrip(item)}
-      ${pentagonChart(item.profile, { mini: true, kind: item.property_type })}
-      ${item.quality_label ? `<span class="tag quality">${escapeHtml(item.quality_label)} · ${fmt(item.quality_score)}</span>` : ""}
-      ${chips ? `<div class="chips">${chips}</div>` : ""}
     </div>
   </article>`;
 }
