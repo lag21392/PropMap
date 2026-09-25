@@ -878,6 +878,37 @@ input, select, textarea {
   content-visibility: auto;
   contain-intrinsic-size: 90px;
 }
+.card-left {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 86px;
+}
+.card-left img, .card-left .card-ph {
+  width: 86px;
+  height: 74px;
+  object-fit: cover;
+  border-radius: 10px;
+  background: #123;
+}
+.card-left .radar-card.is-mini {
+  margin: 0;
+}
+.card-left .radar-card.is-mini .radar-plot {
+  max-width: 76px;
+}
+.card-left .radar-card.is-mini svg {
+  width: 76px;
+}
+.card-left .radar-card.is-mini .radar-total {
+  font-size: 11px;
+}
+.card-left .radar-card.is-mini .radar-cap {
+  font-size: 7px;
+}
+.card-body {
+  min-width: 0;
+}
 .card img, .card-ph {
   width: 86px;
   height: 74px;
@@ -1007,6 +1038,8 @@ input, select, textarea {
 .radar-card.is-mini .radar-plot { max-width: 84px; }
 .radar-card.is-mini svg { width: 84px; }
 .radar-card.is-mini .radar-total { font-size: 13px; }
+.radar-card.is-mini .radar-notes { display: none; }
+.radar-card.is-mini .radar-pending { display: none; }
 .ficha-bundle {
   margin: 0 0 12px;
   border: 1px solid var(--line);
@@ -1420,6 +1453,18 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
   flex-wrap: nowrap;
   overflow: hidden;
   max-height: 22px;
+}
+.card-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+.card-left .card-chips .chip {
+  font-size: 9px;
+  padding: 1px 5px;
+  background: rgba(255,255,255,0.05);
+  color: var(--muted);
 }
 .chip {
   font-size: 10px;
