@@ -157,7 +157,7 @@ function parsePlace(text) {
   return null;
 }
 
-window.parseFreeText = function parseFreeText(query) {
+function parseFreeText(query) {
   const text = normalize(query);
   if (!text) return null;
   const out = {
@@ -193,7 +193,15 @@ window.parseFreeText = function parseFreeText(query) {
   return out;
 }
 
-window.applyParsedFilters = function applyParsedFilters(parsed) {
+// ES module export for tests
+export { parseFreeText };
+
+// Global for browser compatibility
+if (typeof window !== "undefined") {
+  window.parseFreeText = parseFreeText;
+}
+
+function applyParsedFilters(parsed) {
   if (!parsed) return;
   const setVal = (id, val) => {
     const el = document.getElementById(id);
@@ -217,4 +225,12 @@ window.applyParsedFilters = function applyParsedFilters(parsed) {
   }
   // Trigger render
   if (typeof render === "function") render();
+}
+
+// ES module export for tests
+export { applyParsedFilters };
+
+// Global for browser compatibility
+if (typeof window !== "undefined") {
+  window.applyParsedFilters = applyParsedFilters;
 }

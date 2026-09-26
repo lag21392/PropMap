@@ -1,15 +1,15 @@
 /* v1790354913 */
 const PRESET_KEY = "propmap.presets.v1";
 
-window.loadPresets = function loadPresets() {
+function loadPresets() {
   try {
     return JSON.parse(localStorage.getItem(PRESET_KEY) || "[]");
   } catch { return []; }
 }
-window.savePresets = function savePresets(list) {
+function savePresets(list) {
   localStorage.setItem(PRESET_KEY, JSON.stringify(list.slice(0,20)));
 }
-window.currentFilters = function currentFilters() {
+function currentFilters() {
   const ids = ["cityFilter","typeFilter","barrioFilter","zonaFilter","maxPrice","minM2","maxM2","minBeds","minRooms","minBaths","sortBy","dealBar"];
   const out = {};
   ids.forEach(id => { const el = document.getElementById(id); if (el) out[id] = el.value; });
@@ -18,7 +18,7 @@ window.currentFilters = function currentFilters() {
   out.favOnly = document.getElementById("favOnly")?.checked || false;
   return out;
 }
-window.applyFilters = function applyFilters(state) {
+function applyFilters(state) {
   Object.entries(state).forEach(([k,v]) => {
     if (k === "traits") {
       document.querySelectorAll('input[name="listingTrait"]').forEach(cb => cb.checked = v.includes(cb.value));
@@ -30,11 +30,24 @@ window.applyFilters = function applyFilters(state) {
   });
   if (typeof render === "function") render();
 }
-window.saveCurrent = function saveCurrent(name) {
+function saveCurrent(name) {
   const list = loadPresets();
   list.unshift({ name, state: currentFilters(), ts: Date.now() });
   savePresets(list);
 }
-window.deletePreset = function deletePreset(idx) {
+function deletePreset(idx) {
   const list = loadPresets(); list.splice(idx,1); savePresets(list);
+}
+
+// ES module exports for tests
+export { loadPresets, savePresets, currentFilters, applyFilters, saveCurrent, deletePreset };
+
+// Global for browser compatibility
+if (typeof window !== "undefined") {
+  window.loadPresets = loadPresets;
+  window.savePresets = savePresets;
+  window.currentFilters = currentFilters;
+  window.applyFilters = applyFilters;
+  window.saveCurrent = saveCurrent;
+  window.deletePreset = deletePreset;
 }

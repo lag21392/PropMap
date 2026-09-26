@@ -47,9 +47,9 @@ Implementar las features de alta prioridad y bajo esfuerzo de la Fase 1 de ambos
 4. [x] Búsqueda por texto libre: input + parser regex
 5. [x] Filtros guardados: persistir en localStorage
 6. [x] Responsive móvil: breakpoints y panel colapsable
-7. [ ] Afiliación: añadir UTM tracking a outlinks
-8. [ ] Afiliación: evento Matomo `outlink_affiliate`
-9. [ ] Donaciones: botón + página /apoya + Stripe integration
+7. [x] Afiliación: añadir UTM tracking a outlinks (2026-09-25, commit c998c94)
+8. [x] Afiliación: evento Matomo `outlink_affiliate` (2026-09-25, commit c998c94)
+9. [x] Donaciones: botón + página /apoya + Stripe integration (2026-09-25, commit b243a09)
 
 ## Criterios de aceptación
 - Modo oscuro funcional con toggle y preferencia del sistema
