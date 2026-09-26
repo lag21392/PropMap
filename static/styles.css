@@ -232,6 +232,53 @@ h1, h2 {
   align-items: center;
   gap: 8px;
 }
+.donate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid rgba(42, 74, 60, 0.28);
+  background: var(--deal);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-decoration: none;
+  border-radius: 6px;
+}
+.donate-btn:hover, .donate-btn:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+.donate-btn.large {
+  height: 48px;
+  font-size: 14px;
+  border-radius: 8px;
+}
+.apoya-main {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 24px;
+}
+.donate-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin: 24px 0;
+}
+.donate-card {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 20px;
+}
+.transparency {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
 .account-btn {
   flex: 0 0 auto;
   height: 36px;

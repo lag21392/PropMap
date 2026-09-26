@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="es" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Apoya PropMap</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="css/tokens.css" />
+<meta name="theme-color" content="#2f5346" />
+</head>
+<body>
+<div class="shell">
+  <header class="brand">
+    <div class="brand-top">
+      <div class="logo">
+        <span class="logo-mark" aria-hidden="true"></span>
+        <span class="logo-word">PROPMAP</span>
+      </div>
+      <div class="brand-actions">
+        <a href="/" class="back-link">← Volver</a>
+      </div>
+    </div>
+  </header>
+  <main class="apoya-main">
+    <h1>Apoya PropMap</h1>
+    <p>PropMap es un proyecto independiente, sin publicidad intrusiva y sin venta de datos. Tu aporte ayuda a mantener los servidores, mejorar los datos y agregar nuevas features.</p>
+    <div class="donate-cards">
+      <div class="donate-card">
+        <h2>Donación única</h2>
+        <p>Con un aporte puntual ayudás a cubrir costos de infraestructura.</p>
+        <a class="donate-btn large" href="https://buymeacoffee.com/propmap" target="_blank" rel="noopener">Donar con Buy Me a Coffee</a>
+      </div>
+      <div class="donate-card">
+        <h2>Stripe</h2>
+        <p>Donación segura con Stripe.</p>
+        <a class="donate-btn large" href="https://buy.stripe.com/test_..." target="_blank" rel="noopener">Donar con Stripe</a>
+      </div>
+    </div>
+    <section class="transparency">
+      <h2>Transparencia</h2>
+      <ul>
+        <li>Costos mensuales aproximados: hosting, APIs, backups.</li>
+        <li>100% del aporte se usa para mantener el servicio.</li>
+        <li>Informes trimestrales de uso de fondos en este sitio.</li>
+      </ul>
+    </section>
+  </main>
+</div>
+<script>
+  const stored = localStorage.getItem('propmap.theme');
+  const prefers = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const theme = stored || (prefers ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-theme', theme);
+</script>
+</body>
+</html>
