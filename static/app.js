@@ -8,12 +8,92 @@ const map = L.map("map", {
 }).setView([-38.4161, -63.6167], 5);
 window.map = map;
 
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-  maxZoom: 19,
-  updateWhenIdle: true,
-  keepBuffer: 2,
-}).addTo(map);
+// Tile layers for light/dark themes
+const tileLayers = {
+  light: L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+    updateWhenIdle: true,
+    keepBuffer: 2,
+  }),
+  dark: L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    maxZoom: 19,
+    updateWhenIdle: true,
+    keepBuffer: 2,
+  })
+};
+
+// Theme management
+const THEME_KEY = 'propmap.theme';
+const THEME_META_SELECTOR = 'meta[name="theme-color"]';
+
+function getSystemTheme() {
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function getStoredTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY);
+  } catch (_) {
+    return null;
+  }
+}
+
+function setTheme(theme) {
+  const isDark = theme === 'dark';
+  document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+  
+  // Update meta theme-color
+  const metaTheme = document.querySelector(THEME_META_SELECTOR);
+  if (metaTheme) {
+    metaTheme.setAttribute('content', isDark ? '#1e2520' : '#2f5346');
+  }
+  
+  // Switch tile layer
+  if (map) {
+    Object.values(tileLayers).forEach(layer => map.removeLayer(layer));
+    tileLayers[theme].addTo(map);
+  }
+  
+  // Update button icon if present
+  const themeToggle = document.getElementById('themeToggle');
+  if (themeToggle) {
+    themeToggle.textContent = isDark ? '☀️' : '🌙';
+    themeToggle.setAttribute('aria-label', isDark ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro');
+    themeToggle.title = isDark ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro';
+  }
+  
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch (_) {}
+}
+
+function initTheme() {
+  const stored = getStoredTheme();
+  const initialTheme = stored || getSystemTheme();
+  setTheme(initialTheme);
+  
+  // Listen for system theme changes if no stored preference
+  if (!stored && window.matchMedia) {
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    mediaQuery.addEventListener('change', (e) => {
+      setTheme(e.matches ? 'dark' : 'light');
+    });
+  }
+  
+  // Theme toggle button
+  const themeToggle = document.getElementById('themeToggle');
+  if (themeToggle) {
+    themeToggle.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      const newTheme = current === 'dark' ? 'light' : 'dark';
+      setTheme(newTheme);
+    });
+  }
+}
+
+tileLayers.light.addTo(map);
 const poiLayer = L.layerGroup().addTo(map);
 
 const exactCluster = L.markerClusterGroup({
@@ -3866,6 +3946,9 @@ if (landingType && $("typeFilter") && [...$("typeFilter").options].some((opt) =>
   syncRoomFilters();
 }
 if (landingText && $("placeQuery")) $("placeQuery").value = landingText;
+
+// Initialize theme
+initTheme();
 
 bindFolds();
 hydrateAuth().finally(() => {

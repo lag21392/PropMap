@@ -41,9 +41,9 @@ Implementar las features de alta prioridad y bajo esfuerzo de la Fase 1 de ambos
 - Página /apoya con transparencia
 
 ## Tareas
-1. [ ] Modo oscuro: crear design tokens CSS con tema claro/oscuro
-2. [ ] Modo oscuro: implementar toggle + prefers-color-scheme
-3. [ ] Modo oscuro: aplicar tiles oscuros al mapa Leaflet
+1. [x] Modo oscuro: crear design tokens CSS con tema claro/oscuro
+2. [x] Modo oscuro: implementar toggle + prefers-color-scheme
+3. [x] Modo oscuro: aplicar tiles oscuros al mapa Leaflet
 4. [ ] Búsqueda por texto libre: input + parser regex
 5. [ ] Filtros guardados: persistir en localStorage
 6. [ ] Responsive móvil: breakpoints y panel colapsable
