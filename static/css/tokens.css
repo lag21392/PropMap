@@ -1,0 +1,36 @@
+:root {
+  --ink: #1c2a22;
+  --muted: #5a6b61;
+  --bg: #dce8df;
+  --panel: #f3f7f3;
+  --paper: #fbfcf9;
+  --line: rgba(42, 74, 60, 0.16);
+  --teal: #2a4a3c;
+  --sand: #9a5a28;
+  --flare: #d4e3b8;
+  --deal: #1f7a4a;
+  --good: #6a8f2e;
+  --market: #3d6f8a;
+  --high: #c45c3a;
+  --warn: #a07a2e;
+  --dock: 64px;
+}
+
+/* Dark mode - activates when html has data-theme="dark" */
+[data-theme="dark"] {
+  --ink: #f4f1ec;
+  --muted: #8a9a8f;
+  --bg: #1e2520;
+  --panel: #2a342f;
+  --paper: #233530;
+  --line: rgba(255, 255, 255, 0.12);
+  --teal: #4a5a4f;
+  --sand: #c49a78;
+  --flare: #2a3833;
+  --deal: #4a996e;
+  --good: #8faa5e;
+  --market: #5a8aa3;
+  --high: #e8734e;
+  --warn: #d4a057;
+  --dock: 64px;
+}

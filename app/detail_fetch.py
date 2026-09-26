@@ -145,7 +145,9 @@ def refill(prefer_city: str = "") -> int:
     from . import store
 
     items = store.fetch_detail_backlog(min(24, room + 8), prefer_city=prefer_city)
-    take = [item for item in items if item.id not in skip][:room]
+    # Los items cuyo LLM ya está completo no necesitan otra bajada de ficha: el
+    # enriquecimiento ya los procesó y re-parsear solo quema ancho de banda.
+    take = [item for item in items if item.id not in skip and needs_llm(item)][:room]
     if take:
         # Limpiar cooling para estos items ya que el backfill los está reintentando
         with _lock:

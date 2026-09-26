@@ -5,7 +5,7 @@ const map = L.map("map", {
   doubleClickZoom: true,
   boxZoom: true,
   inertia: true,
-}).setView([-38.4161, -63.6167], 4);
+}).setView([-38.4161, -63.6167], 5);
 window.map = map;
 
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -941,9 +941,9 @@ function zoneIcon(group) {
   return L.divIcon({
     className: `zone-pin approx${lost ? " is-lost" : ""}${selected ? " is-selected" : ""}`,
     html: `<span style="border-color:${color};color:${color}"><b>${group.items.length}</b></span>`,
-    iconSize: [44, 44],
-    iconAnchor: [22, 22],
-    popupAnchor: [0, -18],
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+    popupAnchor: [0, -12],
   });
 }
 
@@ -1179,9 +1179,9 @@ function stackIcon(group) {
   return L.divIcon({
     className: `zone-pin stack-pin${selected ? " is-selected" : ""}`,
     html: `<span style="border-color:${color};color:${color}"><b>${group.items.length}</b></span>`,
-    iconSize: [34, 34],
-    iconAnchor: [17, 17],
-    popupAnchor: [0, -14],
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+    popupAnchor: [0, -9],
   });
 }
 
@@ -1318,6 +1318,7 @@ function paintList(items) {
 }
 
 function paintMapMarkers(items) {
+  console.log('[paintMapMarkers] called with', items?.length, 'items');
   const t0 = performance.now();
   const gen = ++mapPaintGen;
   exactCluster.clearLayers();
@@ -1400,6 +1401,7 @@ function paintMapMarkers(items) {
     if (z < zoneList.length) requestAnimationFrame(addZones);
   };
   addZones();
+  console.log('[paintMapMarkers] done, markers added, total items:', items.length);
   markClient("paintMap", performance.now() - t0, { n: items.length });
 }
 
@@ -1430,7 +1432,12 @@ function render() {
       fillListingFicha(current);
     }
   }
-  requestAnimationFrame(() => paintMapMarkers(items));
+  console.log('[render] Calling paintMapMarkers + fitMapToItems, items:', items.length);
+  requestAnimationFrame(() => {
+    console.log('[render RAF] Starting paintMapMarkers + fitMapToItems');
+    paintMapMarkers(items);
+    fitMapToItems(items);
+  });
   renderStats();
 }
 
@@ -3041,16 +3048,50 @@ function viewBounds(view) {
   return [[view.lat - dlat, view.lon - dlon], [view.lat + dlat, view.lon + dlon]];
 }
 
+function fitMapToItems(items) {
+  const points = (items || [])
+    .filter((item) => Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lon)))
+    .map((item) => [Number(item.lat), Number(item.lon)]);
+  console.log('[fitMapToItems] items:', items?.length, 'points:', points.length);
+  if (!points.length) {
+    console.log('[fitMapToItems] No valid points, skipping');
+    return;
+  }
+  if (points.length === 1) {
+    console.log('[fitMapToItems] Single point, setView:', points[0]);
+    map.setView(points[0], 14, { animate: true });
+    return;
+  }
+  const bounds = L.latLngBounds(points);
+  console.log('[fitMapToItems] bounds:', bounds.toBBoxString(), 'map zoom:', map.getZoom());
+  map.fitBounds(bounds, {
+    padding: [80, 80],
+    maxZoom: 16,
+    animate: true,
+  });
+  console.log('[fitMapToItems] after fitBounds, map zoom:', map.getZoom());
+}
+
 function focusCity(cityId) {
   const view = CITY_VIEWS[cityId];
-  if (!view || view.lat == null || view.lon == null || Number.isNaN(Number(view.lat))) return;
-  if (Math.abs(Number(view.lat) + 38.4161) < 0.05 && Math.abs(Number(view.lon) + 63.6167) < 0.05) return;
+  console.log('[focusCity] cityId:', cityId, 'view:', view);
+  if (!view || view.lat == null || view.lon == null || Number.isNaN(Number(view.lat))) {
+    console.log('[focusCity] Invalid view, returning');
+    return;
+  }
+  if (Math.abs(Number(view.lat) + 38.4161) < 0.05 && Math.abs(Number(view.lon) + 63.6167) < 0.05) {
+    console.log('[focusCity] At default Argentina center, returning');
+    return;
+  }
   const run = () => {
     const bounds = viewBounds(view);
+    console.log('[focusCity] bounds:', bounds);
     if (bounds) {
-      map.fitBounds(bounds, { padding: [28, 28], maxZoom: 14, animate: true });
+      console.log('[focusCity] Calling fitBounds with bounds:', bounds);
+      map.fitBounds(bounds, { padding: [80, 80], maxZoom: 16, animate: true });
       return;
     }
+    console.log('[focusCity] No bounds, calling setView:', view.lat, view.lon, view.zoom || 13);
     map.setView([view.lat, view.lon], view.zoom || 13, { animate: true });
   };
   if (window.innerWidth <= 980) {

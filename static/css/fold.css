@@ -1,0 +1,36 @@
+.fold {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  overflow: hidden;
+}
+.fold-head {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  padding: 12px 14px;
+  font-weight: 700;
+  font-size: 13px;
+}
+.fold-head::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--sand);
+  border-bottom: 2px solid var(--sand);
+  transform: rotate(-45deg);
+  transition: transform 0.16s ease;
+}
+.fold.is-open .fold-head::after {
+  transform: rotate(45deg);
+}
+.fold-body {
+  padding: 0 10px 10px;
+}
+.fold-body[hidden] { display: none; }

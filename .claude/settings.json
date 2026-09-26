@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s https://api.github.com/repos/Gentleman-Programming/gentle-ai/contents/.claude)",
+      "Bash(curl -s https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/package.json)",
+      "Bash(curl -s https://raw.githubusercontent.com/Gentleman-Programming/gentle-shell/main/README.md)",
+      "Bash(curl -s https://api.github.com/repos/Gentleman-Programming/gentle-shell/contents/docs)",
+      "Bash(curl -s https://raw.githubusercontent.com/Gentleman-Programming/gentle-shell/main/docs/readme-reference.md)"
+    ]
+  }
+}

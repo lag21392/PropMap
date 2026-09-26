@@ -1,0 +1,130 @@
+.filters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+  margin: 0 0 10px;
+}
+.filters > label {
+  min-width: 0;
+}
+.filters .place-wrap,
+.filters .span-2,
+.filters .trait-filters,
+.filters .size-counts {
+  grid-column: 1 / -1;
+}
+.size-counts {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+}
+.size-counts label {
+  min-width: 0;
+}
+.size-counts select:disabled {
+  opacity: 0.45;
+}
+.place-wrap { position: relative; }
+.place-suggest {
+  position: absolute;
+  z-index: 30;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  max-height: 240px;
+  overflow: auto;
+  box-shadow: 0 12px 30px rgba(28, 42, 34, 0.12);
+}
+.place-suggest button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 9px 12px;
+}
+.place-suggest button:hover,
+.place-suggest button.is-active { background: rgba(42, 74, 60, 0.08); }
+.place-suggest small { color: var(--muted); display: block; font-size: 11px; font-weight: 400; }
+.place-suggest-empty {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.filters label, dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+input, select, textarea {
+  background: var(--paper);
+  border: 1px solid rgba(42, 74, 60, 0.22);
+  border-radius: 10px;
+  padding: 6px 8px;
+  color: var(--ink);
+}
+.check {
+  flex-direction: row !important;
+  align-items: flex-end !important;
+  gap: 8px !important;
+  margin-top: 0;
+  padding-bottom: 6px;
+}
+.trait-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.filters .trait-filters label {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin: 0;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+  box-shadow: none;
+}
+.filters .trait-filters label:hover {
+  border-color: var(--teal);
+  background: var(--panel);
+}
+.filters .trait-filters label:has(input:checked) {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: var(--paper);
+  font-weight: 700;
+}
+.trait-filters input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  overflow: hidden;
+}
+.filters .trait-filters label:focus-within {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+.block { margin-top: 8px; }
+.search-row { display: flex; gap: 8px; }
+.search-row .primary { flex: 1; }
+.search-row button { width: auto; }

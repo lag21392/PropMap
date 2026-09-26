@@ -23,6 +23,9 @@ services:
       - "8010:8000"
     volumes:
       - ./data-dev:/app/data
+      - ./data/listings.sqlite:/app/data/listings.sqlite
+      - ./data/listings.sqlite-wal:/app/data/listings.sqlite-wal
+      - ./data/listings.sqlite-shm:/app/data/listings.sqlite-shm
       - ./static:/app/static:ro
       - ./app:/app/app:ro
     environment:

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#2f5346" />
-  <meta name="color-scheme" content="light" />
+  <meta name="color-scheme" content="light dark" />
   <title>Casas en venta en Argentina · Mapa con score | PropMap</title>
   <meta name="description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
   <meta name="robots" content="index, follow, max-image-preview:large" />
@@ -62,9 +62,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui42" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui44" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui100" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui105" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="all" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -72,7 +72,8 @@
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui42" />
+  <link rel="stylesheet" href="/static/css/tokens.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui44" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -85,6 +86,7 @@
             <span class="logo-word">PROPMAP</span>
           </div>
           <div class="brand-actions">
+            <button type="button" class="theme-toggle" id="themeToggle" title="Cambiar tema" aria-label="Cambiar tema">🌓</button>
             <button type="button" class="account-btn" id="accountBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu" title="Cuenta">
               Cuenta
             </button>
@@ -558,6 +560,6 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
-  <script defer src="/static/app.js?v=ui100"></script>
+  <script defer src="/static/app.js?v=ui105"></script>
 </body>
 </html>

@@ -586,11 +586,19 @@ button:disabled { opacity: 0.55; cursor: wait; }
 }
 .fav-btn {
   background: transparent;
-  color: var(--sand);
+  color: #fff;
   font-size: 20px;
   line-height: 1;
   padding: 0 4px;
   min-width: 28px;
+}
+input[type="number"] {
+  color-scheme: light;
+}
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  filter: invert(1);
+  opacity: 0.8;
 }
 .card.is-fav { border-color: rgba(226, 196, 142, 0.45); }
 .card.is-selected {
@@ -630,13 +638,13 @@ button:disabled { opacity: 0.55; cursor: wait; }
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 42px;
-  height: 42px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   border: 2px dashed currentColor;
   background: rgba(8, 22, 30, 0.82);
-  box-shadow: 0 0 0 8px rgba(126, 182, 214, 0.16);
-  font-size: 13px;
+  box-shadow: 0 0 0 4px rgba(126, 182, 214, 0.16);
+  font-size: 10px;
   font-weight: 700;
 }
 .zone-pin.approx span {
@@ -648,7 +656,7 @@ button:disabled { opacity: 0.55; cursor: wait; }
   opacity: 0.78;
 }
 .zone-pin.is-selected span {
-  box-shadow: 0 0 0 8px rgba(46, 196, 182, 0.35);
+  box-shadow: 0 0 0 4px rgba(46, 196, 182, 0.35);
   background: rgba(46, 196, 182, 0.18);
 }
 .leaflet-div-icon.pin-hub { background: transparent; border: none; }
@@ -661,14 +669,14 @@ button:disabled { opacity: 0.55; cursor: wait; }
   box-shadow: 0 0 0 2px rgba(7, 20, 28, 0.9);
 }
 .stack-pin span {
-  width: 32px;
-  height: 32px;
+  width: 20px;
+  height: 20px;
   border-style: solid;
-  box-shadow: 0 0 0 4px rgba(126, 182, 214, 0.22);
-  font-size: 12px;
+  box-shadow: 0 0 0 2px rgba(126, 182, 214, 0.22);
+  font-size: 9px;
 }
 .stack-pin.is-selected span {
-  box-shadow: 0 0 0 5px rgba(46, 196, 182, 0.4);
+  box-shadow: 0 0 0 3px rgba(46, 196, 182, 0.4);
 }
 .leaflet-popup.pick-popup .leaflet-popup-content {
   margin: 8px 10px;
@@ -1942,7 +1950,7 @@ button {
 #map { background: #d7e0d4; }
 .zone-pin span {
   background: rgba(251, 252, 249, 0.92);
-  box-shadow: 0 0 0 8px rgba(61, 111, 138, 0.12);
+  box-shadow: 0 0 0 4px rgba(61, 111, 138, 0.12);
 }
 .prop-pin span { box-shadow: 0 0 0 2px rgba(251, 252, 249, 0.95); }
 .pin-hub span {
@@ -2572,4 +2580,51 @@ a { color: var(--teal); }
 .marker-pulsing {
   animation: pulse-scale 1.2s ease-out, pulse-shadow 1.2s ease-out, pulse-border 1.2s ease-out infinite;
   will-change: transform, box-shadow, border-width;
+}
+
+/* Light interface surfaces. */
+.list-rail,
+.card,
+.kpi,
+.market-pulse,
+.market-stat,
+.market-type,
+.market-row,
+.place-suggest,
+.map-loading,
+.map-hint,
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip,
+.barrio-label div,
+.barrio-tip,
+input,
+select,
+textarea {
+  background: #fff;
+  color: var(--ink);
+}
+.list-rail {
+  background: #fff;
+}
+.card-skel {
+  background: linear-gradient(90deg, #f4f7f4 0%, #e6f1eb 45%, #f4f7f4 100%);
+}
+.map-loading,
+.map-hint {
+  border-color: var(--line);
+  color: var(--ink);
+}
+.barrio-label div,
+.barrio-tip {
+  color: var(--ink);
+}
+.barrio-label span {
+  color: var(--muted);
+}
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  color: var(--ink);
+}
+.zone-pin span {
+  background: #fff;
 }
