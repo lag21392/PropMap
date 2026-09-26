@@ -1883,11 +1883,33 @@ function sourceSummary(item) {
   return labels.join(" · ") || sourceLabel(item);
 }
 
+function addUtmParams(url, portal) {
+  if (!url) return url;
+  try {
+    const u = new URL(url, window.location.origin);
+    u.searchParams.set('utm_source', 'propmap');
+    u.searchParams.set('utm_medium', 'affiliate');
+    u.searchParams.set('utm_campaign', 'city_' + (document.getElementById('cityFilter')?.value || 'all'));
+    if (portal) u.searchParams.set('utm_content', portal);
+    return u.toString();
+  } catch (_) {
+    return url;
+  }
+}
+
+function trackOutlink(portal, listingId) {
+  if (window._paq) {
+    window._paq.push(['trackEvent', 'Outlink', 'click', 'affiliate', portal + '_' + listingId]);
+  }
+}
+
 function sourceLinkHtml(item, className) {
   const cls = className ? ` class="${className}"` : "";
-  const links = sourceRows(item).filter((row) => row.url).map((row) =>
-    `<a${cls} href="${row.url}" target="_blank" rel="noopener">${escapeHtml(row.label || row.source || "Aviso")}</a>`
-  );
+  const links = sourceRows(item).filter((row) => row.url).map((row) => {
+    const portal = row.source || item.source || '';
+    const url = addUtmParams(row.url, portal);
+    return `<a${cls} href="${url}" target="_blank" rel="noopener" data-portal="${portal}" data-listing="${item.id}" onclick="trackOutlink('${portal}','${item.id}')">${escapeHtml(row.label || row.source || "Aviso")}</a>`;
+  });
   return links.join(" · ");
 }
 
