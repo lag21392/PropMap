@@ -1,15 +1,15 @@
 /* v1790354913 */
 const PRESET_KEY = "propmap.presets.v1";
 
-export function loadPresets() {
+window.loadPresets = function loadPresets() {
   try {
     return JSON.parse(localStorage.getItem(PRESET_KEY) || "[]");
   } catch { return []; }
 }
-export function savePresets(list) {
+window.savePresets = function savePresets(list) {
   localStorage.setItem(PRESET_KEY, JSON.stringify(list.slice(0,20)));
 }
-export function currentFilters() {
+window.currentFilters = function currentFilters() {
   const ids = ["cityFilter","typeFilter","barrioFilter","zonaFilter","maxPrice","minM2","maxM2","minBeds","minRooms","minBaths","sortBy","dealBar"];
   const out = {};
   ids.forEach(id => { const el = document.getElementById(id); if (el) out[id] = el.value; });
@@ -18,7 +18,7 @@ export function currentFilters() {
   out.favOnly = document.getElementById("favOnly")?.checked || false;
   return out;
 }
-export function applyFilters(state) {
+window.applyFilters = function applyFilters(state) {
   Object.entries(state).forEach(([k,v]) => {
     if (k === "traits") {
       document.querySelectorAll('input[name="listingTrait"]').forEach(cb => cb.checked = v.includes(cb.value));
@@ -30,11 +30,11 @@ export function applyFilters(state) {
   });
   if (typeof render === "function") render();
 }
-export function saveCurrent(name) {
+window.saveCurrent = function saveCurrent(name) {
   const list = loadPresets();
   list.unshift({ name, state: currentFilters(), ts: Date.now() });
   savePresets(list);
 }
-export function deletePreset(idx) {
+window.deletePreset = function deletePreset(idx) {
   const list = loadPresets(); list.splice(idx,1); savePresets(list);
 }

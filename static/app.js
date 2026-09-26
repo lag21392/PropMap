@@ -3933,6 +3933,122 @@ function whenIdle(fn) {
   setTimeout(fn, 1200);
 }
 
+// Free-text search initialization
+function initFreeTextSearch() {
+  const freeTextInput = $("freeTextSearch");
+  if (!freeTextInput) return;
+  
+  freeTextInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const query = freeTextInput.value.trim();
+      if (!query) return;
+      
+      if (typeof window.parseFreeText === "function" && typeof window.applyParsedFilters === "function") {
+        const parsed = window.parseFreeText(query);
+        window.applyParsedFilters(parsed);
+      }
+    }
+  });
+  
+  // Clear free text when filters change manually
+  const filterIds = ["cityFilter", "typeFilter", "barrioFilter", "maxPrice", "minM2", "maxM2", "minBeds"];
+  filterIds.forEach(id => {
+    const el = $(id);
+    if (el) {
+      el.addEventListener("change", () => {
+        if (freeTextInput.value) freeTextInput.value = "";
+      });
+    }
+  });
+}
+
+// Filter presets initialization
+function initFilterPresets() {
+  // Add preset UI elements if not present
+  const filtersContainer = document.querySelector(".filters");
+  if (!filtersContainer || filtersContainer.querySelector("#presetControls")) return;
+  
+  const presetDiv = document.createElement("div");
+  presetDiv.id = "presetControls";
+  presetDiv.className = "preset-controls";
+  presetDiv.innerHTML = `
+    <label class="span-2">
+      <span>Filtros guardados</span>
+      <div class="preset-row">
+        <input id="presetName" type="text" placeholder="Nombre del preset" />
+        <button type="button" id="savePresetBtn" class="btn-small">Guardar</button>
+        <select id="presetSelect" class="preset-select">
+          <option value="">Cargar preset...</option>
+        </select>
+        <button type="button" id="loadPresetBtn" class="btn-small">Cargar</button>
+        <button type="button" id="deletePresetBtn" class="btn-small">Borrar</button>
+      </div>
+    </label>
+  `;
+  filtersContainer.insertBefore(presetDiv, filtersContainer.firstChild);
+  
+  const presetName = $("presetName");
+  const saveBtn = $("savePresetBtn");
+  const presetSelect = $("presetSelect");
+  const loadBtn = $("loadPresetBtn");
+  const deleteBtn = $("deletePresetBtn");
+  
+  function refreshPresets() {
+    if (!presetSelect) return;
+    const presets = window.loadPresets ? window.loadPresets() : [];
+    presetSelect.innerHTML = '<option value="">Cargar preset...</option>';
+    presets.forEach((p, i) => {
+      const opt = document.createElement("option");
+      opt.value = i;
+      opt.textContent = `${p.name} (${new Date(p.ts).toLocaleDateString()})`;
+      presetSelect.appendChild(opt);
+    });
+  }
+  
+  if (saveBtn && presetName) {
+    saveBtn.addEventListener("click", () => {
+      const name = presetName.value.trim();
+      if (!name) {
+        alert("Ingresa un nombre para el preset");
+        return;
+      }
+      if (typeof window.saveCurrent === "function") {
+        window.saveCurrent(name);
+        presetName.value = "";
+        refreshPresets();
+      }
+    });
+  }
+  
+  if (loadBtn && presetSelect) {
+    loadBtn.addEventListener("click", () => {
+      const idx = parseInt(presetSelect.value);
+      if (isNaN(idx)) return;
+      const presets = window.loadPresets ? window.loadPresets() : [];
+      const preset = presets[idx];
+      if (preset && typeof window.applyFilters === "function") {
+        window.applyFilters(preset.state);
+      }
+    });
+  }
+  
+  if (deleteBtn && presetSelect) {
+    deleteBtn.addEventListener("click", () => {
+      const idx = parseInt(presetSelect.value);
+      if (isNaN(idx)) return;
+      if (confirm("¿Borrar preset?")) {
+        if (typeof window.deletePreset === "function") {
+          window.deletePreset(idx);
+          refreshPresets();
+        }
+      }
+    });
+  }
+  
+  refreshPresets();
+}
+
 const landingQuery = new URLSearchParams(location.search);
 let landingBarrio = landingQuery.get("barrio") || "";
 const landingCity = landingQuery.get("ciudad") || "";
@@ -3949,6 +4065,12 @@ if (landingText && $("placeQuery")) $("placeQuery").value = landingText;
 
 // Initialize theme
 initTheme();
+
+// Initialize free-text search
+initFreeTextSearch();
+
+// Initialize filter presets
+initFilterPresets();
 
 bindFolds();
 hydrateAuth().finally(() => {

@@ -101,6 +101,10 @@
 
       <div class="panel-scroll">
       <div class="filters">
+        <label class="span-2 place-wrap">
+          <span>Búsqueda libre</span>
+          <input id="freeTextSearch" type="search" placeholder="Ej: casa 3 dormitorios Palermo hasta 200k USD" autocomplete="off" spellcheck="false" />
+        </label>
         <label class="place-wrap">Lugar
           <input id="placeQuery" type="search" placeholder="Escribí una ciudad" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="placeSuggest" />
           <div id="placeSuggest" class="place-suggest" hidden></div>
@@ -560,6 +564,8 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
+  <script defer src="/static/parse-free-text.js"></script>
+  <script defer src="/static/filter-presets.js"></script>
   <script defer src="/static/app.js?v=ui105"></script>
 </body>
 </html>

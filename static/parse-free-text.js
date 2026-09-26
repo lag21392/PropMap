@@ -157,7 +157,7 @@ function parsePlace(text) {
   return null;
 }
 
-export function parseFreeText(query) {
+window.parseFreeText = function parseFreeText(query) {
   const text = normalize(query);
   if (!text) return null;
   const out = {
@@ -193,7 +193,7 @@ export function parseFreeText(query) {
   return out;
 }
 
-export function applyParsedFilters(parsed) {
+window.applyParsedFilters = function applyParsedFilters(parsed) {
   if (!parsed) return;
   const setVal = (id, val) => {
     const el = document.getElementById(id);
