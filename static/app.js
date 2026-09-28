@@ -104,6 +104,12 @@ const exactCluster = L.markerClusterGroup({
   singleMarkerMode: false,
 });
 map.addLayer(exactCluster);
+let mapPointer = false;
+let mapPaintHeld = false;
+const mapBox = map.getContainer();
+mapBox.addEventListener("pointerdown", () => { mapPointer = true; });
+mapBox.addEventListener("pointerup", releaseMapPointer);
+mapBox.addEventListener("pointercancel", releaseMapPointer);
 
 const zoneLayer = L.layerGroup().addTo(map);
 let zoneMarkersByKey = {};
@@ -113,7 +119,10 @@ let approxBox = null;
 let allListings = [];
 let listWindowItems = [];
 let listWinRange = "";
+let listCardH = 200;
+let listUserMoved = false;
 let mapPaintGen = 0;
+let mapPaintKey = "";
 let facebook = [];
 let markersById = {};
 let pollTimer = null;
@@ -124,6 +133,9 @@ let noteTimers = {};
 let selectedId = null;
 let loadInFlight = false;
 let lastListingsFp = "";
+let cardPagesLoaded = 0;
+let pinsSettled = false;
+let mapPaintTimer = 0;
 let lastListingsFetchAt = 0;
 let listingsReady = false;
 let scrapeRunning = false;
@@ -204,10 +216,14 @@ function clearLoadedListings() {
   allListings = [];
   listWindowItems = [];
   listWinRange = "";
+  listUserMoved = false;
   lastListingsFp = "";
+  cardPagesLoaded = 0;
+  pinsSettled = false;
   listingsRev = 0;
   selectedId = null;
   mapPaintGen += 1;
+  mapPaintKey = "";
   exactCluster.clearLayers();
   zoneLayer.clearLayers();
   markersById = {};
@@ -227,7 +243,29 @@ function clearLoadedListings() {
   showListingsWait("city");
 }
 
+const emptyPlaces = new Set();
+try {
+  JSON.parse(localStorage.getItem("propmap.emptyPlaces") || "[]").forEach((id) => {
+    if (id) emptyPlaces.add(String(id));
+  });
+} catch (err) {}
+
+function rememberEmptyPlace(cityId) {
+  const id = String(cityId || "");
+  if (!id || emptyPlaces.has(id)) return;
+  emptyPlaces.add(id);
+  localStorage.setItem("propmap.emptyPlaces", JSON.stringify([...emptyPlaces]));
+}
+
+function forgetEmptyPlace(cityId) {
+  const id = String(cityId || "");
+  if (!emptyPlaces.has(id)) return;
+  emptyPlaces.delete(id);
+  localStorage.setItem("propmap.emptyPlaces", JSON.stringify([...emptyPlaces]));
+}
+
 function forgetCityWithoutListings(cityId) {
+  rememberEmptyPlace(cityId);
   const rows = (window.lastCities || []).filter((c) => String(c.id) !== String(cityId));
   window.lastCities = rows;
   window.knownCities = rows;
@@ -380,46 +418,238 @@ function isLocationMissing(item) {
   return !streetAddress(item) && !hasInterseccion(item) && !hasScrapedApprox(item);
 }
 
-function prefetchPins(city, seq, waitKind) {
+function prefetchPins(city, seq, waitKind, attempt = 0) {
+  if (pinsSettled || attempt > 24 || seq !== viewSeq || currentCity() !== city) return;
   const q = new URLSearchParams({ city, pins: "1" });
   const ac = new AbortController();
-  const kill = setTimeout(() => ac.abort(), 8000);
+  const kill = setTimeout(() => ac.abort(), 45000);
   timedFetch("/api/listings?" + q.toString(), "listings.pins", { signal: ac.signal })
     .then((res) => (res.ok ? res.json() : null))
     .then((data) => {
-      if (!data || seq !== viewSeq || currentCity() !== city) return;
-      if (!(data.listings || []).length) return;
+      if (seq !== viewSeq || currentCity() !== city) return;
+      const rows = (data && data.listings) || [];
+      if (!rows.length) {
+        setTimeout(() => prefetchPins(city, seq, waitKind, attempt + 1), 700);
+        return;
+      }
       applyListingsPayload(data, city, seq, { keepStatus: true });
-      if ($("statusLine") && String(lastListingsFp).endsWith(":p")) {
-        $("statusLine").textContent = `Mostrando ${allListings.length} avisos. Cargando fichas…`;
+      if (data.warming && !pinsSettled) {
+        setTimeout(() => prefetchPins(city, seq, waitKind, attempt + 1), 800);
       }
     })
-    .catch(() => {})
+    .catch(() => {
+      if (seq === viewSeq && currentCity() === city && !pinsSettled) {
+        setTimeout(() => prefetchPins(city, seq, waitKind, attempt + 1), 1000);
+      }
+    })
     .finally(() => clearTimeout(kill));
+}
+
+function absorbPins(rows, warming) {
+  const incoming = applyLocalPins(rows || []).map(withCachedFicha);
+  if (!incoming.length) return 0;
+  const byId = new Map(allListings.map((item) => [item.id, item]));
+  const seen = new Set();
+  const next = [];
+  for (const pin of incoming) {
+    seen.add(pin.id);
+    const prev = byId.get(pin.id);
+    if (!prev) {
+      next.push(pin);
+      continue;
+    }
+    Object.keys(pin).forEach((key) => {
+      const value = pin[key];
+      if (value == null || value === "") return;
+      prev[key] = value;
+    });
+    next.push(prev);
+  }
+  if (warming) {
+    allListings.forEach((item) => {
+      if (!seen.has(item.id)) next.push(item);
+    });
+  }
+  allListings = next;
+  return incoming.length;
+}
+
+function releaseMapPointer() {
+  if (!mapPointer) return;
+  mapPointer = false;
+  if (!mapPaintHeld) return;
+  mapPaintHeld = false;
+  scheduleMapPaint(true);
+}
+
+function listingsPaintKey(items) {
+  let hash = items.length >>> 0;
+  for (let i = 0; i < items.length; i++) {
+    const id = items[i].id || "";
+    for (let c = 0; c < id.length; c++) hash = Math.imul(hash ^ id.charCodeAt(c), 16777619);
+  }
+  return `${items.length}:${hash >>> 0}`;
+}
+
+function scheduleMapPaint(immediate) {
+  if (mapPointer) {
+    mapPaintHeld = true;
+    return;
+  }
+  if (mapPaintTimer) {
+    if (!immediate) return;
+    clearTimeout(mapPaintTimer);
+  }
+  mapPaintTimer = setTimeout(() => {
+    mapPaintTimer = 0;
+    if (mapPointer) {
+      mapPaintHeld = true;
+      return;
+    }
+    paintMapMarkers(sorted(filtered()));
+  }, immediate ? 0 : 400);
+}
+
+function refreshList(opts = {}) {
+  const items = sorted(filtered());
+  if ($("listCount")) $("listCount").textContent = `${items.length}`;
+  const paging = cardPagesLoaded > 0 && !String(lastListingsFp).endsWith(":f");
+  if (paging && !opts.forceList && listWindowItems.length) {
+    if (opts.map) scheduleMapPaint(opts.map === "now");
+    return;
+  }
+  renderKpisFromItems(items);
+  paintList(items);
+  if (opts.map) scheduleMapPaint(opts.map === "now");
+}
+
+function mergeCardPage(data) {
+  const incoming = data.listings || [];
+  if (!incoming.length) return;
+  const byId = new Map(allListings.map((item) => [item.id, item]));
+  for (const row of incoming) {
+    const prev = byId.get(row.id);
+    if (prev) Object.assign(prev, row);
+    else allListings.push(withCachedFicha(applyLocalPins([row])[0] || row));
+  }
+  cardPagesLoaded += 1;
+}
+
+async function loadCardPages(city, seq) {
+  let page = 0;
+  let stalls = 0;
+  while (seq === viewSeq && currentCity() === city && page < 80) {
+    const q = new URLSearchParams({ city, page: String(page) });
+    const ac = new AbortController();
+    const kill = setTimeout(() => ac.abort(), 20000);
+    let data;
+    try {
+      const res = await timedFetch("/api/listings?" + q.toString(), "listings.page", { signal: ac.signal });
+      clearTimeout(kill);
+      if (!res.ok) throw new Error(String(res.status));
+      data = await res.json();
+    } finally {
+      clearTimeout(kill);
+    }
+    if (seq !== viewSeq || currentCity() !== city) return;
+    if (data.warming || data.unchanged) {
+      stalls += 1;
+      if (stalls > 40 && allListings.length) return;
+      await new Promise((r) => setTimeout(r, 400));
+      continue;
+    }
+    stalls = 0;
+    if (data.rev != null) {
+      listingsRev = data.rev;
+      listingsRevByCity[city] = data.rev;
+    }
+    if (page === 0 && !data.more && !(data.listings || []).length) {
+      if (city !== "caba" && city !== "capital-federal") {
+        forgetCityWithoutListings(city);
+        return;
+      }
+    }
+    if (data.usd_ars) usdArs = Number(data.usd_ars) || usdArs;
+    if (page === 0 && (data.cities || []).length) fillCities(data.cities, { source: "listings" });
+    mergeCardPage(data);
+    hideListingsWait();
+    listingsReady = true;
+    if (page === 0 || !data.more) {
+      fillZonas(cityItems());
+      fillBarrios();
+    }
+    refreshList({
+      map: mapPaintKey ? false : !pinsSettled,
+      forceList: page === 0 || !data.more,
+    });
+    const total = Number(data.total || allListings.length);
+    if (data.more) {
+      const got = Math.min(total, (page + 1) * Number(data.size || 300));
+      if ($("statusLine")) {
+        $("statusLine").textContent = pinsSettled
+          ? `Mapa listo. Avisos ${got} de ${total}.`
+          : `Puntos en el mapa: ${allListings.length}. Avisos ${got} de ${total}.`;
+      }
+      page += 1;
+      continue;
+    }
+    if ((data.listings || []).length || allListings.length) forgetEmptyPlace(city);
+    lastListingsFp = `${data.rev}:${total}:f`;
+    lastListingsFetchAt = Date.now();
+    if ($("statusLine")) $("statusLine").textContent = publicStatusLine();
+    loadMarket();
+    return;
+  }
 }
 
 async function load(opts = {}) {
   const city = currentCity();
   if (loadInFlight && opts.live) return;
-  if (!opts.live) viewSeq += 1;
+  if (!opts.live) {
+    viewSeq += 1;
+    pinsSettled = false;
+  }
   const seq = viewSeq;
     loadInFlight = true;
   const shouldWait = !listingsReady || opts.waitKind === "city";
   if (shouldWait && !allListings.length) showListingsWait(opts.waitKind || "init");
   if (!allListings.length && !opts.live) prefetchPins(city, seq, opts.waitKind);
+  if (!String(lastListingsFp).endsWith(":f")) {
+    try {
+      await loadCardPages(city, seq);
+    } catch {
+      if (seq !== viewSeq || currentCity() !== city) return;
+      if (allListings.length) {
+        hideListingsWait();
+        if ($("statusLine") && /Cargando/.test($("statusLine").textContent || "")) {
+          $("statusLine").textContent = publicStatusLine();
+        }
+        return;
+      }
+      loadRetries += 1;
+      showListingsWait(opts.waitKind || "init");
+      const delay = Math.min(3000, 350 * loadRetries);
+      setTimeout(() => load({ ...opts, live: false }), delay);
+    } finally {
+      loadInFlight = false;
+    }
+    return;
+  }
   let data;
   try {
     const q = new URLSearchParams();
     if (opts.live) q.set("live", "1");
     q.set("city", city);
     const knownRev = listingsRevByCity[city];
-    if (allListings.length && knownRev && !String(lastListingsFp).endsWith(":p")) {
+    const havePins = String(lastListingsFp).endsWith(":p");
+    if (allListings.length && knownRev && !havePins) {
       q.set("since", String(knownRev));
     }
     const ac = new AbortController();
-    const kill = setTimeout(() => ac.abort(), 25000);
+    const kill = setTimeout(() => ac.abort(), havePins ? 120000 : 90000);
     try {
       const res = await timedFetch("/api/listings?" + q.toString(), "listings", { signal: ac.signal });
+      clearTimeout(kill);
       if (!res.ok) throw new Error(String(res.status));
       data = await res.json();
     } finally {
@@ -428,11 +658,17 @@ async function load(opts = {}) {
     if (!(data.warming && !(data.listings || []).length && !allListings.length)) loadRetries = 0;
   } catch {
     if (seq !== viewSeq || currentCity() !== city) return;
-    if (listingsReady && opts.live && allListings.length) return;
+    if (allListings.length) {
+      hideListingsWait();
+      if ($("statusLine") && /Cargando/.test($("statusLine").textContent || "")) {
+        $("statusLine").textContent = publicStatusLine();
+      }
+      return;
+    }
     loadRetries += 1;
-    if (!allListings.length) showListingsWait(opts.waitKind || "init");
+    showListingsWait(opts.waitKind || "init");
     const delay = Math.min(3000, 350 * loadRetries);
-    setTimeout(() => load({ ...opts, live: Boolean(opts.live || allListings.length) }), delay);
+    setTimeout(() => load({ ...opts, live: false }), delay);
     return;
   } finally {
     loadInFlight = false;
@@ -471,20 +707,40 @@ async function load(opts = {}) {
     return;
   }
   if (!data.warming && data.layer !== "pins" && !(data.listings || []).length) {
-    const row = (data.cities || []).find((c) => c.id === city);
-    const n = Number(row?.n);
-    if (!Number.isFinite(n) || n < 8) {
+    if (city !== "caba" && city !== "capital-federal") {
       forgetCityWithoutListings(city);
       return;
     }
   }
+  if ((data.listings || []).length) forgetEmptyPlace(city);
   applyListingsPayload(data, city, seq, { keepStatus: opts.keepStatus, live: opts.live });
 }
 
 function applyListingsPayload(data, city, seq, opts = {}) {
   const fp = `${data.rev}:${(data.listings || []).length}:${data.warming ? "w" : (data.layer === "pins" ? "p" : "f")}`;
   if (opts.live && fp === lastListingsFp && listingsReady) return;
-  if (lastListingsFp.endsWith(":f") && data.layer === "pins") return;
+  if (data.layer === "pins") {
+    const n = absorbPins(data.listings || [], !!data.warming);
+    if (!n || seq !== viewSeq || currentCity() !== city) return;
+    if (!data.warming) pinsSettled = true;
+    lastListingsFp = fp;
+    lastListingsFetchAt = Date.now();
+    if (data.usd_ars) usdArs = Number(data.usd_ars) || usdArs;
+    window.lastStats = data.stats || window.lastStats || {};
+    hideListingsWait();
+    listingsReady = true;
+    if ((data.cities || []).length) fillCities(data.cities, { source: "listings" });
+    fillZonas(cityItems());
+    fillBarrios();
+    refreshList({ map: "now" });
+    if ($("statusLine")) {
+      $("statusLine").textContent = pinsSettled
+        ? `Mapa listo. ${allListings.length} puntos.`
+        : `Puntos en el mapa: ${allListings.length}. Sigue cargando…`;
+    }
+    if (!lastMarketKey) loadMarket();
+    return;
+  }
   lastListingsFp = fp;
   lastListingsFetchAt = Date.now();
   allListings = applyLocalPins(data.listings || []).map(withCachedFicha);
@@ -720,6 +976,7 @@ function placeCatalogKey(c) {
 function cityReadyForCatalog(c) {
   if (!c || !c.id) return false;
   const id = String(c.id);
+  if (emptyPlaces.has(id)) return false;
   if (id.endsWith("-pins") || id.includes("-pins-") || id.includes(".pins")) return false;
   if (!isLocatableCity(c)) return false;
   const n = Number(c.n);
@@ -1090,43 +1347,6 @@ function walkMeters(item, data) {
   return Math.round(km * 1000);
 }
 
-function applyNearToProfile(item, data) {
-  if (!item || !data) return;
-  if (!item.profile) item.profile = { axes: {} };
-  if (!item.profile.axes) item.profile.axes = {};
-  if (item.property_type === "terreno") item.profile.order = ["price_m2", "zona", "servicios"];
-  if (!item.access) item.access = {};
-  if (data.walk_km) item.access.walk_km = data.walk_km;
-  const score = data.pending ? null : data.score;
-  item.profile.axes.servicios = {
-    score: score == null ? null : Number(score),
-    confidence: score == null ? (data.pending ? "low" : "none") : "high",
-    note: data.pending
-      ? (data.reason || "calculando POIs cercanos…")
-      : (data.reason || ""),
-  };
-  stampProfile(item.profile);
-  redrawPentagon(item);
-}
-
-function redrawPentagon(item) {
-  if (!item?.profile) return;
-  const card = document.querySelector(".ficha-bundle > .radar-card");
-  if (card) {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = pentagonChart(item.profile, { kind: item.property_type });
-    const next = wrap.firstElementChild;
-    if (next) card.replaceWith(next);
-  }
-  const mini = document.querySelector(`#card-${cssId(item.id)} .radar-card`);
-  if (mini) {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = pentagonChart(item.profile, { mini: true, kind: item.property_type });
-    const next = wrap.firstElementChild;
-    if (next) mini.replaceWith(next);
-  }
-}
-
 function formatKm(km) {
   if (km < 1) return `${Math.round(km * 1000)} m`;
   return `${String(km.toFixed(1)).replace(".", ",")} km`;
@@ -1206,7 +1426,6 @@ async function fillNearby(item) {
     const data = await loadNear(item);
     if (!data || selectedId !== item.id) return;
     const rows = groupNearby(data.nearby || []);
-    applyNearToProfile(item, data);
     if (rows.length) {
       box.innerHTML = nearbyHtml(item, rows, data.pending);
       bindNearby(item, rows);
@@ -1229,23 +1448,24 @@ async function fillNearby(item) {
 
 function groupExactPins(items) {
   const exact = items.filter((item) => isExactPin(item) && item.lat && item.lon);
-  const used = new Set();
+  const cell = 0.00014;
+  const buckets = new Map();
+  for (const item of exact) {
+    const key = `${Math.round(item.lat / cell)}:${Math.round(item.lon / cell)}`;
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(item);
+    else buckets.set(key, [item]);
+  }
   const groups = [];
-  exact.forEach((item) => {
-    if (used.has(item.id)) return;
-    const group = { items: [item], lat: item.lat, lon: item.lon };
-    used.add(item.id);
-    exact.forEach((other) => {
-      if (used.has(other.id)) return;
-      if (distM(item, other) <= 15) {
-        group.items.push(other);
-        used.add(other.id);
-      }
-    });
-    group.lat = group.items.reduce((sum, row) => sum + row.lat, 0) / group.items.length;
-    group.lon = group.items.reduce((sum, row) => sum + row.lon, 0) / group.items.length;
-    groups.push(group);
-  });
+  for (const bucket of buckets.values()) {
+    let lat = 0;
+    let lon = 0;
+    for (const item of bucket) {
+      lat += item.lat;
+      lon += item.lon;
+    }
+    groups.push({ items: bucket, lat: lat / bucket.length, lon: lon / bucket.length });
+  }
   return groups;
 }
 
@@ -1335,9 +1555,8 @@ function sorted(items) {
   return copy;
 }
 
-function listCardHeight(list) {
-  const card = list.querySelector(".card");
-  return card ? Math.round(card.getBoundingClientRect().height) + 8 : 118;
+function listCardHeight() {
+  return listCardH;
 }
 
 function ensureListVirtual() {
@@ -1345,6 +1564,7 @@ function ensureListVirtual() {
   if (!list || list._virt) return;
   list._virt = true;
   list.addEventListener("scroll", () => {
+    if (list.scrollTop > 24) listUserMoved = true;
     if (list._raf) return;
     list._raf = requestAnimationFrame(() => {
       list._raf = 0;
@@ -1357,10 +1577,29 @@ function paintListWindow(force = false) {
   const list = $("list");
   const items = listWindowItems;
   if (!listingsReady || !list || !items.length) return;
-  const h = listCardHeight(list);
-  const view = list.clientHeight || 640;
-  const start = Math.max(0, Math.floor(list.scrollTop / h) - 6);
-  const end = Math.min(items.length, start + Math.ceil(view / h) + 12);
+  const h = listCardHeight();
+  const view = list.clientHeight;
+  if (!view) {
+    if (force && !list._waitH) {
+      list._waitH = true;
+      let tries = 0;
+      const retry = () => {
+        list._waitH = false;
+        if (list.clientHeight) {
+          paintListWindow(true);
+          return;
+        }
+        if (tries++ < 8) {
+          list._waitH = true;
+          requestAnimationFrame(retry);
+        }
+      };
+      requestAnimationFrame(retry);
+    }
+    return;
+  }
+  const start = Math.max(0, Math.floor(list.scrollTop / h) - 2);
+  const end = Math.min(items.length, start + Math.ceil(view / h) + 4);
   const key = `${start}:${end}:${items.length}:${scrapeRunning}:${selectedId}`;
   if (!force && key === listWinRange && list.querySelector(".card")) return;
   listWinRange = key;
@@ -1369,13 +1608,17 @@ function paintListWindow(force = false) {
   const banner = scrapeRunning
     ? `<p class="list-banner" role="status">Se actualizan los avisos. Podés filtrar y cambiar de lugar.</p>`
     : "";
+  const top = list.scrollTop;
   list.innerHTML = `${banner}<div class="list-pad" style="height:${padTop}px" aria-hidden="true"></div>${items.slice(start, end).map(cardHtml).join("")}<div class="list-pad" style="height:${padBot}px" aria-hidden="true"></div>`;
+  if (list.scrollTop !== top) list.scrollTop = top;
   highlightSelected();
 }
 
 function paintList(items) {
   const list = $("list");
-  const jumped = listWindowItems[0]?.id !== items[0]?.id || listWindowItems.length !== items.length;
+  const jumped = !listUserMoved && listWindowItems.length > 0 && (
+    listWindowItems[0]?.id !== items[0]?.id || items.length < listWindowItems.length
+  );
   listWindowItems = items;
   updateSearchingBanner();
   if (!items.length) {
@@ -1390,15 +1633,25 @@ function paintList(items) {
     return;
   }
   ensureListVirtual();
+  bindListEvents();
   if (jumped) list.scrollTop = 0;
   paintListWindow(true);
-  if (list.querySelector(".card") && Math.abs(listCardHeight(list) - 118) > 8) {
+  requestAnimationFrame(() => {
+    if (listWindowItems !== items) return;
+    const card = list.querySelector(".card");
+    const measured = card ? Math.round(card.getBoundingClientRect().height) : 0;
+    if (measured < 80) return;
+    const next = measured + 8;
+    if (Math.abs(next - listCardH) < 16) return;
+    listCardH = next;
     paintListWindow(true);
-  }
+  });
 }
 
 function paintMapMarkers(items) {
-  console.log('[paintMapMarkers] called with', items?.length, 'items');
+  const key = listingsPaintKey(items);
+  if (key === mapPaintKey) return;
+  mapPaintKey = "";
   const t0 = performance.now();
   const gen = ++mapPaintGen;
   exactCluster.clearLayers();
@@ -1432,15 +1685,7 @@ function paintMapMarkers(items) {
     exactMarkers.push(marker);
   });
   if (gen !== mapPaintGen) return;
-  let i = 0;
-  const step = 250;
-  const addChunk = () => {
-    if (gen !== mapPaintGen) return;
-    exactCluster.addLayers(exactMarkers.slice(i, i + step));
-    i += step;
-    if (i < exactMarkers.length) requestAnimationFrame(addChunk);
-  };
-  addChunk();
+  exactCluster.addLayers(exactMarkers);
   items.forEach((item) => {
     if (isExactPin(item) && item.lat && item.lon) return;
     const key = approxCellKey(item);
@@ -1454,34 +1699,26 @@ function paintMapMarkers(items) {
     }
     zoneGroups[key].items.push(item);
   });
-  const zoneList = Object.values(zoneGroups);
-  let z = 0;
-  const addZones = () => {
-    if (gen !== mapPaintGen) return;
-    const slice = zoneList.slice(z, z + 80);
-    slice.forEach((group) => {
-      const [lat, lon] = zoneCenter(group);
-      const one = group.items.length === 1;
-      const marker = L.marker([lat, lon], {
-        icon: one ? pinIcon(group.items[0]) : zoneIcon(group),
-        riseOnHover: true,
-        zIndexOffset: 200,
-      });
-      marker.on("click", () => {
-        if (one) selectListing(group.items[0], { focusMap: false, at: L.latLng(lat, lon) });
-        else openPickPopup(L.latLng(lat, lon), group.items, `${group.label} · ubicación aproximada`);
-      });
-      group.items.forEach((item) => {
-        markersById[item.id] = marker;
-      });
-      zoneMarkersByKey[group.key] = { marker, group, lat, lon };
-      zoneLayer.addLayer(marker);
+  if (gen !== mapPaintGen) return;
+  Object.values(zoneGroups).forEach((group) => {
+    const [lat, lon] = zoneCenter(group);
+    const one = group.items.length === 1;
+    const marker = L.marker([lat, lon], {
+      icon: one ? pinIcon(group.items[0]) : zoneIcon(group),
+      riseOnHover: true,
+      zIndexOffset: 200,
     });
-    z += 80;
-    if (z < zoneList.length) requestAnimationFrame(addZones);
-  };
-  addZones();
-  console.log('[paintMapMarkers] done, markers added, total items:', items.length);
+    marker.on("click", () => {
+      if (one) selectListing(group.items[0], { focusMap: false, at: L.latLng(lat, lon) });
+      else openPickPopup(L.latLng(lat, lon), group.items, `${group.label} · ubicación aproximada`);
+    });
+    group.items.forEach((item) => {
+      markersById[item.id] = marker;
+    });
+    zoneMarkersByKey[group.key] = { marker, group, lat, lon };
+    zoneLayer.addLayer(marker);
+  });
+  mapPaintKey = key;
   markClient("paintMap", performance.now() - t0, { n: items.length });
 }
 
@@ -1529,7 +1766,7 @@ function selectListing(item, { focusMap = true, at = null, keepPopup = false } =
   const list = $("list");
   const idx = listWindowItems.findIndex((x) => x.id === item.id);
   if (idx >= 0 && list) {
-    list.scrollTop = Math.max(0, idx * listCardHeight(list) - 48);
+    list.scrollTop = Math.max(0, idx * listCardHeight() - 48);
     paintListWindow(true);
   }
   highlightSelected();
@@ -1767,7 +2004,13 @@ function stampProfile(profile) {
   return profile;
 }
 
+function poiScoreReady(profile) {
+  const axis = profile && profile.axes && profile.axes.servicios;
+  return !!(axis && axis.score != null && axis.score !== "");
+}
+
 function pentagonChart(profile, { mini = false, kind = "" } = {}) {
+  if (!poiScoreReady(profile)) return "";
   profile = profile && typeof profile === "object" ? profile : {};
   if (!profile.axes) profile.axes = {};
   if (kind === "terreno") profile.order = LOT_AXES.slice();
@@ -2160,6 +2403,36 @@ function fillListingFicha(item) {
   });
 }
 
+function descriptionParts(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+  const re = /(Qué es|Detalles|Cerca)\s*:?\s*([\s\S]*?)(?=(?:Qué es|Detalles|Cerca)\s*:?\s|$)/gi;
+  const blocks = [];
+  let match;
+  while ((match = re.exec(raw))) {
+    const body = match[2].replace(/\s+/g, " ").trim();
+    if (body) blocks.push([match[1], body]);
+  }
+  return blocks;
+}
+
+function descriptionHtml(text, item) {
+  const raw = String(text || "").trim();
+  if (!raw) return `<p class="desc">Sin descripción nueva todavía.</p>`;
+  const blocks = descriptionParts(raw);
+  if (!blocks.length) return `<p class="desc">${escapeHtml(raw)}</p>`;
+  const headline = blocks.find(([label]) => /^qué es$/i.test(label));
+  const hasDetails = blocks.some(([label]) => /^detalles$/i.test(label));
+  const body = blocks.filter((block) => block !== headline).map(([label, line]) => (
+    /^cerca$/i.test(label) && /^hay\b/i.test(line) ? `Cerca ${line}` : line
+  )).filter(Boolean);
+  if (!hasDetails) {
+    body.unshift("El aviso no trae descripción de la propiedad.");
+    if (item && item.mortgage_credit === false) body.splice(1, 0, "No es apta para crédito.");
+  }
+  return `${headline ? `<p class="detail-title">${escapeHtml(headline[1])}</p>` : ""}<div class="detail-copy">${body.map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>`;
+}
+
 function showDetail(item) {
   const pane = $("detailPane");
   if (!pane) return;
@@ -2168,7 +2441,6 @@ function showDetail(item) {
   const chips = listingTags(item).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
   const reasons = (item.deal_reasons || []).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
   const fixes = (item.data_fixes || []).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
-  const locLine = locationLine(item);
   const direccion = streetAddress(item) || "—";
   const cityName = (window.lastCities || []).find((c) => c.id === item.city)?.label
     || (item.city || "").replace(/-/g, " ");
@@ -2213,7 +2485,6 @@ function showDetail(item) {
     ["Orientación", item.orientation || "—"],
     ["Estado", item.condition || "—"],
     ["Publicado", published],
-    ["Inmobiliaria", item.publisher || "—"],
     ["Fuente", sourceSummary(item)],
   ].filter(([k, v]) => {
     if (item.property_type === "terreno" && ["Ambientes", "Dormitorios", "Baños"].includes(k)) return false;
@@ -2245,8 +2516,7 @@ function showDetail(item) {
       </div>
       ${flags ? `<div class="detail-flags">${flags}</div>` : ""}
     </div>
-    <h3>${escapeHtml(kind)} · ${escapeHtml(item.title)}</h3>
-    <p class="meta">${escapeHtml(locLine)} · ${escapeHtml(sourceSummary(item))}</p>
+    <div class="detail-lead">${descriptionHtml(item.description, item)}</div>
     ${missingMark}
     ${sourceLinkHtml(item, "detail-link") || "<p class='muted'>Sin link al aviso original</p>"}
     <div class="ficha-bundle">
@@ -2268,10 +2538,6 @@ function showDetail(item) {
     <details class="fold near-fold">
       <summary>Cerca en el mapa</summary>
       <div id="nearBox">${nearbyHtml(item, groupNearby(item.nearby || []), isExactPin(item) && !(item.nearby || []).length)}</div>
-    </details>
-    <details class="fold" open>
-      <summary>Descripción</summary>
-      <p class="desc">${escapeHtml(item.description || "Sin descripción todavía. Tocá buscar avisos para leer la ficha completa.")}</p>
     </details>
     ${currentUser ? `
     <details class="fold" open>
@@ -2905,7 +3171,7 @@ function emptyPlaceCopy(label) {
 function publicStatusLine(s) {
   const label = $("cityFilter")?.selectedOptions?.[0]?.textContent || "";
   if (!allListings.length) return emptyPlaceCopy(label);
-  const when = s?.last_run || lastStatus.last_run;
+  const when = s?.last_run || lastStatus?.last_run;
   if (when) return `Última búsqueda: ${new Date(when).toLocaleString("es-AR")}`;
   return "Los avisos se van a ir actualizando.";
 }
@@ -3022,6 +3288,7 @@ function setTab(tab, push) {
     history.replaceState(null, "", url);
   }
   if (next === "map") setTimeout(() => map.invalidateSize(), 60);
+  if (next === "list" || next === "map") setTimeout(() => paintListWindow(true), 80);
 }
 
 function armPoll() {
@@ -3327,9 +3594,12 @@ function showSuggest(places, opts = {}) {
 
 async function choosePlace(place) {
   if (!place || !place.id) return;
+  forgetEmptyPlace(place.id);
   pickedPlace = place;
   hideSuggest();
   lastListingsFp = "";
+  cardPagesLoaded = 0;
+  pinsSettled = false;
   allListings = [];
   listingsRev = 0;
   applyPlace(place);

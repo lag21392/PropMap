@@ -826,6 +826,28 @@ def test_missing_street_without_pin_is_not_llm_urgent_if_it_has_address(monkeypa
     assert item.id not in llm_enrich._urgent
 
 
+def test_closed_partial_does_not_return_to_the_gpu_when_still_thin():
+    from app.llm_enrich import LLM_SCHEMA
+
+    item = Listing(
+        source="properati",
+        source_id="loop",
+        url="https://example.com/loop",
+        title="Depto",
+        property_type="departamento",
+        city="cordoba",
+        details_scraped=True,
+        extra={
+            "llm_thin": True,
+            "llm_partial": True,
+            "llm_ready": True,
+            "llm_ver": LLM_SCHEMA,
+            "details_at": "2026-01-01T00:00:00+00:00",
+        },
+    )
+    assert needs_improve(item) is False
+
+
 def test_needs_improve_prioritizes_missing_location_but_also_stale_schema():
     from app.llm_enrich import LLM_SCHEMA
 
@@ -974,6 +996,7 @@ def test_extract_busy_ignores_waiting_queue():
 def test_next_gpu_job_prefers_extract_then_copy():
     from app import llm_copy, llm_enrich
 
+    llm_enrich._since_copy = 0
     llm_enrich._ready.clear()
     llm_copy._ready.clear()
     llm_copy._ready.append(("copy:1", None, []))
@@ -992,6 +1015,53 @@ def test_next_gpu_job_prefers_extract_then_copy():
     finally:
         llm_enrich._ready.clear()
         llm_copy._ready.clear()
+        llm_enrich._since_copy = 0
+
+
+def test_gpu_yields_a_description_after_a_buffer_of_extracts():
+    from app import llm_copy, llm_enrich
+
+    llm_enrich._since_copy = 0
+    llm_enrich._ready.clear()
+    llm_copy._ready.clear()
+    for n in range(llm_enrich._EXTRACT_BEFORE_COPY + 2):
+        llm_enrich._ready.append((f"ex:{n}", None, {}))
+    llm_copy._ready.append(("copy:buf", None, []))
+    try:
+        kinds = []
+        for _ in range(llm_enrich._EXTRACT_BEFORE_COPY + 1):
+            kind, job = llm_enrich._next_gpu_job(0)
+            kinds.append((kind, job[0]))
+        assert kinds[:-1] == [("extract", f"ex:{n}") for n in range(llm_enrich._EXTRACT_BEFORE_COPY)]
+        assert kinds[-1] == ("copy", "copy:buf")
+    finally:
+        llm_enrich._ready.clear()
+        llm_copy._ready.clear()
+        llm_enrich._since_copy = 0
+
+
+def test_commit_llm_fail_without_ficha_waits_instead_of_partial(monkeypatch):
+    from app import llm_enrich
+    from app.models import Listing
+
+    item = Listing(
+        source="zonaprop",
+        source_id="thin-fail",
+        url="https://example.com/thin",
+        title="Depto",
+        property_type="departamento",
+        city="caba",
+        extra={"llm_tries": llm_enrich.MAX_TRIES - 1},
+    )
+    monkeypatch.setattr(llm_enrich, "_save_llm_item", lambda row: None)
+    monkeypatch.setattr(llm_enrich, "_ops_note", lambda *a, **k: None)
+    llm_enrich._commit_llm_fail(item.id, item)
+    assert item.extra.get("llm_wait_ficha") is True
+    assert item.extra.get("llm_partial") is not True
+    assert item.extra.get("llm_ready") is not True
+    assert llm_enrich.needs_improve(item) is False
+    item.details_scraped = True
+    assert llm_enrich.needs_improve(item) is True
 
 
 def test_commit_llm_ok_disables_ficha_when_city_stays_unknown(monkeypatch):
@@ -1033,6 +1103,27 @@ def test_commit_llm_ok_keeps_ficha_when_city_is_known(monkeypatch):
     llm_enrich._commit_llm_ok(item, {})
     assert not item.extra.get("skip_details")
     assert item.extra.get("llm_thin") is True
+
+
+def test_commit_llm_ok_clears_thin_when_the_ficha_exists(monkeypatch):
+    from app import llm_enrich
+    from app.models import Listing
+
+    item = Listing(
+        source="zonaprop",
+        source_id="ficha-ok",
+        url="https://example.com/ficha",
+        title="Casa",
+        property_type="casa",
+        city="trelew",
+        details_scraped=True,
+        extra={"llm_thin": True, "details_at": "2026-01-01T00:00:00+00:00"},
+    )
+    monkeypatch.setattr(llm_enrich, "apply_analysis", lambda *a, **k: None)
+    monkeypatch.setattr(llm_enrich, "_save_llm_item", lambda row: None)
+    monkeypatch.setattr(llm_enrich, "_ops_note", lambda *a, **k: None)
+    llm_enrich._commit_llm_ok(item, {})
+    assert item.extra.get("llm_thin") is False
 
 
 def test_commit_llm_fail_disables_ficha_when_city_unknown(monkeypatch):

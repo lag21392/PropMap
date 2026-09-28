@@ -830,6 +830,46 @@ def listing_count_for_catalog(n: int | None) -> bool:
         return False
 
 
+def empty_view_ids() -> set[str]:
+    """Lugares ya abiertos cuyo mapa quedó sin avisos."""
+    try:
+        raw = store.get_meta("empty_view_places", "[]")
+        data = json.loads(raw or "[]")
+    except Exception:
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(item) for item in data if item}
+
+
+def mark_empty_view(city_id: str) -> None:
+    token = (city_id or "").strip()
+    if not token or token == DEFAULT_CITY or token in CABA_IDS:
+        return
+    try:
+        current = empty_view_ids()
+        if token in current:
+            return
+        current.add(token)
+        store.set_meta("empty_view_places", json.dumps(sorted(current)))
+    except Exception:
+        log.exception("no pude deslistar %s", token)
+
+
+def clear_empty_view(city_id: str) -> bool:
+    token = (city_id or "").strip()
+    try:
+        current = empty_view_ids()
+        if token not in current:
+            return False
+        current.discard(token)
+        store.set_meta("empty_view_places", json.dumps(sorted(current)))
+    except Exception:
+        log.exception("no pude volver a listar %s", token)
+        return False
+    return True
+
+
 def listing_count_for_scrape(n: int | None) -> bool:
     try:
         return int(n or 0) >= MIN_SCRAPE_LISTINGS
@@ -1256,9 +1296,10 @@ def listed_cities(listings: list | None = None) -> list[dict]:
         except Exception:
             pass
     seen: dict[str, dict] = {}
+    empty = empty_view_ids()
 
     def take(cid: str, cfg: dict) -> None:
-        if not cid or cid in seen or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
+        if not cid or cid in seen or cid in empty or cid in _LISTED_SKIP or is_cache_artifact_id(cid):
             return
         if _canonical_listed_id(cid) != cid:
             return
@@ -1426,10 +1467,11 @@ def _restore_loaded_cities() -> None:
         log.exception("no pude leer ciudades cargadas")
         return
     centroids = _listing_centroids()
+    empty = empty_view_ids()
     restored = 0
     for cid, n in counts.items():
         token = _canonical_listed_id(cid) or cid
-        if not token or token in _LISTED_SKIP or is_cache_artifact_id(token):
+        if not token or token in empty or token in _LISTED_SKIP or is_cache_artifact_id(token):
             continue
         if not listing_count_for_catalog(n):
             continue

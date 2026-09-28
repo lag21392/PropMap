@@ -12,21 +12,38 @@ from typing import Any
 from .freshness import LIST_TEXT_MIN
 from .models import Listing
 
-COPY_SCHEMA = 1
+COPY_SCHEMA = 3
+# Desde este esquema el texto ya sale sin teléfonos ni inmobiliarias.
+_SHOW_COPY_FROM = 2
 QUEUE_CAP = 32
 READY_CAP = 2
 MAX_TRIES = 2
 SKIP_FAIL_SEC = 120.0
-MAX_TOKENS = 180
+MAX_TOKENS = 240
 MAX_CHARS = 700
 MIN_CHARS = 40
 DESC_PROMPT_MAX = 900
 
 COPY_SYSTEM = (
-    "Redactás una ficha inmobiliaria breve en español rioplatense. "
-    "Un párrafo de 2 a 4 oraciones. Solo hechos de DATOS y del AVISO. "
-    "Sin marketing, sin 'imperdible', sin invitar a consultar, sin teléfono ni vendedor. "
-    "Si un dato no está, no lo inventes. Devolvé solo el párrafo. /no_think"
+    "Redactás la ficha pública en español rioplatense. Solo estas líneas, en este orden, y nada más:\n"
+    "Qué es: una oración con el tipo, el tamaño y el barrio o la ciudad.\n"
+    "Detalles: una oración natural, como la diría una persona. No hagas una lista de cifras "
+    "('3 ambientes, 2 dormitorios, 1 baño, 75 m²'). "
+    "Los enteros van sin decimal y en singular si es uno: baño, 75 m². "
+    "Si no hay rasgos, no escribas esta línea.\n"
+    "Si TEXTO trae datos que DATOS no tiene (plantas, distribución, quincho, terraza, "
+    "orientación, lavadero, patio), incluilos en Detalles.\n"
+    "Cerca: una oración solo si ENTORNO tiene ítems. Empezá con \"Cerca hay\" y usá solo esas palabras "
+    "(transporte, subte, tren, colectivo, universidad, escuela, salud, comercios, plaza). "
+    "Si ENTORNO está vacío, no escribas esta línea.\n"
+    "Prohibido: teléfonos, mails, WhatsApp, nombres de personas, inmobiliarias, martilleros, "
+    "corredores, marcas de inmobiliaria, códigos de aviso, altura de la calle, y frases de venta "
+    "(imperdible, consultar, llamar). No inventes datos. No pegues el aviso: reescribí solo lo útil. /no_think"
+)
+
+_FORBIDDEN_RE = re.compile(
+    r"inmobiliari|martiller|corredor|whats?app|re/?max|century\s*21|\[oculto\]|@",
+    re.I,
 )
 
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.I)
@@ -50,6 +67,28 @@ def enabled() -> bool:
     from .llm_enrich import enabled as llm_on
 
     return llm_on()
+
+
+_fichas_at = 0.0
+_fichas_n = 0
+
+
+def fichas_pending() -> bool:
+    """Hay fichas sin bajar: la GPU no redacta descripciones mientras tanto."""
+    global _fichas_at, _fichas_n
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return False
+    now = time.time()
+    if now - _fichas_at < 20:
+        return _fichas_n > 0
+    from .store import count_detail_backlog
+
+    try:
+        _fichas_n = count_detail_backlog()
+    except Exception:
+        _fichas_n = 0
+    _fichas_at = now
+    return _fichas_n > 0
 
 
 def copy_payload(item: Listing) -> dict[str, Any]:
@@ -97,13 +136,50 @@ def needs_copy(item: Listing) -> bool:
 
 
 def display_description(item: Listing) -> str:
-    """Texto de la página: párrafo generado si está, si no el aviso original."""
+    """En la página solo entra la ficha nueva. El aviso original puede traer teléfonos y nombres."""
     extra = item.extra or {}
     edited = str((extra.get("user_edits") or {}).get("description") or "").strip()
     if edited:
         return edited
-    text = str(copy_payload(item).get("text") or "").strip()
-    return text or (item.description or "")
+    payload = copy_payload(item)
+    try:
+        ver = int(payload.get("ver") or 0)
+    except (TypeError, ValueError):
+        ver = 0
+    if ver < _SHOW_COPY_FROM:
+        return ""
+    return polish_copy_text(str(payload.get("text") or "").strip())
+
+
+def _plain_number(value: Any) -> str:
+    """1.0 y 75.0 se leen como 1 y 75. Un decimal de verdad se conserva."""
+    if isinstance(value, bool) or value in {None, ""}:
+        return ""
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number.is_integer():
+            return str(int(number))
+        return f"{number:.1f}".rstrip("0").rstrip(".")
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+\.0+", text):
+        return str(int(float(text)))
+    return text
+
+
+_NEEDLESS_DECIMAL = re.compile(r"\b(\d+)\.0+\b")
+_ONE_NOUN = (
+    (re.compile(r"\b1 baños\b", re.I), "1 baño"),
+    (re.compile(r"\b1 dormitorios\b", re.I), "1 dormitorio"),
+    (re.compile(r"\b1 ambientes\b", re.I), "1 ambiente"),
+)
+
+
+def polish_copy_text(text: str) -> str:
+    """Saca decimales y plurales que la ficha no necesita."""
+    cleaned = _NEEDLESS_DECIMAL.sub(r"\1", text or "")
+    for pattern, repl in _ONE_NOUN:
+        cleaned = pattern.sub(repl, cleaned)
+    return cleaned
 
 
 def facts_for_copy(item: Listing) -> list[str]:
@@ -115,7 +191,7 @@ def facts_for_copy(item: Listing) -> list[str]:
     lines: list[str] = []
 
     def add(label: str, value: Any) -> None:
-        text = str(value).strip() if value not in {None, ""} else ""
+        text = _plain_number(value)
         if not text or text in {"Sin clasificar", "—"}:
             return
         lines.append(f"{label}: {text}")
@@ -125,7 +201,6 @@ def facts_for_copy(item: Listing) -> list[str]:
     add("ciudad", city_label(item.city) or item.city)
     add("barrio", item.barrio)
     add("zona", item.zona)
-    add("dirección", item.address)
     add("ambientes", item.rooms)
     add("dormitorios", item.bedrooms)
     add("baños", item.bathrooms)
@@ -154,18 +229,77 @@ def facts_for_copy(item: Listing) -> list[str]:
     return lines
 
 
+def entorno_for_copy(item: Listing) -> list[str]:
+    """Tipos de lugar cerca, sin nombres de comercios ni personas."""
+    extra = item.extra or {}
+    access = extra.get("access") if isinstance(extra.get("access"), dict) else {}
+    cats = access.get("categories") if isinstance(access.get("categories"), dict) else {}
+
+    def present(key: str) -> bool:
+        row = cats.get(key)
+        return isinstance(row, dict) and bool(row.get("present"))
+
+    out: list[str] = []
+    transport: list[str] = []
+    if present("subway"):
+        transport.append("subte")
+    if present("train"):
+        transport.append("tren")
+    if present("transport"):
+        transport.append("colectivo")
+    if transport:
+        out.append("transporte (" + ", ".join(transport) + ")")
+    school = cats.get("school") if isinstance(cats.get("school"), dict) else {}
+    if school.get("present"):
+        kind = str(school.get("kind") or "").lower()
+        out.append("universidad" if "univers" in kind or "terci" in kind else "escuela")
+    if present("health"):
+        out.append("salud")
+    if present("shop"):
+        out.append("comercios")
+    if present("plaza") or present("beach"):
+        out.append("plaza")
+    return out
+
+
+def source_for_copy(item: Listing) -> str:
+    """Datos del aviso original que DATOS no tiene. Sin teléfonos, inmobiliarias ni altura."""
+    from .llm_enrich import _scrub
+
+    raw = _scrub(item.description or "").replace("[oculto]", " ")
+    extra = item.extra or {}
+    for chunk in (item.address or "", str(extra.get("street") or "")):
+        token = chunk.strip()
+        if len(token) >= 4:
+            raw = re.sub(re.escape(token), " ", raw, flags=re.I)
+    raw = re.sub(r"\b(?:usd|u\$s|ars)\s*[\d.]+", " ", raw, flags=re.I)
+    raw = re.sub(r"\b\d{2,5}\b(?!\s*(?:m²|m2|mts?|metros|años))", " ", raw, flags=re.I)
+    parts: list[str] = []
+    for bit in re.split(r"[\n.;]+", raw):
+        line = re.sub(r"\s+", " ", bit).strip(" -_:")
+        if len(line) < 12 or _FORBIDDEN_RE.search(line):
+            continue
+        if re.search(r"publicado por|c[oó]digo\b", line, re.I):
+            continue
+        parts.append(line)
+    return re.sub(r"\s+", " ", ". ".join(parts)).strip()[:480]
+
+
 def build_copy_prompt(item: Listing) -> str:
     from .llm_enrich import _scrub
 
     facts = facts_for_copy(item)
-    original = _scrub((item.description or "").strip())[:DESC_PROMPT_MAX]
     fact_txt = "\n".join(facts) if facts else "(sin datos extraídos)"
-    aviso = original or "(sin texto de aviso)"
-    title = _scrub((item.title or "").strip())[:160]
+    entorno = entorno_for_copy(item)
+    entorno_txt = ", ".join(entorno) if entorno else "(nada medido cerca)"
+    title = _FORBIDDEN_RE.sub("", _scrub((item.title or "").strip()))
+    title = re.sub(r"\s+", " ", title).replace("[oculto]", "").strip()[:160]
+    source = source_for_copy(item) or "(el aviso no trae más datos)"
     return (
         f"titulo: {title}\n"
         f"DATOS:\n{fact_txt}\n"
-        f"AVISO:\n{aviso}\n"
+        f"ENTORNO:\n{entorno_txt}\n"
+        f"TEXTO:\n{source}\n"
     )
 
 
@@ -181,16 +315,20 @@ def parse_copy_text(raw: str) -> str:
         if data:
             text = str(data.get("text") or data.get("descripcion") or data.get("description") or "").strip()
     text = _MD_RE.sub("", text).strip().strip('"').strip()
-    if "\n\n" in text:
-        text = text.split("\n\n", 1)[0].strip()
-    text = re.sub(r"\s+", " ", text)
-    text = _scrub(text)
+    text = _scrub(text).replace("[oculto]", "")
+    kept: list[str] = []
+    for line in re.split(r"\n+", text):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if not line or _FORBIDDEN_RE.search(line):
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
     if len(text) > MAX_CHARS:
         cut = text[:MAX_CHARS].rsplit(" ", 1)[0]
         text = cut or text[:MAX_CHARS]
     if len(text) < MIN_CHARS:
         return ""
-    return text
+    return polish_copy_text(text)
 
 
 def apply_copy(item: Listing, text: str) -> None:
@@ -251,7 +389,7 @@ def enqueue(listings: list[Listing] | None) -> None:
 
 
 def refill(prefer_city: str = "") -> int:
-    """Mantiene la cola de descripciones llena. La GPU las toma cuando extract no tiene prompt."""
+    """Mantiene un buffer corto. La GPU las toma cuando la limpieza no ocupa el turno."""
     if not enabled():
         return 0
     with _lock:

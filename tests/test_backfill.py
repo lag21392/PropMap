@@ -135,6 +135,34 @@ def test_detail_backlog_skips_downloaded(tmp_path, monkeypatch):
     assert skipped == []
 
 
+def test_detail_backlog_refreshes_priority_city_before_the_rest(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    today = datetime.now(timezone.utc).isoformat()
+    old = _item(
+        "old",
+        city="puerto-madryn",
+        details_scraped=True,
+        extra={"details_at": "2026-08-26T12:00:00+00:00"},
+    )
+    fresh = _item(
+        "fresh",
+        city="puerto-madryn",
+        details_scraped=True,
+        extra={"details_at": today},
+    )
+    other = _item("other", city="trelew", details_scraped=False)
+    store.upsert_many([old, fresh, other])
+    ids = [row.id for row in store.fetch_detail_backlog(8, refresh_city="puerto-madryn")]
+    assert ids[0] == "zonaprop:old"
+    assert "zonaprop:fresh" not in ids
+    assert "zonaprop:other" in ids
+
+
 def test_detail_backlog_skips_unknown_city_after_llm_pass(tmp_path, monkeypatch):
     from app import store
 

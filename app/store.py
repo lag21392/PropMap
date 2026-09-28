@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, local
+from typing import Any
 
 from .jsoncodec import dumps_text, loads as json_loads
 from .models import Listing
@@ -377,6 +378,9 @@ def init() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_seen ON visits(seen_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_name ON visits(name, city)")
         _stamp_skip_details_unknown_city(conn)
+        _clear_llm_thin_already_cleaned(conn)
+        _reopen_partials_waiting_ficha(conn)
+        _release_closed_partials(conn)
         conn.commit()
     from .accounts import init_tables
 
@@ -436,6 +440,9 @@ def _merge_existing(item: Listing, row: sqlite3.Row) -> None:
     if row["details_scraped"] and not item.details_scraped:
         item.details_scraped = True
     extra = {**old_extra, **(item.extra or {})}
+    # Si esta pasada apagó el pendiente, la fila vieja no puede volver a encenderlo.
+    if (item.extra or {}).get("llm_thin") is False:
+        extra["llm_thin"] = False
     extra["amenities"] = list(
         dict.fromkeys((old_extra.get("amenities") or []) + ((item.extra or {}).get("amenities") or []))
     )
@@ -521,6 +528,10 @@ def _listing_query_flags(item: Listing) -> dict[str, int]:
 
     if hidden:
         needs = 0
+    elif extra.get("llm_wait_ficha") and not (item.details_scraped or extra.get("details_at")):
+        needs = 0
+    elif partial and ver == LLM_SCHEMA:
+        needs = 0
     elif extra.get("llm_thin") and (item.details_scraped or extra.get("details_at")):
         needs = 1
     elif unassigned and not extra.get("llm_city_ok"):
@@ -528,8 +539,6 @@ def _listing_query_flags(item: Listing) -> dict[str, int]:
     elif fix:
         needs = 1
     elif ver == LLM_SCHEMA and ready and not partial:
-        needs = 0
-    elif partial and ver == LLM_SCHEMA:
         needs = 0
     else:
         needs = 1
@@ -755,6 +764,22 @@ def _pins_map(conn: sqlite3.Connection) -> dict:
     return pins
 
 
+def _overlay_saved_llm_flags(extra: dict, row: sqlite3.Row) -> None:
+    """Si un guardado de POIs pisó el JSON, las columnas siguen diciendo que ya se limpió."""
+    keys = row.keys()
+    if "llm_ver" in keys and "llm_ver" not in extra:
+        try:
+            ver = int(row["llm_ver"] or 0)
+        except (TypeError, ValueError):
+            ver = 0
+        if ver:
+            extra["llm_ver"] = ver
+    if "llm_ready" in keys and "llm_ready" not in extra and row["llm_ready"]:
+        extra["llm_ready"] = True
+    if "llm_partial" in keys and "llm_partial" not in extra and row["llm_partial"]:
+        extra["llm_partial"] = True
+
+
 def _listing_from_row(row: sqlite3.Row, pin, *, map_row: bool = False) -> Listing:
     keys = row.keys()
     raw = row["extra_json"] if "extra_json" in keys else "{}"
@@ -762,6 +787,7 @@ def _listing_from_row(row: sqlite3.Row, pin, *, map_row: bool = False) -> Listin
     if map_row and "extra_map" in keys and row["extra_map"] is not None:
         raw = row["extra_map"]
     extra = _loads_extra(raw, map_row=slim)
+    _overlay_saved_llm_flags(extra, row)
     return Listing(
         source=row["source"],
         source_id=row["source_id"],
@@ -845,6 +871,52 @@ def get_listing(listing_id: str) -> Listing | None:
     item = _listing_from_row(row, pins.get(row["id"]))
     apply_user_edits(item)
     return item
+
+
+def poi_axes_for_cities(cities: list[str]) -> dict[str, dict[str, Any]]:
+    """Score de POIs ya guardado en la ficha, para pegarlo en el mapa sin recalcular."""
+    wanted = [cid for cid in cities if cid]
+    if not wanted:
+        return {}
+    marks = ",".join("?" * len(wanted))
+    sql = f"""
+        SELECT id,
+               json_extract(extra_json, '$.profile.axes.servicios.score') AS score,
+               json_extract(extra_json, '$.profile.axes.servicios.confidence') AS confidence,
+               json_extract(extra_json, '$.profile.axes.servicios.note') AS note
+        FROM listings
+        WHERE city IN ({marks})
+          AND IFNULL(is_hidden, 0) = 0
+          AND json_extract(extra_json, '$.profile.axes.servicios.score') IS NOT NULL
+    """
+    out: dict[str, dict[str, Any]] = {}
+    with connect() as conn:
+        for row in conn.execute(sql, tuple(wanted)):
+            out[row["id"]] = {
+                "score": row["score"],
+                "confidence": row["confidence"] or "high",
+                "note": row["note"] or "",
+            }
+    return out
+
+
+def fetch_poi_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
+    """Avisos con pin que todavía no tienen score de POIs a pie."""
+    lim = max(1, min(80, int(limit)))
+    prefer = (prefer_city or "").strip()
+    sql = """
+        SELECT * FROM listings
+        WHERE IFNULL(is_hidden, 0) = 0
+          AND lat IS NOT NULL AND lon IS NOT NULL
+          AND json_extract(extra_json, '$.profile.axes.servicios.score') IS NULL
+          AND IFNULL(json_extract(extra_json, '$.profile.axes.servicios.confidence'), '') != 'none'
+        ORDER BY CASE WHEN city = ? THEN 0 ELSE 1 END, id
+        LIMIT ?
+    """
+    with connect() as conn:
+        rows = conn.execute(sql, (prefer, lim)).fetchall()
+        pins = _pins_map(conn)
+    return [_listing_from_row(row, pins.get(row["id"])) for row in rows]
 
 
 def fetch_by_cities(cities: set[str] | list[str]) -> list[Listing]:
@@ -984,6 +1056,137 @@ _SKIP_DETAILS_STAMP_SQL = """
 
 
 _SKIP_DETAILS_STAMP_META = "skip_details_unknown_city"
+_LLM_THIN_CLEAR_META = "llm_thin_ficha_cleared"
+_PARTIAL_WAIT_META = "llm_partial_wait_ficha"
+
+
+def _clear_llm_thin_already_cleaned(conn: sqlite3.Connection) -> None:
+    """La ficha ya está y el LLM ya pasó: el flag thin no puede seguir contando como falta."""
+    from .llm_enrich import LLM_SCHEMA
+
+    try:
+        done = conn.execute(
+            "SELECT 1 FROM meta WHERE key = ? AND value = ?",
+            (_LLM_THIN_CLEAR_META, str(LLM_SCHEMA)),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done:
+        return
+    schema = int(LLM_SCHEMA)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, extra_json, is_hidden, city, llm_fix, llm_partial
+            FROM listings
+            WHERE details_scraped = 1
+              AND llm_ready = 1
+              AND llm_partial = 0
+              AND llm_ver = ?
+              AND needs_llm = 1
+            """,
+            (schema,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    cleared: list[tuple[str, int]] = []
+    for row in rows:
+        try:
+            extra = json_loads(row["extra_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(extra, dict) or not extra.get("llm_thin"):
+            continue
+        extra.pop("llm_thin", None)
+        city = (row["city"] or "").strip()
+        unassigned = city in {"", "fuera", "otros", "argentina"} and not extra.get("llm_city_ok")
+        if row["is_hidden"]:
+            needs = 0
+        elif unassigned or row["llm_fix"]:
+            needs = 1
+        else:
+            needs = 0
+        cleared.append((dumps_text(extra), needs, row["id"]))
+    if cleared:
+        conn.executemany(
+            "UPDATE listings SET extra_json = ?, needs_llm = ? WHERE id = ?",
+            cleared,
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        (_LLM_THIN_CLEAR_META, str(schema)),
+    )
+
+
+def _release_closed_partials(conn: sqlite3.Connection) -> None:
+    """Un parcial del schema actual no puede seguir ocupando la GPU."""
+    from .llm_enrich import LLM_SCHEMA
+
+    try:
+        conn.execute(
+            """
+            UPDATE listings
+            SET needs_llm = 0
+            WHERE needs_llm = 1 AND llm_partial = 1 AND llm_ver = ?
+            """,
+            (int(LLM_SCHEMA),),
+        )
+    except sqlite3.OperationalError:
+        return
+
+
+def _reopen_partials_waiting_ficha(conn: sqlite3.Connection) -> None:
+    """Un parcial sin ficha no es un fallo del modelo: espera la bajada y vuelve a la cola."""
+    from .llm_enrich import LLM_SCHEMA
+
+    try:
+        done = conn.execute(
+            "SELECT 1 FROM meta WHERE key = ? AND value = ?",
+            (_PARTIAL_WAIT_META, str(LLM_SCHEMA)),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done:
+        return
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, extra_json, city
+            FROM listings
+            WHERE llm_partial = 1 AND details_scraped = 0
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        city = (row["city"] or "").strip()
+        if city in {"", "fuera", "otros", "argentina"}:
+            continue
+        try:
+            extra = json_loads(row["extra_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(extra, dict) or extra.get("details_at"):
+            continue
+        extra["llm_wait_ficha"] = True
+        extra["llm_partial"] = False
+        extra["llm_ready"] = False
+        extra["await_llm"] = False
+        updates.append((dumps_text(extra), row["id"]))
+    if updates:
+        conn.executemany(
+            """
+            UPDATE listings
+            SET extra_json = ?, llm_partial = 0, llm_ready = 0, needs_llm = 0
+            WHERE id = ?
+            """,
+            updates,
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        (_PARTIAL_WAIT_META, str(LLM_SCHEMA)),
+    )
 
 
 def _stamp_skip_details_unknown_city(conn: sqlite3.Connection, *, force: bool = False) -> None:
@@ -1005,23 +1208,10 @@ def _stamp_skip_details_unknown_city(conn: sqlite3.Connection, *, force: bool = 
         return
 
 
-def fetch_detail_backlog(
-    limit: int,
-    prefer_city: str = "",
-    skip_ids: set[str] | None = None,
-) -> list[Listing]:
-    """Fichas que todavía no se bajaron, de toda la base."""
-    n = max(1, min(80, int(limit or 1)))
-    prefer = (prefer_city or "").strip()
-    skip = [lid for lid in dict.fromkeys(skip_ids or ()) if lid][:240]
-    skip_sql = ""
-    params: list = []
-    if skip:
-        skip_sql = f" AND id NOT IN ({','.join('?' * len(skip))})"
-        params.extend(skip)
-    params.extend((prefer, n))
-    sql = f"""
-        SELECT * FROM listings
+def count_detail_backlog() -> int:
+    """Cuántas fichas siguen sin bajar. Misma población que fetch_detail_backlog."""
+    sql = """
+        SELECT COUNT(*) FROM listings
         WHERE details_scraped = 0
           AND IFNULL(url, '') != ''
           AND is_hidden = 0
@@ -1034,15 +1224,110 @@ def fetch_detail_backlog(
               OR length(trim(IFNULL(json_extract(extra_json, '$.llm_at'), ''))) > 0
             )
           )
+    """
+    with connect() as conn:
+        row = conn.execute(sql).fetchone()
+    return int(row[0] if row else 0)
+
+
+def _local_today() -> str:
+    from datetime import datetime, timezone
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/Argentina/Buenos_Aires")
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz).date().isoformat()
+
+
+def fetch_detail_backlog(
+    limit: int,
+    prefer_city: str = "",
+    skip_ids: set[str] | None = None,
+    refresh_city: str = "",
+) -> list[Listing]:
+    """Fichas que todavía no se bajaron, de toda la base.
+
+    refresh_city vuelve a pedir las de esa ciudad si la ficha no es de hoy.
+    """
+    n = max(1, min(80, int(limit or 1)))
+    prefer = (prefer_city or "").strip()
+    refresh = (refresh_city or "").strip()
+    skip = [lid for lid in dict.fromkeys(skip_ids or ()) if lid][:240]
+    picked: list[Listing] = []
+    if refresh:
+        refresh_skip = ""
+        refresh_params: list = [refresh, _local_today()]
+        if skip:
+            refresh_skip = f" AND id NOT IN ({','.join('?' * len(skip))})"
+            refresh_params.extend(skip)
+        refresh_params.append(n)
+        picked = _fetch_backlog_rows(
+            f"""
+            SELECT * FROM listings
+            WHERE city = ?
+              AND is_hidden = 0
+              AND IFNULL(url, '') != ''
+              AND IFNULL(json_extract(extra_json, '$.skip_details'), 0) = 0
+              AND (
+                details_scraped = 0
+                OR substr(IFNULL(json_extract(extra_json, '$.details_at'), ''), 1, 10) < ?
+              )
+              {refresh_skip}
+            ORDER BY
+              CASE
+                WHEN details_scraped = 0
+                 AND CAST(IFNULL(json_extract(extra_json, '$.detail_tries'), 0) AS INTEGER) = 0
+                THEN 0
+                WHEN details_scraped = 1 THEN 1
+                ELSE 2
+              END,
+              scraped_at ASC
+            LIMIT ?
+            """,
+            tuple(refresh_params),
+        )
+        seen = {item.id for item in picked}
+        skip = [lid for lid in dict.fromkeys([*skip, *seen]) if lid][:240]
+    room = n - len(picked)
+    if room <= 0:
+        return picked[:n]
+    skip_sql = ""
+    params: list = []
+    if skip:
+        skip_sql = f" AND id NOT IN ({','.join('?' * len(skip))})"
+        params.extend(skip)
+    params.extend((prefer, room))
+    sql = f"""
+        SELECT * FROM listings
+        WHERE details_scraped = 0
+          AND IFNULL(url, '') != ''
+          AND is_hidden = 0
+          AND IFNULL(json_extract(extra_json, '$.skip_details'), 0) = 0
+          AND NOT (
+            IFNULL(city, '') IN ('', 'fuera', 'otros', 'argentina')
+            AND (
+              IFNULL(json_extract(extra_json, '$.skip_details'), 0) != 0
+              OR IFNULL(json_extract(extra_json, '$.llm_city_ok'), 0) != 0
+              OR IFNULL(json_extract(extra_json, '$.llm_ready'), 0) != 0
+              OR length(trim(IFNULL(json_extract(extra_json, '$.llm_at'), ''))) > 0
+            )
+          )
           {skip_sql}
         ORDER BY
+          CASE
+            WHEN CAST(IFNULL(json_extract(extra_json, '$.detail_tries'), 0) AS INTEGER) = 0
+            THEN 0 ELSE 1
+          END,
           CASE WHEN needs_llm = 1 THEN 0 ELSE 1 END,
           CASE WHEN llm_await = 1 THEN 0 ELSE 1 END,
           CASE WHEN city = ? THEN 0 ELSE 1 END,
           scraped_at DESC
         LIMIT ?
     """
-    return _fetch_backlog_rows(sql, tuple(params))
+    return picked + _fetch_backlog_rows(sql, tuple(params))
 
 
 def fetch_copy_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
@@ -1241,16 +1526,23 @@ def sale_m2_by_city() -> dict[str, float]:
 
 
 def update_extras(listings: list[Listing]) -> None:
+    """Suma claves al JSON guardado. Una ficha cargada para el mapa no trae llm ni fotos."""
     if not listings:
         return
     with _write:
         with connect() as conn:
+            rows = []
+            for item in listings:
+                current = conn.execute(
+                    "SELECT extra_json FROM listings WHERE id = ?",
+                    (item.id,),
+                ).fetchone()
+                old = _loads_extra(current["extra_json"] if current else "{}")
+                merged = {**old, **(item.extra or {})}
+                rows.append((dumps_text(merged), item.id))
             conn.executemany(
                 "UPDATE listings SET extra_json = ? WHERE id = ?",
-                [
-                    (dumps_text(item.extra or {}), item.id)
-                    for item in listings
-                ],
+                rows,
             )
             conn.commit()
 

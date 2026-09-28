@@ -249,6 +249,40 @@ def test_listed_cities_hides_empty_searched_place(monkeypatch):
     reset()
 
 
+def test_listed_cities_hides_a_place_whose_map_is_empty(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, register_city
+    from app.places import clear_empty_view, listed_cities, mark_empty_view, reset_listed_places
+
+    saved: dict[str, str] = {}
+    monkeypatch.setattr(
+        "app.places.store.get_meta",
+        lambda key, default="", **kwargs: saved.get(key, default),
+    )
+    monkeypatch.setattr("app.places.store.set_meta", lambda key, value: saved.__setitem__(key, value))
+    reset_listed_places()
+    register_city(
+        "vista-vacia",
+        label="Vista Vacia",
+        lat=-34.85,
+        lon=-58.52,
+        province="buenos-aires",
+        builtin=False,
+    )
+    monkeypatch.setattr("app.places._ids_with_saved_listings", lambda: {"vista-vacia"})
+    try:
+        assert "vista-vacia" in {row["id"] for row in listed_cities([])}
+        mark_empty_view("vista-vacia")
+        assert "vista-vacia" not in {row["id"] for row in listed_cities([])}
+        assert clear_empty_view("vista-vacia")
+        assert "vista-vacia" in {row["id"] for row in listed_cities([])}
+    finally:
+        CITIES.pop("vista-vacia", None)
+        for token, owner in list(CITY_ALIASES.items()):
+            if owner == "vista-vacia" or token == "vista-vacia":
+                CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
+
 def test_listed_cities_hides_a_loading_empty_place(monkeypatch):
     from app.places import remember_listed_place, reset_listed_places
     from app.schedule import reset

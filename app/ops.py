@@ -70,7 +70,7 @@ def note(metric: str, n: int = 1, **labels: Any) -> None:
                 _minutes.pop(old, None)
     if name in {"new", "gone", "ingest"}:
         _persist(name, int(n), minute)
-    elif name in {"llm", "details"}:
+    elif name in {"llm", "details", "copy"}:
         outcome = str(labels.get("outcome") or "ok")[:24]
         _persist(f"{name}.{outcome}", int(n), minute)
 
@@ -98,6 +98,7 @@ def snapshot() -> dict[str, Any]:
         saved = disk.get(slot) or {}
         llm_by = _merge_outcome(saved, _by_label(bucket, "llm", "outcome"), "llm")
         details_by = _merge_outcome(saved, _by_label(bucket, "details", "outcome"), "details")
+        copy_by = _merge_outcome(saved, _by_label(bucket, "copy", "outcome"), "copy")
         row = {
             "t": slot * 60,
             "http": _sum_metric(bucket, "http"),
@@ -109,6 +110,8 @@ def snapshot() -> dict[str, Any]:
             "lanes": _lane_groups(bucket),
             "llm_by": llm_by,
             "details_by": details_by,
+            "copy_by": copy_by,
+            "copy": _disk_or_mem(saved, _sum_metric(bucket, "copy"), "copy.ok"),
         }
         series.append(row)
     return {
@@ -143,13 +146,13 @@ def inventory(force: bool = False) -> dict[str, Any]:
                 """
                 SELECT
                   SUM(CASE WHEN llm_ready = 1 AND llm_ver = ? AND llm_partial = 0 THEN 1 ELSE 0 END),
-                  SUM(llm_partial),
+                  SUM(CASE WHEN llm_partial = 1 AND llm_ver = ? AND details_scraped = 1 THEN 1 ELSE 0 END),
                   SUM(llm_await),
                   SUM(needs_llm),
                   SUM(CASE WHEN details_scraped = 0 AND is_hidden = 0 THEN 1 ELSE 0 END)
                 FROM listings
                 """,
-                (LLM_SCHEMA,),
+                (LLM_SCHEMA, LLM_SCHEMA),
             ).fetchone()
             sources = [
                 {"id": row[0] or "?", "n": int(row[1])}
@@ -188,6 +191,7 @@ def inventory(force: bool = False) -> dict[str, Any]:
     await_llm = int(llm_row[2] or 0)
     llm_need = int(llm_row[3] or 0)
     details_need = int(llm_row[4] or 0)
+    copy_done, copy_need = _copy_stock()
     data = {
         "listings": total,
         "details": detailed,
@@ -198,6 +202,9 @@ def inventory(force: bool = False) -> dict[str, Any]:
         "await_llm": await_llm,
         "llm_need": llm_need,
         "llm_pct": round(100.0 * llm_done / total, 1) if total else 0.0,
+        "copy_done": copy_done,
+        "copy_need": copy_need,
+        "copy_pct": round(100.0 * copy_done / (copy_done + copy_need), 1) if (copy_done + copy_need) else 0.0,
         "sources": sources,
         "cities": cities,
         "schema": LLM_SCHEMA,
@@ -205,6 +212,39 @@ def inventory(force: bool = False) -> dict[str, Any]:
     _inv = data
     _inv_at = now
     return data
+
+
+def _copy_stock() -> tuple[int, int]:
+    """Descripciones ya redactadas y las que todavía no. La consulta toca JSON."""
+    try:
+        from .freshness import LIST_TEXT_MIN
+        from .llm_copy import COPY_SCHEMA
+        from .store import connect
+
+        sql = """
+            SELECT
+              SUM(CASE
+                WHEN is_hidden = 0
+                 AND length(trim(IFNULL(json_extract(extra_json, '$.copy.text'), ''))) > 0
+                 AND IFNULL(CAST(json_extract(extra_json, '$.copy.ver') AS INTEGER), 0) = ?
+                THEN 1 ELSE 0 END),
+              SUM(CASE
+                WHEN is_hidden = 0 AND needs_llm = 0
+                 AND (details_scraped = 1 OR length(trim(IFNULL(description, ''))) >= ?)
+                 AND length(trim(IFNULL(json_extract(extra_json, '$.user_edits.description'), ''))) = 0
+                 AND (
+                   IFNULL(CAST(json_extract(extra_json, '$.copy.ver') AS INTEGER), 0) != ?
+                   OR length(trim(IFNULL(json_extract(extra_json, '$.copy.text'), ''))) = 0
+                   OR IFNULL(CAST(json_extract(extra_json, '$.copy.llm_ver') AS INTEGER), 0) != llm_ver
+                 )
+                THEN 1 ELSE 0 END)
+            FROM listings
+        """
+        with connect() as conn:
+            row = conn.execute(sql, (int(COPY_SCHEMA), int(LIST_TEXT_MIN), int(COPY_SCHEMA))).fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
+    except Exception:
+        return 0, 0
 
 
 def dashboard() -> dict[str, Any]:
@@ -276,12 +316,16 @@ def _build_dashboard() -> dict[str, Any]:
     copy_live = live.get("copy") or {}
     llm_pace = _outcome_pace(tel.get("series") or [], "llm_by", prefix="llm")
     details_pace = _outcome_pace(tel.get("series") or [], "details_by", prefix="details")
+    copy_pace = _outcome_pace(tel.get("series") or [], "copy_by", prefix="copy")
     llm_rate = float(llm_pace.get("per_hour") or 0)
     details_rate = float(details_pace.get("per_hour") or 0)
+    copy_rate = float(copy_pace.get("per_hour") or 0)
     llm_need_n = int(inv.get("llm_need") or 0)
     details_need_n = int(inv.get("details_need") or 0)
+    copy_need_n = int(inv.get("copy_need") or 0)
     llm_pace["eta_h"] = round(llm_need_n / llm_rate, 1) if llm_rate and llm_need_n else None
     details_pace["eta_h"] = round(details_need_n / details_rate, 1) if details_rate and details_need_n else None
+    copy_pace["eta_h"] = round(copy_need_n / copy_rate, 1) if copy_rate and copy_need_n else None
     new_n, gone_n, seen_n = _movement_totals(tel)
     new_24h, gone_24h, seen_24h = _movement_totals(tel, since_min=int(time.time() // 60) - KEEP_MIN + 1)
     pass_new = int((live.get("counts") or {}).get("avisos") or 0)
@@ -357,6 +401,16 @@ def _build_dashboard() -> dict[str, Any]:
             "workers": int(details_live.get("workers") or 0),
             "pct": float(inv.get("details_pct") or 0),
             **details_pace,
+        },
+        "copy_pipe": {
+            "done": int(inv.get("copy_done") or 0),
+            "need": int(inv.get("copy_need") or 0),
+            "pct": float(inv.get("copy_pct") or 0),
+            "queue": int(copy_live.get("pending") or 0),
+            "working": int(copy_live.get("cleaning") or 0),
+            "paused": False,
+            "ready": int(copy_live.get("ready") or 0),
+            **copy_pace,
         },
         "visits": visits,
     }

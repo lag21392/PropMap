@@ -120,6 +120,32 @@ PIN_KEYS = (
     "approx_cell",
     "lot_m2",
 )
+CARD_PAGE = 300
+CARD_EXTRA = (
+    "mortgage_credit",
+    "owner_direct",
+    "low_expenses",
+    "urgent_sale",
+    "environment",
+    "condition",
+    "has_balcony",
+    "bright",
+    "growing_area",
+    "open_view",
+    "has_patio",
+    "has_garage",
+    "has_terrace",
+    "is_outlier",
+    "monthly_yield_pct",
+    "temporal_yield_pct",
+    "monthly_rent_usd",
+    "nightly_usd",
+    "rental_month_scope",
+    "rental_month_n",
+    "contacted",
+    "tags",
+    "amenities",
+)
 _REV_HEAD = re.compile(rb'"rev"\s*:\s*(\d+)')
 _TOTAL_TAIL = re.compile(rb'"total":(\d+)')
 _STATS_HEAD = re.compile(rb'"stats":\{"total":(\d+),"deals":(\d+)')
@@ -151,6 +177,126 @@ def _drop_http_blobs(snap: dict[str, Any]) -> None:
     snap.pop("encoded_gzip", None)
     snap.pop("pins_encoded", None)
     snap.pop("pins_gzip", None)
+    snap.pop("card_rows", None)
+    snap.pop("card_rev", None)
+
+
+# Score de POIs ya calculado. La lista lo pega al servir: el snap puede ser anterior al cálculo.
+_poi_by_id: dict[str, dict[str, Any]] = {}
+_pin_dirty: set[str] = set()
+_pin_flush_at: dict[str, float] = {}
+
+
+def remember_poi_axes(axes: dict[str, dict[str, Any]]) -> None:
+    for lid, axis in axes.items():
+        if not lid or not isinstance(axis, dict) or axis.get("score") is None:
+            continue
+        _poi_by_id[str(lid)] = {
+            "score": axis.get("score"),
+            "confidence": axis.get("confidence") or "high",
+            "note": axis.get("note") or "",
+        }
+
+
+def apply_poi_overlay(rows: list[dict[str, Any]] | None) -> int:
+    """Completa el eje de POIs si el aviso ya lo tiene calculado y la fila todavía no."""
+    if not rows or not _poi_by_id:
+        return 0
+    changed = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        incoming = _poi_by_id.get(row.get("id"))
+        if not incoming:
+            continue
+        profile = row.get("profile")
+        if not isinstance(profile, dict):
+            profile = {}
+            row["profile"] = profile
+        axes = profile.get("axes")
+        if not isinstance(axes, dict):
+            axes = {}
+            profile["axes"] = axes
+        serv = axes.get("servicios") if isinstance(axes.get("servicios"), dict) else {}
+        if serv.get("score") == incoming.get("score") and (serv.get("note") or "") == (incoming.get("note") or ""):
+            continue
+        axes["servicios"] = dict(incoming)
+        changed += 1
+    return changed
+
+
+def schedule_pin_flush(city_id: str) -> None:
+    cid = (city_id or "").strip()
+    if cid and cid not in {"*", "fuera", "otros"}:
+        _pin_dirty.add(cid)
+
+
+def cached_city_ids() -> list[str]:
+    with _lock:
+        return [cid for cid in _city_snaps if cid and cid != "*"]
+
+
+def flush_pin_scores(max_cities: int = 1) -> int:
+    """Reescribe los pines de las ciudades cuyo score de POIs llegó después del snap."""
+    if not _poi_by_id or not _pin_dirty:
+        return 0
+    now = time.time()
+    flushed = 0
+    for cid in list(_pin_dirty)[: max(1, max_cities)]:
+        last = _pin_flush_at.get(cid) or 0.0
+        if last and now - last < 15:
+            continue
+        try:
+            _rewrite_pins_with_poi(cid)
+        except Exception:
+            log.exception("no pude reescribir pines con POIs %s", cid)
+        _pin_flush_at[cid] = now
+        _pin_dirty.discard(cid)
+        flushed += 1
+    return flushed
+
+
+def _rewrite_pins_with_poi(city_id: str) -> int:
+    raw: bytes | None = None
+    with _lock:
+        snap = _city_snaps.get(city_id) or {}
+        blob = snap.get("pins_encoded")
+        if isinstance(blob, (bytes, bytearray)) and len(blob) > 80:
+            raw = bytes(blob)
+    disk = False
+    if raw is None:
+        folder = _disk_dir()
+        if folder is None:
+            return 0
+        path = _pins_path(folder, city_id)
+        try:
+            if path.is_file() and path.stat().st_size > 80:
+                raw = path.read_bytes()
+                disk = True
+        except OSError:
+            return 0
+    if not raw:
+        return 0
+    try:
+        data = json_loads(raw)
+    except (ValueError, json.JSONDecodeError, TypeError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    changed = apply_poi_overlay(data.get("listings") or [])
+    if not changed:
+        return 0
+    encoded = json_dumps_bytes(data)
+    packed = gzip_encode(encoded)
+    with _lock:
+        snap = _city_snaps.get(city_id)
+        if snap is not None:
+            snap["pins_encoded"] = encoded
+            snap["pins_gzip"] = packed
+    if disk or _disk_dir() is not None:
+        _write_pins_artifact(city_id, encoded, packed=packed)
+    log.info("pines de %s con score de POIs n=%s", city_id, changed)
+    return changed
 
 
 def _read_meta(city_id: str, *, allow_stale: bool = False) -> dict[str, Any] | None:
@@ -185,7 +331,7 @@ def _disk_snap_complete(meta: dict[str, Any] | None) -> bool:
         return False
     n = int(meta.get("n") or 0)
     if n <= 0:
-        return False
+        return bool(meta.get("db_loaded"))
     if n < MIN_TRUSTED_SNAP and not meta.get("db_loaded"):
         return False
     return True
@@ -916,6 +1062,8 @@ def listings_pins_body(city: str | None, *, gzip: bool = False) -> tuple[bytes |
         return None, None
     snap = _city_snaps.get(view_city)
     geo_ok = _ram_http_ok(snap, view_city)
+    if geo_ok and not snap.get("warming") and snap.get("card_rev") != snap.get("rev"):
+        _schedule_card_pages(view_city)
     if geo_ok and snap.get("pins_gzip") and gzip:
         return snap["pins_gzip"], "gzip"
     if geo_ok and snap.get("pins_encoded"):
@@ -1058,9 +1206,9 @@ def request_city_bytes(city: str | None, *, refresh: bool = False) -> None:
         incomplete = n < MIN_TRUSTED_SNAP and view_city not in _db_loaded
         if not refresh:
             if view_city in _db_loaded and not incomplete:
-                if n == 0:
+                if n == 0 and not snap.get("warming") and (snap.get("encoded") or snap.get("encoded_gzip")):
                     return
-                if snap.get("encoded") and not snap.get("warming"):
+                if n and snap.get("encoded") and not snap.get("warming"):
                     return
                 if n and not snap.get("warming"):
                     _schedule_encode(view_city)
@@ -1154,8 +1302,19 @@ def _load_city_body(city_id: str) -> None:
             except Exception:
                 log.exception("no pude guardar correcciones de tipo en %s", city_id)
         if rows:
+            from .places import clear_empty_view
+
+            if clear_empty_view(city_id):
+                _refresh_meta(force=True)
             _commit_snap(city_id, rows, warming=False, persist=True, db_n=sqlite_n)
             log.warning("cache de %s en disco: %s fichas", city_id, len(rows))
+        else:
+            from .places import mark_empty_view
+
+            if sqlite_n >= 8:
+                mark_empty_view(city_id)
+                _refresh_meta(force=True)
+            _commit_snap(city_id, [], warming=False, persist=True, db_n=sqlite_n)
         log.warning("cache de %s listo: %s avisos", city_id, len(rows))
     except Exception:
         log.exception("no pude armar cache de %s", city_id)
@@ -1414,8 +1573,11 @@ def _commit_snap(
             "geo_ver": GEO_VERSION,
             "snap_ver": SNAP_VER,
             "score_ver": SCORE_VERSION,
+            "card_rows": [_card_row(row) for row in rows if isinstance(row, dict)],
+            "card_rev": rev,
         }
         _city_snaps[city_id] = snap
+        _card_cache[city_id] = (rev, snap["card_rows"])
         usd = _usd
         last_run = _last_run
         cities = snap["cities"]
@@ -1571,7 +1733,109 @@ def _public_to_pin(row: dict[str, Any]) -> dict[str, Any]:
         out["profile"] = slim
     else:
         out.pop("profile", None)
+    apply_poi_overlay([out])
     return out
+
+
+def _card_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Lo que usa la lista y los filtros, sin la ficha larga."""
+    out = _public_to_pin(row)
+    for key in CARD_EXTRA:
+        if key not in row:
+            continue
+        value = row[key]
+        if value is None or value == "" or value == []:
+            continue
+        out[key] = value
+    return out
+
+
+_page_building: set[str] = set()
+_page_lock = threading.Lock()
+_card_cache: dict[str, tuple[int, list]] = {}
+
+
+def _schedule_card_pages(city_id: str) -> None:
+    if not city_id or os.environ.get("PROPMAP_TEST") == "1":
+        return
+    with _page_lock:
+        if city_id in _page_building:
+            return
+        _page_building.add(city_id)
+    threading.Thread(
+        target=_build_card_pages,
+        args=(city_id,),
+        daemon=True,
+        name=f"card-pages-{city_id}",
+    ).start()
+
+
+def _build_card_pages(city_id: str) -> None:
+    try:
+        raw, _encoding = listings_body(city_id, gzip=False)
+        if not raw:
+            return
+        try:
+            data = json_loads(raw)
+        except (ValueError, json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict) or data.get("layer") == "pins":
+            return
+        rows = [_card_row(row) for row in data.get("listings") or [] if isinstance(row, dict)]
+        rev = int(data.get("rev") or 0)
+        del data
+        with _lock:
+            snap = _city_snaps.get(city_id)
+            if snap is not None and not snap.get("warming"):
+                snap["card_rows"] = rows
+                snap["card_rev"] = int(snap.get("rev") or rev)
+                rev = int(snap.get("card_rev") or rev)
+            _card_cache[city_id] = (rev, rows)
+    finally:
+        with _page_lock:
+            _page_building.discard(city_id)
+
+
+def listings_card_page(city: str | None, page: int) -> dict[str, Any] | None:
+    """Una tanda de avisos para la lista. El mapa sale por pines, aparte."""
+    view_city = resolve_city(city) if city else None
+    if not view_city:
+        return None
+    size = max(1, min(500, int(CARD_PAGE)))
+    snap = _city_snaps.get(view_city) or {}
+    if snap.get("warming"):
+        return {"warming": True, "layer": "cards", "page": max(0, page), "listings": []}
+    rows = snap.get("card_rows")
+    rev = int(snap.get("rev") or 0)
+    if not isinstance(rows, list) or snap.get("card_rev") != snap.get("rev"):
+        cached = _card_cache.get(view_city)
+        if cached and (not rev or cached[0] == rev):
+            rev, rows = cached
+        else:
+            _schedule_card_pages(view_city)
+            return {"warming": True, "layer": "cards", "page": max(0, page), "listings": []}
+    total = len(rows)
+    start = max(0, int(page)) * size
+    chunk = rows[start:start + size]
+    apply_poi_overlay(chunk)
+    pages = max(1, (total + size - 1) // size) if total else 1
+    return {
+        "rev": rev,
+        "unchanged": False,
+        "warming": False,
+        "layer": "cards",
+        "page": max(0, int(page)),
+        "size": size,
+        "pages": pages,
+        "total": total,
+        "more": start + size < total,
+        "listings": chunk,
+        "stats": snap.get("stats") if page <= 0 else {},
+        "cities": snap.get("cities") if page <= 0 else [],
+        "usd_ars": snap.get("usd_ars"),
+        "last_run": snap.get("last_run"),
+        "facebook": snap.get("facebook") if page <= 0 else [],
+    }
 
 
 def _ensure_disk_gzip(city_id: str) -> None:
@@ -1706,7 +1970,7 @@ def _write_http_artifacts(
     folder = _disk_dir()
     if folder is None or not city_id or city_id == "*":
         return
-    if n <= 0:
+    if n <= 0 and not (db_loaded and not warming):
         return
     meta = _read_meta(city_id, allow_stale=True)
     if warming and meta and _disk_snap_complete(meta):
@@ -2130,7 +2394,12 @@ def _read_disk_bytes(city_id: str, *, allow_stale: bool = False, allow_incomplet
             allow_stale or time.time() - path.stat().st_mtime <= CITY_CACHE_TTL_SEC
         ):
             raw = path.read_bytes()
-            if raw and not (b'"listings":[]' in raw[:160]) and _snap_ver_ok_bytes(raw):
+            finished_empty = bool(
+                meta and meta.get("db_loaded") and not meta.get("warming") and int(meta.get("n") or 0) <= 0
+            )
+            if raw and _snap_ver_ok_bytes(raw) and (
+                finished_empty or b'"listings":[]' not in raw[:160]
+            ):
                 return raw
     except OSError:
         pass

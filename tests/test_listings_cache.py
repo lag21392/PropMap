@@ -311,6 +311,33 @@ def test_warming_pins_are_served_before_full_cache(monkeypatch):
     reset()
 
 
+def test_card_page_returns_a_slice(monkeypatch):
+    from app import listings_cache
+
+    monkeypatch.setattr(listings_cache, "CARD_PAGE", 2)
+    monkeypatch.setattr(listings_cache, "start_warmup", lambda: None)
+    listings_cache.reset()
+    rows = []
+    for i in range(5):
+        pin = listings_cache._pin_row(_item(f"card-{i}", "caba"))
+        pin["mortgage_credit"] = True
+        pin["monthly_yield_pct"] = 4
+        rows.append(pin)
+    listings_cache._commit_snap("caba", rows, warming=False, persist=False)
+    first = listings_cache.listings_card_page("caba", 0)
+    assert first["warming"] is False
+    assert first["layer"] == "cards"
+    assert first["more"] is True
+    assert first["total"] == 5
+    assert len(first["listings"]) == 2
+    assert first["listings"][0]["mortgage_credit"] is True
+    assert first["listings"][0]["monthly_yield_pct"] == 4
+    last = listings_cache.listings_card_page("caba", 2)
+    assert last["more"] is False
+    assert len(last["listings"]) == 1
+    listings_cache.reset()
+
+
 def test_http_list_row_drops_nearby_and_extra_photos():
     from app import listings_cache
 

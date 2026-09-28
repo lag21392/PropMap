@@ -180,6 +180,7 @@ def test_snapshot_groups_vpn_and_movement(monkeypatch):
     ops.note("new", n=5, source="zonaprop")
     ops.note("gone", n=2)
     ops.note("llm", outcome="ok")
+    ops.note("copy", outcome="ok")
     ops.note("http", lane="translate", host="www.zonaprop.com.ar", status=200)
     snap = ops.snapshot()
     assert snap["http"]["by_group"]["local"] == 1
@@ -191,6 +192,7 @@ def test_snapshot_groups_vpn_and_movement(monkeypatch):
     assert snap["series"][-1]["new"] == 5
     assert snap["series"][-1]["gone"] == 2
     assert snap["series"][-1]["llm_by"]["ok"] == 1
+    assert snap["series"][-1]["copy_by"]["ok"] == 1
     monkeypatch.setattr(
         ops,
         "inventory",

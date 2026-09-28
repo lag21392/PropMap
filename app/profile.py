@@ -186,14 +186,22 @@ def compute_profile(item: Listing, pois: dict[str, list[dict]] | None = None) ->
     extra = item.extra or {}
     stored = extra.get("access") if isinstance(extra.get("access"), dict) else {}
     have_pois = bool(pois) and any(pois.get(key) for key in pois)
-    from .access import stored_access_ok
-
     if have_pois:
         access = compute_access(item, pois)
-    elif stored_access_ok(item, stored):
+    elif stored.get("score") is not None:
         access = stored
     else:
-        access = compute_access(item, pois)
+        access = {
+            "score": None,
+            "score_raw": None,
+            "groups_hit": 0,
+            "groups": 0,
+            "walk_km": None,
+            "pin_grade": pin_grade(item),
+            "precise": pin_is_precise(item),
+            "nearby": [],
+            "reason": "el proceso de la ficha todavía no guardó los POIs",
+        }
     order = axes_for(item)
     builders = {
         "price_m2": lambda: _price_axis(item),
@@ -224,24 +232,12 @@ def overlay_live_access(item: Listing, data: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_profiles(listings: list[Listing]) -> list[Listing]:
-    from .access import stored_access_ok
-    from .osm_poi import city_pois
-
-    pois_by_city: dict[str, dict[str, list[dict]]] = {}
+    """Arma precio, zona y alquiler. El eje de POIs solo si la ficha ya lo tiene guardado."""
     for i, item in enumerate(listings):
         extra = dict(item.extra or {})
-        city = item.city or ""
-        need_pois = pin_is_precise(item) and not stored_access_ok(item)
-        pois: dict[str, list[dict]] = {}
-        if need_pois:
-            if city not in pois_by_city:
-                pois_by_city[city] = city_pois(city)
-            pois = pois_by_city[city]
-        profile = compute_profile(item, pois)
+        profile = compute_profile(item, None)
         extra["profile"] = profile
         extra["pin_grade"] = profile.get("pin_grade")
-        if profile.get("access") and (not need_pois or any(pois.get(key) for key in pois)):
-            extra["access"] = profile["access"]
         item.extra = extra
         if i and i % 80 == 0:
             time.sleep(0.02)

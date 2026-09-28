@@ -82,7 +82,7 @@ async function load() {
   if (fetchCtrl) fetchCtrl.abort();
   const ctrl = new AbortController();
   fetchCtrl = ctrl;
-  const kill = setTimeout(() => ctrl.abort(), 3500);
+  const kill = setTimeout(() => ctrl.abort(), 12000);
   try {
     const res = await fetch("/api/ops", { credentials: "same-origin", signal: ctrl.signal });
     if (res.status === 401) {
@@ -106,9 +106,10 @@ function paint(data) {
   const move = data.movement || {};
   const llm = data.llm_pipe || {};
   const fichas = data.details_pipe || {};
+  const copy = data.copy_pipe || {};
   const running = Boolean(live.running);
 
-  paintSummary({ live, inv, tel, move, llm, fichas, egress, running });
+  paintSummary({ live, inv, tel, move, llm, fichas, copy, egress, running });
   paintLanes(egress.tracks || [], tel, data.busy || [], egress);
   paintMove(move, tel.series || []);
   paintLlm(llm, tel.series || [], live.copy || {});
@@ -302,28 +303,72 @@ function etaCopy(hours, need, live) {
   return `A este ritmo, unos ${(h / 24).toFixed(1)} días para vaciar lo que falta.`;
 }
 
+function queueNow(kind, pipe) {
+  const working = Number(pipe.working || 0);
+  const queue = Number(pipe.queue || 0);
+  const copyOnGpu = Number(pipe.copy_working || 0) > 0;
+  if (kind === "llm" && pipe.gpu && !copyOnGpu) return "en la GPU";
+  if (kind === "llm" && copyOnGpu) return "cede el turno";
+  if (kind === "copy" && working) return "en la GPU";
+  if (kind === "copy" && queue) return "en buffer, espera turno";
+  if (working) return kind === "fichas" ? `bajando ${fmt(working)}` : "trabajando";
+  if (queue) return `${fmt(queue)} en cola`;
+  return "libre";
+}
+
+function queueEta(pipe) {
+  const need = Number(pipe.need || 0);
+  if (!need) return "al día";
+  const h = Number(pipe.eta_h);
+  if (!Number.isFinite(h) || h <= 0) return "—";
+  if (h < 1.5) return `${Math.max(1, Math.round(h * 60))} min`;
+  if (h < 48) return `${Math.round(h)} h`;
+  return `${Math.round(h / 24)} días`;
+}
+
+function queueRow(label, pipe, kind) {
+  return `<tr>
+    <td>${esc(label)}</td>
+    <td class="num">${fmt(pipe.done || 0)}</td>
+    <td class="num is-need">${fmt(pipe.need || 0)}</td>
+    <td>${esc(queueNow(kind, pipe))}</td>
+    <td class="num">${fmt(pipe.this_min || 0)}</td>
+    <td class="num">${paceLabel(Number(pipe.per_hour || 0), pipe)}</td>
+    <td class="num">${fmt(pipe.ok_d || 0)}</td>
+    <td class="num">${esc(queueEta(pipe))}</td>
+  </tr>`;
+}
+
+function paintQueues(llm, fichas, copy) {
+  const table = document.getElementById("queueTable");
+  if (!table) return;
+  table.innerHTML = `<caption>Proceso</caption>
+    <thead><tr>
+      <th>Etapa</th><th class="num">Hechos</th><th class="num">Faltan</th><th>Ahora</th>
+      <th class="num">Este minuto</th><th class="num">Por hora</th><th class="num">Hoy</th><th class="num">Termina</th>
+    </tr></thead>
+    <tbody>
+      ${queueRow("Fichas · bajada, no es LLM", fichas, "fichas")}
+      ${queueRow("Limpieza · LLM", llm, "llm")}
+      ${queueRow("Descripciones · LLM", copy, "copy")}
+    </tbody>`;
+}
+
 function paintSummary(ctx) {
-  const { live, inv, tel, move, llm, fichas, egress, running } = ctx;
+  const { live, inv, tel, move, llm, fichas, copy, egress, running } = ctx;
+  paintQueues(llm, fichas, copy || {});
   document.getElementById("sumBlock").hidden = false;
   const cities = (live.running_cities || []).join(", ");
-  document.getElementById("nowLead").textContent = running
-    ? `Scrape en curso · ${cities || "sin lugar"} · ${live.mode || "pasada"} · ${live.message || "trabajando"}`
-    : live.message && live.message !== "Todavía no se buscó nada."
-      ? live.message
-      : "El motor rota lugares sin parar. Enseguida arranca el próximo.";
-
-  const lanes = latestLanes(tel.series || []).lanes;
-  const reqMin = LANE_ORDER.reduce((sum, key) => sum + Number(lanes[key] || 0), 0);
+  const base = fmt(inv.listings || 0);
   const newToday = Number(move.new || 0) || Number(move.new_24h || 0);
   const goneToday = Number(move.gone || 0) || Number(move.gone_24h || 0);
-  document.getElementById("sumKpis").innerHTML = [
-    tile("Avisos en base", fmt(inv.listings || 0), newToday || goneToday ? `+${fmt(newToday)} / −${fmt(goneToday)} hoy` : "sin altas ni bajas hoy"),
-    tile("Limpiados por LLM", pctLabel(llm.pct), `faltan ${fmt(llm.need || 0)}`),
-    tile("Ritmo LLM", `${paceMinLabel(Number(llm.per_min || 0), llm)} /min`, `≈ ${paceLabel(Number(llm.per_hour || 0), llm)} por hora`),
-    tile("Termina en", etaShort(llm.eta_h), "al ritmo actual"),
-    tile("Fichas bajadas", pctLabel(fichas.pct), `faltan ${fmt(fichas.need || 0)}`),
-    tile("Requests / min", fmt(reqMin), running ? "scrape activo" : "motor en pausa"),
-  ].join("");
+  const flow = newToday || goneToday ? ` · +${fmt(newToday)} / −${fmt(goneToday)} hoy` : "";
+  const scrape = running
+    ? `Scrape en curso · ${cities || "sin lugar"} · ${live.mode || "pasada"}`
+    : live.message && live.message !== "Todavía no se buscó nada."
+      ? live.message
+      : "El motor rota lugares sin parar.";
+  document.getElementById("nowLead").textContent = `${base} avisos en la base${flow}. ${scrape}`;
 
   const alerts = [];
   if (llm.llama_ok === false) {
@@ -340,6 +385,9 @@ function paintSummary(ctx) {
   }
   if (Number(llm.fail_h || 0)) {
     alerts.push(["warn", `${fmt(llm.fail_h)} errores del LLM en la última hora.`]);
+  }
+  if (Number(fichas.need || 0) && !Number(fichas.queue || 0) && !Number(fichas.working || 0)) {
+    alerts.push(["warn", `Faltan ${fmt(fichas.need)} fichas y ahora no se está bajando ninguna.`]);
   }
   const blocked = Object.entries((tel.http || {}).by_status || {})
     .filter(([code]) => code === "403" || code === "401" || code === "429")
@@ -361,8 +409,6 @@ function paintSummary(ctx) {
 
 function paintLlm(pipe, series, copy) {
   document.getElementById("llmBlock").hidden = false;
-  const done = Number(pipe.done || 0);
-  const need = Number(pipe.need || 0);
   const queue = Number(pipe.queue || 0);
   const working = Number(pipe.working || 0);
   const ready = Number(pipe.ready || 0);
@@ -371,44 +417,44 @@ function paintLlm(pipe, series, copy) {
   const awaitDir = Number(pipe.await_dir || 0);
   const cap = Number(pipe.cap || 0);
   const thisMin = Number(pipe.this_min || 0);
-  const okH = Number(pipe.ok_h || 0);
-  const okD = Number(pipe.ok_d || 0);
-  const copyQ = Number(pipe.copy_queue || (copy || {}).pending || 0);
-  const copyW = Number(pipe.copy_working || (copy || {}).cleaning || 0);
+  const copyQ = Number(pipe.copy_queue || (copy || {}).queue || (copy || {}).pending || 0);
+  const copyW = Number(pipe.copy_working || (copy || {}).working || (copy || {}).cleaning || 0);
+  const copyReady = Number((copy || {}).ready || 0);
   const copyCap = Number(pipe.copy_cap || (copy || {}).cap || 0);
-  const gpu = Boolean(pipe.gpu) || Boolean(copyW);
+  const onCopy = Boolean(copyW);
+  const gpu = Boolean(pipe.gpu) || onCopy;
   const llamaOk = pipe.llama_ok !== false;
   const busyS = Number(pipe.busy_s || 0);
-  const ok24 = Number(pipe.ok_24 || 0);
   const stuck = Boolean(working) && !gpu && busyS > 20;
   const nowBits = [];
-  if (gpu && copyW && !working) {
-    nowBits.push(`GPU redactando descripción${busyS ? ` hace ${Math.round(busyS)} s` : ""}`);
+  if (onCopy) {
+    nowBits.push(`GPU en descripciones${busyS ? ` hace ${Math.round(busyS)} s` : ""}`);
   } else if (gpu) {
-    nowBits.push(`GPU generando${busyS ? ` hace ${Math.round(busyS)} s` : ""}`);
+    nowBits.push(`GPU en limpieza${busyS ? ` hace ${Math.round(busyS)} s` : ""}`);
   } else if (stuck) {
     nowBits.push(`GPU quieta · el worker se trabó ${Math.round(busyS)} s en un aviso`);
   } else if (queue && working) {
-    nowBits.push(`armando el próximo prompt${busyS ? ` (${Math.round(busyS)} s)` : ""}`);
-  } else if (queue || copyQ) {
-    nowBits.push("GPU libre y hay cola: debería arrancar ya");
+    nowBits.push(`armando el próximo prompt de limpieza${busyS ? ` (${Math.round(busyS)} s)` : ""}`);
+  } else if (ready || queue) {
+    nowBits.push("limpieza con trabajo y la GPU todavía no lo tomó");
+  } else if (copyReady || copyQ) {
+    nowBits.push("limpieza sin prompt: el próximo turno es una descripción");
   } else {
-    nowBits.push("GPU libre");
+    nowBits.push("GPU libre: ni limpieza ni descripciones tienen un prompt armado");
   }
   if (!llamaOk) nowBits.push("llama.cpp no responde");
-  nowBits.push(ready ? `${fmt(ready)} prompt${ready === 1 ? "" : "s"} esperando turno` : "sin prompt de reserva");
+  nowBits.push(
+    `limpieza ${fmt(queue)} en cola${ready ? `, ${fmt(ready)} en buffer` : ", buffer vacío"}`
+  );
+  nowBits.push(
+    `descripciones ${fmt(copyW)} en GPU, ${fmt(copyQ)}${copyCap ? ` / ${fmt(copyCap)}` : ""} en buffer${copyReady ? `, ${fmt(copyReady)} armadas` : ""}`
+  );
   if (saving) nowBits.push(`${fmt(saving)} esperando para guardarse`);
-  if (copyQ || copyW) {
-    nowBits.push(`${fmt(copyW)} descripciones en GPU · ${fmt(copyQ)}${copyCap ? ` / ${fmt(copyCap)}` : ""} en cola`);
-  }
-  document.getElementById("llmNow").textContent = `Ahora: ${nowBits.join(" · ")}.`;
-  document.getElementById("llmLead").textContent = need
-    ? (stuck
-        ? `Hay ${fmt(queue)} en cola pero la GPU no está generando. No es que falte trabajo: el pedido a llama.cpp se colgó.`
-        : `En la base faltan ${fmt(need)}. ${etaCopy(pipe.eta_h, need, gpu || working || thisMin || okH || okD || ok24)}`)
-    : (copyQ || copyW
-        ? `Extracción al día. Redactando descripciones: ${fmt(copyQ)} en cola.`
-        : "No hay avisos pendientes de esta versión del LLM.");
+  if (partial) nowBits.push(`${fmt(partial)} parciales: falló el modelo con la ficha ya bajada`);
+  document.getElementById("llmNow").textContent = nowBits.join(" · ") + ".";
+  document.getElementById("llmLead").textContent = stuck
+    ? `Hay ${fmt(queue)} de limpieza en cola pero la GPU no está generando. El pedido a llama.cpp se colgó.`
+    : "Una sola GPU y dos colas LLM. No corta el aviso que ya empezó. La limpieza va primero; cada 6, si hay una descripción armada, entra esa. Si la limpieza no tiene prompt, la GPU redacta.";
   paintStack("llmNowStack", [
     { label: "Prompts armados", n: ready, color: "#6a8f2e" },
     { label: "GPU generando", n: gpu ? 1 : 0, color: "#3d6f8a" },
@@ -417,17 +463,13 @@ function paintLlm(pipe, series, copy) {
     { label: "Worker trabado", n: stuck ? 1 : 0, color: "#c45c3a" },
     { label: "Listos este minuto", n: thisMin, color: "#2a4a3c" },
   ]);
-  paintStack("llmStack", [
-    { label: "Listos", n: done, color: "#2a4a3c" },
-    { label: "Parciales", n: partial, color: "#6a8f2e" },
-    { label: "Faltan", n: need, color: "#a07a2e" },
-  ]);
-  document.getElementById("llmKpis").innerHTML = paceKpis(pipe, [
+  document.getElementById("llmKpis").innerHTML = [
     kpi("En cola", `${fmt(queue)}${cap ? ` / ${fmt(cap)}` : ""}`),
     copyQ || copyW ? kpi("Descripciones", `${fmt(copyQ)}${copyCap ? ` / ${fmt(copyCap)}` : ""}`) : "",
     partial ? kpi("Parciales", fmt(partial)) : "",
     awaitDir ? kpi("Sin dirección", fmt(awaitDir)) : "",
-  ]);
+    Number(pipe.fail_h || 0) ? kpi("Errores / h", fmt(pipe.fail_h)) : "",
+  ].join("");
   outcomeBars(document.getElementById("llmChart"), series || [], "llm_by");
   document.getElementById("llmChartLegend").innerHTML = [
     ["#2a4a3c", "Listos"],
@@ -441,34 +483,24 @@ function paintLlm(pipe, series, copy) {
 
 function paintFichas(pipe, series) {
   document.getElementById("fichaBlock").hidden = false;
-  const done = Number(pipe.done || 0);
   const need = Number(pipe.need || 0);
   const queue = Number(pipe.queue || 0);
   const working = Number(pipe.working || 0);
-  const thisMin = Number(pipe.this_min || 0);
   const okH = Number(pipe.ok_h || 0);
-  const okD = Number(pipe.ok_d || 0);
   const workers = Number(pipe.workers || 0);
   const cooling = Number(pipe.cooling || 0);
   const failH = Number(pipe.fail_h || 0);
   document.getElementById("fichaNow").textContent =
-    `Ahora: ${fmt(working)} bajando${workers ? ` / ${fmt(workers)}` : ""} · ${fmt(queue)} en cola${cooling ? ` · ${fmt(cooling)} esperando reintento` : ""}.`;
+    `${fmt(working)} bajando${workers ? ` / ${fmt(workers)}` : ""} · ${fmt(queue)} en cola${cooling ? ` · ${fmt(cooling)} esperando reintento` : ""}.`;
   document.getElementById("fichaLead").textContent = !need
     ? "Todas las fichas de la base ya se bajaron."
     : failH > Math.max(20, okH * 3)
-      ? `Faltan ${fmt(need)}, pero los portales están rechazando casi todo (${fmt(failH)} fallas en la última hora). Cada aviso que falla espera antes de reintentar.`
-      : `Faltan bajar ${fmt(need)} fichas. ${etaCopy(pipe.eta_h, need, working || thisMin || okH || okD)}`;
-  paintStack("fichaStack", [
-    { label: "Bajadas", n: done, color: "#2a4a3c" },
-    { label: "Bajando", n: working, color: "#3d6f8a" },
-    { label: "En cola", n: queue, color: "#9a5a28" },
-    { label: "Faltan", n: Math.max(0, need - queue - working), color: "#a07a2e" },
-  ]);
-  document.getElementById("fichaKpis").innerHTML = paceKpis(pipe, [
-    kpi("En cola", fmt(queue)),
-    kpi("Bajando", `${fmt(working)}${workers ? ` / ${fmt(workers)}` : ""}`),
+      ? `Los portales están rechazando casi todo (${fmt(failH)} fallas en la última hora). Cada aviso que falla espera antes de reintentar.`
+      : "Detalle de la bajada. Hechos, faltan y ritmo están en la tabla de arriba.";
+  document.getElementById("fichaKpis").innerHTML = [
     cooling ? kpi("Esperando reintento", fmt(cooling)) : "",
-  ]);
+    failH ? kpi("Errores / h", fmt(failH)) : "",
+  ].join("");
   const chart = document.getElementById("fichaChart");
   if (chart) outcomeBars(chart, series || [], "details_by");
 }

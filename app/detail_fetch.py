@@ -93,7 +93,48 @@ def needs_llm(item: Listing) -> bool:
     return needs_improve(item)
 
 
-def enqueue(listings: list[Listing] | None, *, ignore_cooling: bool = False) -> None:
+_priority_city = ""
+_priority_read = 0.0
+
+
+def _priority_city_now() -> str:
+    global _priority_city, _priority_read
+    now = time.time()
+    if _priority_read and now - _priority_read < 20:
+        return _priority_city
+    from . import store
+
+    try:
+        with store.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                ("detail_priority_city",),
+            ).fetchone()
+    except Exception:
+        return _priority_city
+    _priority_city = (row["value"] if row else "").strip()
+    _priority_read = now
+    return _priority_city
+
+
+def _refresh_due(item: Listing, city: str) -> bool:
+    """La ciudad prioritaria se vuelve a bajar si la ficha no es de hoy."""
+    if not city or (item.city or "") != city or not item.url:
+        return False
+    extra = item.extra or {}
+    if extra.get("skip_details"):
+        return False
+    from .freshness import same_local_day
+
+    return not same_local_day(extra.get("details_at"))
+
+
+def enqueue(
+    listings: list[Listing] | None,
+    *,
+    ignore_cooling: bool = False,
+    refresh_city: str = "",
+) -> None:
     if not enabled() or not listings:
         return
     from .llm_enrich import enqueue as enqueue_llm
@@ -103,7 +144,7 @@ def enqueue(listings: list[Listing] | None, *, ignore_cooling: bool = False) -> 
         for item in listings:
             if not item or not item.id:
                 continue
-            if needs_detail_fetch(item) and item.url:
+            if item.url and (needs_detail_fetch(item) or _refresh_due(item, refresh_city)):
                 extra = item.extra or {}
                 tries = int(extra.get("detail_tries") or 0)
                 if tries >= COLD_TRIES and item.id not in _skip_until:
@@ -136,7 +177,7 @@ def refill(prefer_city: str = "") -> int:
     now = time.time()
     with _lock:
         pending = len(_urgent) + len(_queue)
-        room = max(0, workers() * 3 - pending)
+        room = max(0, 30 - pending)
         skip = set(_seen)
         # El backfill es un reintento deliberado: no filtrar por cooling (_skip_until)
         # para que los items con detail_tries agotados puedan reintentarse.
@@ -144,16 +185,21 @@ def refill(prefer_city: str = "") -> int:
         return 0
     from . import store
 
-    items = store.fetch_detail_backlog(min(24, room + 8), prefer_city=prefer_city)
-    # Los items cuyo LLM ya está completo no necesitan otra bajada de ficha: el
-    # enriquecimiento ya los procesó y re-parsear solo quema ancho de banda.
-    take = [item for item in items if item.id not in skip and needs_llm(item)][:room]
+    refresh = _priority_city_now()
+    prefer = refresh or (prefer_city or "").strip()
+    items = store.fetch_detail_backlog(
+        room,
+        prefer_city=prefer,
+        skip_ids=skip,
+        refresh_city=refresh,
+    )
+    take = [item for item in items if item.id not in skip][:room]
     if take:
         # Limpiar cooling para estos items ya que el backfill los está reintentando
         with _lock:
             for item in take:
                 _skip_until.pop(item.id, None)
-        enqueue(take, ignore_cooling=True)
+        enqueue(take, ignore_cooling=True, refresh_city=refresh)
     return len(take)
 
 
@@ -210,7 +256,7 @@ def _drain() -> None:
                 listing_id = _pop_work()
                 stalled = not listing_id and _has_work()
             if listing_id:
-                _fetch_id(listing_id)
+                _fetch_bounded(listing_id)
                 continue
             if stalled:
                 time.sleep(1.0)
@@ -222,6 +268,25 @@ def _drain() -> None:
             _ensure_workers_locked()
 
 
+def _fetch_bounded(listing_id: str) -> None:
+    """Una ficha que no vuelve no puede quedarse con el cupo para siempre."""
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            _fetch_id(listing_id)
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True, name="detail-one").start()
+    if done.wait(75):
+        return
+    _ops_note("details", outcome="fail")
+    with _lock:
+        _seen.discard(listing_id)
+        _cool_locked(listing_id, 1)
+
+
 def _fetch_id(listing_id: str) -> None:
     from . import store
     from .features import analyze
@@ -231,10 +296,14 @@ def _fetch_id(listing_id: str) -> None:
     item = store.get_listing(listing_id)
     if not item:
         return
-    if needs_detail_fetch(item) and item.url:
+    force = _refresh_due(item, _priority_city_now())
+    if item.url and (needs_detail_fetch(item) or force):
+        stamp = str((item.extra or {}).get("details_at") or "")
         try:
-            enrich_details(item)
+            enrich_details(item, force=force)
             ok = bool(item.details_scraped)
+            if force:
+                ok = ok and str((item.extra or {}).get("details_at") or "") != stamp
         except Exception:
             analyze(item)
             ok = False
@@ -252,6 +321,12 @@ def _fetch_id(listing_id: str) -> None:
         item.extra = extra
         store.upsert_many([item])
         item = store.get_listing(listing_id) or item
+    try:
+        from .access import enqueue_poi_score
+
+        enqueue_poi_score(item)
+    except Exception:
+        pass
     if needs_llm(item):
         extra = item.extra or {}
         enqueue_llm(
