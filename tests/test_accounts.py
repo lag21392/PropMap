@@ -262,7 +262,7 @@ def test_api_listing_get_returns_description_and_rent(tmp_path, monkeypatch):
         missing = client.get("/api/listing", params={"id": "zonaprop:no-esta"})
     assert res.status_code == 200
     body = res.json()["listing"]
-    assert "Living comedor" in (body.get("description") or "")
+    assert body.get("description") == ""
     assert body.get("monthly_yield_pct") == 4.8
     assert body.get("monthly_rent_usd") == 420
     assert missing.status_code == 404

@@ -8,7 +8,7 @@ const map = L.map("map", {
 }).setView([-38.4161, -63.6167], 5);
 window.map = map;
 
-// Tile layers for light/dark themes
+// El mapa queda siempre en OpenStreetMap claro. El modo oscuro no cambia las teselas.
 const tileLayers = {
   light: L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
@@ -16,12 +16,6 @@ const tileLayers = {
     updateWhenIdle: true,
     keepBuffer: 2,
   }),
-  dark: L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-    maxZoom: 19,
-    updateWhenIdle: true,
-    keepBuffer: 2,
-  })
 };
 
 // Theme management
@@ -47,19 +41,16 @@ function setTheme(theme) {
   // Update meta theme-color
   const metaTheme = document.querySelector(THEME_META_SELECTOR);
   if (metaTheme) {
-    metaTheme.setAttribute('content', isDark ? '#1e2520' : '#2f5346');
+    metaTheme.setAttribute('content', isDark ? '#121820' : '#2f5346');
   }
   
-  // Switch tile layer
-  if (map) {
-    Object.values(tileLayers).forEach(layer => map.removeLayer(layer));
-    tileLayers[theme].addTo(map);
+  if (map && tileLayers.light && !map.hasLayer(tileLayers.light)) {
+    tileLayers.light.addTo(map);
   }
   
   // Update button icon if present
   const themeToggle = document.getElementById('themeToggle');
   if (themeToggle) {
-    themeToggle.textContent = isDark ? '☀️' : '🌙';
     themeToggle.setAttribute('aria-label', isDark ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro');
     themeToggle.title = isDark ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro';
   }
@@ -112,6 +103,11 @@ mapBox.addEventListener("pointerup", releaseMapPointer);
 mapBox.addEventListener("pointercancel", releaseMapPointer);
 
 const zoneLayer = L.layerGroup().addTo(map);
+
+// Heatmap layer for USD/m² visualization
+let heatLayer = null;
+let heatData = [];
+
 let zoneMarkersByKey = {};
 let stackMarkers = [];
 let approxBox = null;
@@ -123,6 +119,10 @@ let listCardH = 200;
 let listUserMoved = false;
 let mapPaintGen = 0;
 let mapPaintKey = "";
+let frameAfterListings = false;
+let lastSearchPlace = null;
+let earthZoomUntil = 0;
+let earthZoomToken = 0;
 let facebook = [];
 let markersById = {};
 let pollTimer = null;
@@ -226,6 +226,12 @@ function clearLoadedListings() {
   mapPaintKey = "";
   exactCluster.clearLayers();
   zoneLayer.clearLayers();
+  // Clear heatmap
+  if (heatLayer) {
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+    heatData = [];
+  }
   markersById = {};
   zoneMarkersByKey = {};
   stackMarkers = [];
@@ -433,6 +439,9 @@ function prefetchPins(city, seq, waitKind, attempt = 0) {
         return;
       }
       applyListingsPayload(data, city, seq, { keepStatus: true });
+      if ($("statusLine") && String(lastListingsFp).endsWith(":p")) {
+        $("statusLine").textContent = `Mostrando ${allListings.length} avisos.`;
+      }
       if (data.warming && !pinsSettled) {
         setTimeout(() => prefetchPins(city, seq, waitKind, attempt + 1), 800);
       }
@@ -506,7 +515,12 @@ function scheduleMapPaint(immediate) {
       mapPaintHeld = true;
       return;
     }
-    paintMapMarkers(sorted(filtered()));
+    const items = sorted(filtered());
+    paintMapMarkers(items);
+    if (frameAfterListings && pinPoints(items).length) {
+      frameAfterListings = false;
+      flyToPins(items, lastSearchPlace);
+    }
   }, immediate ? 0 : 400);
 }
 
@@ -704,6 +718,7 @@ async function load(opts = {}) {
       return;
     }
     hideListingsWait();
+    if (frameAfterListings) frameVisiblePins();
     return;
   }
   if (!data.warming && data.layer !== "pins" && !(data.listings || []).length) {
@@ -1063,29 +1078,110 @@ function fillCities(cities, opts = {}) {
   }
 }
 
+function asList(value) {
+  if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean);
+  if (value == null || value === "") return [];
+  return String(value).split(",").map((v) => v.trim()).filter(Boolean);
+}
+
+function paintMulti(el) {
+  if (!el) return;
+  const checked = [...el.querySelectorAll('input[type="checkbox"]:checked')];
+  const btn = el.querySelector(".multi-btn");
+  if (!btn) return;
+  const empty = el.dataset.empty || "Todos";
+  if (!checked.length) btn.textContent = empty;
+  else if (checked.length <= 2) btn.textContent = checked.map((box) => box.parentElement.textContent.trim()).join(", ");
+  else btn.textContent = `${checked.length} elegidos`;
+}
+
+function closeMulti(el) {
+  el.classList.remove("is-open");
+  const menu = el.querySelector(".multi-menu");
+  const btn = el.querySelector(".multi-btn");
+  if (menu) menu.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function bindMulti(el) {
+  if (!el || el._multi) return;
+  el._multi = true;
+  Object.defineProperty(el, "value", {
+    configurable: true,
+    get() {
+      return [...el.querySelectorAll('input[type="checkbox"]:checked')].map((box) => box.value).join(",");
+    },
+    set(raw) {
+      const wanted = new Set(asList(raw).map((v) => v.toLowerCase()));
+      el.querySelectorAll('input[type="checkbox"]').forEach((box) => {
+        box.checked = wanted.has(box.value.trim().toLowerCase());
+      });
+      paintMulti(el);
+    },
+  });
+  el.querySelector(".multi-btn")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const open = !el.classList.contains("is-open");
+    document.querySelectorAll(".multi.is-open").forEach((other) => {
+      if (other !== el) closeMulti(other);
+    });
+    el.classList.toggle("is-open", open);
+    const menu = el.querySelector(".multi-menu");
+    if (menu) menu.hidden = !open;
+    el.querySelector(".multi-btn")?.setAttribute("aria-expanded", String(open));
+  });
+  el.addEventListener("change", () => paintMulti(el));
+}
+
+function setMultiOptions(el, options, keep) {
+  if (!el) return;
+  bindMulti(el);
+  const menu = el.querySelector(".multi-menu");
+  if (!menu) return;
+  const wanted = new Set(asList(keep ?? el.value).map((v) => v.toLowerCase()));
+  menu.innerHTML = options.map((opt) => {
+    const value = String(opt.value);
+    const on = wanted.has(value.trim().toLowerCase()) ? " checked" : "";
+    return `<label><input type="checkbox" value="${escapeHtml(value)}"${on} /> ${escapeHtml(opt.label)}</label>`;
+  }).join("");
+  paintMulti(el);
+}
+
+function initMultis() {
+  document.querySelectorAll(".multi").forEach(bindMulti);
+}
+
+function chosen(id) {
+  return asList($(id)?.value);
+}
+
+function matchesChosen(id, value) {
+  const picked = chosen(id);
+  if (!picked.length) return true;
+  const key = String(value || "").trim().toLowerCase();
+  return picked.some((item) => item.toLowerCase() === key);
+}
+
 function fillZonas(items) {
-  const select = $("zonaFilter");
-  const current = select.value;
+  const el = $("zonaFilter");
+  if (!el) return;
+  const current = el.value;
   const zonas = [...new Set(items.map((x) => x.zona).filter(Boolean))].sort((a, b) => a.localeCompare(b, "es"));
-  select.innerHTML = `<option value="">Todas</option>` + zonas.map((z) => `<option>${escapeHtml(z)}</option>`).join("");
-  select.value = current;
+  setMultiOptions(el, zonas.map((z) => ({ value: z, label: z })), current);
 }
 
 function fillBarrios() {
-  const select = $("barrioFilter");
-  if (!select) return;
+  const el = $("barrioFilter");
+  if (!el) return;
   const city = currentCity();
-  const current = select.value;
+  const pending = asList(landingBarrio);
+  const keep = pending.length ? pending.join(",") : el.value;
   const fromItems = cityItems().map((x) => x.barrio).filter((n) => n && n !== "Sin clasificar");
   const fromKnown = (window.placeBarrios && window.placeBarrios[city]) || [];
   const names = [...new Set([...fromItems, ...fromKnown])].sort((a, b) => a.localeCompare(b, "es"));
-  select.innerHTML = `<option value="">Todos</option>` + names.map((n) => `<option>${escapeHtml(n)}</option>`).join("");
-  let next = names.includes(current) ? current : "";
-  if (landingBarrio && names.includes(landingBarrio)) {
-    next = landingBarrio;
-    landingBarrio = "";
-  }
-  select.value = next;
+  setMultiOptions(el, names.map((n) => ({ value: n, label: n })), keep);
+  if (pending.length && chosen("barrioFilter").length) landingBarrio = "";
 }
 
 function ambientesOf(item) {
@@ -1138,18 +1234,25 @@ function passesSize(item) {
     if (minM2 && m2 < minM2) return false;
     if (maxM2 && m2 > maxM2) return false;
   }
-  if ($("typeFilter")?.value === "terreno") return true;
+  if ((item?.property_type || "") === "terreno") return true;
+  if (chosen("typeFilter").length === 1 && chosen("typeFilter")[0] === "terreno") return true;
   const minBeds = minChosen("minBeds");
   const minRooms = minChosen("minRooms");
   const minBaths = minChosen("minBaths");
   if (minBeds && !(bedroomsOf(item) >= minBeds)) return false;
   if (minRooms && !(ambientesOf(item) >= minRooms)) return false;
+  const maxRooms = minChosen("maxRooms");
+  if (maxRooms) {
+    const rooms = ambientesOf(item);
+    if (rooms == null || rooms > maxRooms) return false;
+  }
   if (minBaths && !(bathroomsOf(item) >= minBaths)) return false;
   return true;
 }
 
 function syncRoomFilters() {
-  const lot = $("typeFilter")?.value === "terreno";
+  const types = chosen("typeFilter");
+  const lot = types.length === 1 && types[0] === "terreno";
   ["minBeds", "minRooms", "minBaths"].forEach((id) => {
     const el = $(id);
     if (el) el.disabled = lot;
@@ -1193,9 +1296,6 @@ function passesTraits(item, traits) {
 
 function filtered() {
   const city = currentCity();
-  const type = $("typeFilter").value;
-  const zona = $("zonaFilter").value;
-  const barrio = $("barrioFilter")?.value || "";
   const max = Number($("maxPrice").value || 0);
   const minDeal = Number($("dealBar")?.value || 0);
   const favs = $("favOnly").checked;
@@ -1203,9 +1303,9 @@ function filtered() {
 
   return allListings.filter((item) => {
     if (city && !belongsToCity(item, city)) return false;
-    if (type && item.property_type !== type) return false;
-    if (zona && item.zona !== zona) return false;
-    if (barrio && item.barrio !== barrio) return false;
+    if (!matchesChosen("typeFilter", item.property_type)) return false;
+    if (!matchesChosen("zonaFilter", item.zona)) return false;
+    if (!matchesChosen("barrioFilter", item.barrio)) return false;
     if (max && (!item.price_usd || item.price_usd > max)) return false;
     if (minDeal > 0 && cityDealScore(item) < minDeal) return false;
     if (minDeal >= 40 && item.is_outlier) return false;
@@ -1605,11 +1705,8 @@ function paintListWindow(force = false) {
   listWinRange = key;
   const padTop = start * h;
   const padBot = Math.max(0, (items.length - end) * h);
-  const banner = scrapeRunning
-    ? `<p class="list-banner" role="status">Se actualizan los avisos. Podés filtrar y cambiar de lugar.</p>`
-    : "";
   const top = list.scrollTop;
-  list.innerHTML = `${banner}<div class="list-pad" style="height:${padTop}px" aria-hidden="true"></div>${items.slice(start, end).map(cardHtml).join("")}<div class="list-pad" style="height:${padBot}px" aria-hidden="true"></div>`;
+  list.innerHTML = `<div class="list-pad" style="height:${padTop}px" aria-hidden="true"></div>${items.slice(start, end).map(cardHtml).join("")}<div class="list-pad" style="height:${padBot}px" aria-hidden="true"></div>`;
   if (list.scrollTop !== top) list.scrollTop = top;
   highlightSelected();
 }
@@ -1621,6 +1718,7 @@ function paintList(items) {
   );
   listWindowItems = items;
   updateSearchingBanner();
+  updateCompareButton();
   if (!items.length) {
     listWinRange = "";
     if (scrapeRunning || placeIsQueued()) {
@@ -1648,12 +1746,55 @@ function paintList(items) {
   });
 }
 
+function updateCompareButton() {
+  const btn = $("openCompareBtn");
+  const dock = $("compareDock");
+  const hint = $("cmpHint");
+  const ids = window.getCompareIds ? window.getCompareIds() : [];
+  const n = ids.length;
+  if (dock) dock.hidden = n < 1;
+  if (btn) {
+    btn.disabled = n < 2;
+    btn.textContent = n < 2 ? "Comparar" : `Comparar ${n}`;
+  }
+  if (hint) {
+    hint.textContent = n < 2
+      ? "Elegí otro aviso para comparar."
+      : "Hasta 4 avisos, uno al lado del otro.";
+  }
+  let picks = dock?.querySelector(".compare-picks");
+  if (dock && !picks) {
+    picks = document.createElement("div");
+    picks.className = "compare-picks";
+    dock.insertBefore(picks, hint || btn);
+  }
+  if (picks) {
+    picks.innerHTML = ids.map((id) => {
+      const item = allListings.find((row) => row.id === id);
+      const title = escapeHtml(item?.title || "Aviso");
+      return `<span class="compare-pick"><span>${title}</span><button type="button" data-cmp-remove="${escapeHtml(id)}">Sacar</button></span>`;
+    }).join("");
+  }
+  const picked = new Set(ids);
+  document.querySelectorAll(".cmp-btn").forEach((el) => {
+    const on = picked.has(el.dataset.cmp);
+    el.classList.toggle("is-on", on);
+    el.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+window.updateCompareButton = updateCompareButton;
+window.toggleHeatmap = toggleHeatmap;
+
 function paintMapMarkers(items) {
   const key = listingsPaintKey(items);
   if (key === mapPaintKey) return;
   mapPaintKey = "";
   const t0 = performance.now();
   const gen = ++mapPaintGen;
+  
+  // Build heatmap data
+  buildHeatData(items);
+  
   exactCluster.clearLayers();
   zoneLayer.clearLayers();
   markersById = {};
@@ -1722,13 +1863,52 @@ function paintMapMarkers(items) {
   markClient("paintMap", performance.now() - t0, { n: items.length });
 }
 
+// Heatmap functions
+function buildHeatData(items) {
+  heatData = items
+    .filter((item) => item.price_m2 && item.price_m2 > 0 && item.lat && item.lon)
+    .map((item) => [item.lat, item.lon, Math.min(Number(item.price_m2), 8000)]);
+}
+
+function updateHeatmap() {
+  if (heatLayer) {
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+  }
+  if (!heatData.length || typeof L.heatLayer !== "function") return;
+  const max = heatData.reduce((peak, point) => Math.max(peak, point[2] || 0), 1);
+  heatLayer = L.heatLayer(heatData, {
+    radius: 25,
+    blur: 15,
+    maxZoom: 17,
+    max,
+    gradient: {
+      0.2: "#1f7a4a",
+      0.4: "#6a8f2e",
+      0.6: "#3d6f8a",
+      0.8: "#c45c3a",
+      1.0: "#a07a2e",
+    },
+  }).addTo(map);
+  heatLayer.bringToBack();
+}
+
+function toggleHeatmap(enabled) {
+  if (enabled && heatData.length > 0) {
+    updateHeatmap();
+  } else if (heatLayer) {
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+  }
+}
+
 function render() {
   if (!listingsReady) {
     if ($("listCount")) $("listCount").textContent = "…";
     return;
   }
   const items = sorted(filtered());
-  $("listCount").textContent = `${items.length}`;
+  if ($("listCount")) $("listCount").textContent = `${items.length}`;
   renderKpisFromItems(items);
   paintList(items);
   const overlay = $("mapLoading");
@@ -1749,10 +1929,13 @@ function render() {
       fillListingFicha(current);
     }
   }
-  console.log('[render] Calling paintMapMarkers + fitMapToItems, items:', items.length);
   requestAnimationFrame(() => {
-    console.log('[render RAF] Starting paintMapMarkers + fitMapToItems');
     paintMapMarkers(items);
+    if (frameAfterListings && pinPoints(items).length) {
+      frameAfterListings = false;
+      flyToPins(items, lastSearchPlace);
+      return;
+    }
     fitMapToItems(items);
   });
   renderStats();
@@ -1776,9 +1959,6 @@ function selectListing(item, { focusMap = true, at = null, keepPopup = false } =
   if (!keepPopup) map.closePopup();
   showApproxBox(item, at || listingPopupLatLng(item));
   if (focusMap) focusListing(item);
-
-  // Highlight the clicked marker with pulse effect
-  highlightMarkerPulse(item);
 }
 
 function refreshZoneIcons() {
@@ -1938,10 +2118,10 @@ function rentStrip(item) {
   if (item.monthly_yield_pct == null && item.temporal_yield_pct == null) return "";
   const rows = [];
   if (item.monthly_rent_usd) {
-    rows.push(`<span>Contrato <b>${pct(item.monthly_yield_pct)}</b> · ${rentMoney(item.monthly_rent_usd, "/mes")}</span>`);
+    rows.push(`<span>Mes <b>USD ${fmt(item.monthly_rent_usd)}</b> · ${pct(item.monthly_yield_pct)}</span>`);
   }
   if (item.nightly_usd) {
-    rows.push(`<span>Temporal <b>${pct(item.temporal_yield_pct)}</b> · ${rentMoney(item.nightly_usd, "/noche")}</span>`);
+    rows.push(`<span>Noche <b>USD ${fmt(item.nightly_usd)}</b> · ${pct(item.temporal_yield_pct)}</span>`);
   }
   return rows.length ? `<div class="rent-strip">${rows.join("")}</div>` : "";
 }
@@ -2009,8 +2189,13 @@ function poiScoreReady(profile) {
   return !!(axis && axis.score != null && axis.score !== "");
 }
 
-function pentagonChart(profile, { mini = false, kind = "" } = {}) {
-  if (!poiScoreReady(profile)) return "";
+function pentagonChart(profile, { mini = false, kind = "", allowPartial = false } = {}) {
+  if (!allowPartial && !poiScoreReady(profile)) return "";
+  if (allowPartial) {
+    const axes = profile && profile.axes;
+    const ready = axes && Object.values(axes).some((axis) => axis && axis.score != null);
+    if (!ready) return "";
+  }
   profile = profile && typeof profile === "object" ? profile : {};
   if (!profile.axes) profile.axes = {};
   if (kind === "terreno") profile.order = LOT_AXES.slice();
@@ -2174,36 +2359,67 @@ function sizeBits(item) {
   if (item.price_m2) bits.push(`USD ${fmt(item.price_m2)}/m²`);
   return bits;
 }
+function dealTone(item) {
+  const label = String(item.deal_label || "").toLowerCase();
+  if (label.startsWith("oportunidad")) return "oportunidad";
+  if (label.startsWith("bueno")) return "bueno";
+  if (label.startsWith("caro")) return "caro";
+  if (label.startsWith("revisar") || label.startsWith("dato")) return "revisar";
+  if (label.startsWith("loteo")) return "loteo";
+  return "mercado";
+}
+
+function scoreBadge(item) {
+  const total = item.profile && item.profile.total;
+  if (total == null) return "";
+  return `<span class="card-score ${dealTone(item)}" title="${escapeHtml(item.deal_label || "Score")}">${Math.round(total)}</span>`;
+}
+
+function starIcon() {
+  return `<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M12 3.1l2.2 4.6 5.1.7-3.7 3.6.9 5.1L12 14.7 7.5 17.1l.9-5.1L4.7 8.4l5.1-.7z"/></svg>`;
+}
+
+function compareIcon() {
+  return `<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="3.5" y="5" width="7" height="14" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="5" width="7" height="14" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>`;
+}
+
 function cardHtml(item) {
   const img = listingImage(item.image, "thumb");
   const thumb = img
-    ? `<img src="${img}" alt="${escapeHtml(item.title || "Aviso en venta")}" width="86" height="74" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`
+    ? `<img src="${img}" alt="${escapeHtml(item.title || "Aviso en venta")}" width="104" height="112" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`
     : `<span class="card-ph" aria-hidden="true"></span>`;
   const kind = typeLabel(item);
   const bits = sizeBits(item);
-  const chips = listingTags(item).slice(0, 4).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
+  const chips = listingTraits(item).slice(0, 2).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
   const selected = item.id === selectedId ? " is-selected" : "";
   const contacted = item.contacted ? " is-contacted" : "";
   const approx = isExactPin(item) ? "" : isLocationMissing(item) ? " is-noloc" : " is-approx";
-  const place = streetAddress(item) || (isLocationMissing(item) ? "Sin ubicación" : (item.approx_address || item.barrio || ""));
-  const crossing = item.intersection ? ` · intersección ${item.intersection}` : "";
-  const between = item.between ? ` · entre ${item.between}` : "";
-  const locBit = isExactPin(item) ? " · ubicación real" : isLocationMissing(item) ? " · sin ubicación" : " · ubicación aprox.";
-  const dealNote = (item.deal_label || "").startsWith("revisar") ? ` · ${escapeHtml(item.deal_label)}` : "";
-  return `<article class="card${item.favorite ? " is-fav" : ""}${selected}${contacted}${approx}" id="card-${cssId(item.id)}" data-id="${item.id}">
-    <div class="card-left">
-      ${thumb}
-      ${pentagonChart(item.profile, { mini: true, kind: item.property_type })}
-      ${chips ? `<div class="chips card-chips">${chips}</div>` : ""}
+  const place = streetAddress(item) || (isLocationMissing(item) ? "Sin ubicación" : (item.barrio || item.approx_address || ""));
+  const locBit = isExactPin(item) ? "ubicación real" : isLocationMissing(item) ? "sin ubicación" : "aprox.";
+  const picked = window.getCompareIds ? window.getCompareIds().includes(item.id) : false;
+  const dealNote = (item.deal_label || "").startsWith("revisar") ? item.deal_label : "";
+  const radar = pentagonChart(item.profile, { mini: true, kind: item.property_type, allowPartial: true });
+  return `<article class="card${item.favorite ? " is-fav" : ""}${selected}${contacted}${approx}${radar ? "" : " is-photo-only"}" id="card-${cssId(item.id)}" data-id="${item.id}">
+    <div class="card-photo">
+      <div class="card-shot">
+        ${thumb}
+        ${radar ? "" : scoreBadge(item)}
+      </div>
+      ${radar}
     </div>
     <div class="card-body">
       <div class="card-top">
         <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
-        <div class="price">${money(item)}</div>
-        <button class="fav-btn" type="button" data-fav="${item.id}" title="Favorito">${item.favorite ? "\u2605" : "\u2606"}</button>
+        <div class="card-actions">
+          <button class="fav-btn" type="button" data-fav="${item.id}" title="Favorito" aria-label="Favorito">${starIcon()}</button>
+          <button class="cmp-btn${picked ? " is-on" : ""}" type="button" data-cmp="${item.id}" title="Comparar" aria-label="Comparar este aviso" aria-pressed="${picked ? "true" : "false"}">${compareIcon()}</button>
+        </div>
       </div>
-      <div class="headline">${escapeHtml(bits.join(" · ") || item.title || "")}</div>
-      <div class="meta">${escapeHtml(place)}${escapeHtml(crossing)}${escapeHtml(between)} · ${escapeHtml(sourceSummary(item))}${locBit}${item.mortgage_credit === true ? " · apto crédito" : ""}${item.owner_direct === true ? " · dueño" : ""}${item.contacted ? " · contactado" : ""}${dealNote}</div>
+      <p class="price">${money(item)}</p>
+      <p class="headline">${escapeHtml(bits.join(" · ") || item.title || "")}</p>
+      <p class="place">${escapeHtml(place)}</p>
+      <p class="meta">${escapeHtml(sourceSummary(item))} · ${locBit}${item.contacted ? " · contactado" : ""}${dealNote ? ` · ${escapeHtml(dealNote)}` : ""}</p>
+      ${chips ? `<div class="chips">${chips}</div>` : ""}
       ${rentStrip(item)}
     </div>
   </article>`;
@@ -2221,6 +2437,14 @@ function bindListEvents() {
       const id = fav.dataset.fav;
       const listing = allListings.find((x) => x.id === id);
       if (listing) savePin(id, { favorite: !listing.favorite });
+      return;
+    }
+    const cmp = ev.target.closest(".cmp-btn");
+    if (cmp) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const id = cmp.dataset.cmp;
+      if (window.toggleCompare) window.toggleCompare(id);
       return;
     }
     if (ev.target.closest(".note-box")) return;
@@ -2508,7 +2732,6 @@ function showDetail(item) {
   )).join("");
   pane.innerHTML = `
     <button type="button" class="ghost detail-close" id="closeDetail">cerrar</button>
-    ${hero ? `<figure class="detail-photos"><img class="detail-hero" src="${hero}" alt="${escapeHtml(item.title || "Foto del aviso")}" width="640" height="420" decoding="async" referrerpolicy="no-referrer" />${film}</figure>` : ""}
     <div class="detail-head">
       <div class="detail-kicker">
         <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
@@ -2517,6 +2740,7 @@ function showDetail(item) {
       ${flags ? `<div class="detail-flags">${flags}</div>` : ""}
     </div>
     <div class="detail-lead">${descriptionHtml(item.description, item)}</div>
+    ${hero ? `<figure class="detail-photos"><img class="detail-hero" src="${hero}" alt="${escapeHtml(item.title || "Foto del aviso")}" width="640" height="420" decoding="async" referrerpolicy="no-referrer" />${film}</figure>` : ""}
     ${missingMark}
     ${sourceLinkHtml(item, "detail-link") || "<p class='muted'>Sin link al aviso original</p>"}
     <div class="ficha-bundle">
@@ -2680,21 +2904,18 @@ function averageTitle() {
     oficina: "oficinas",
     galpon: "galpones",
   };
-  const type = names[$("typeFilter")?.value || ""];
-  return type ? `Promedios por barrio · ${type}` : "Promedios por barrio";
+  const types = chosen("typeFilter").map((id) => names[id]).filter(Boolean);
+  return types.length ? `Promedios por barrio · ${types.join(", ")}` : "Promedios por barrio";
 }
 
 function forBarrioAverage(item, traits) {
   // Precio máximo, ganga y favoritos recortan la muestra que el promedio está midiendo.
   if (item.is_outlier || item.exclude_from_comps) return false;
   const city = currentCity();
-  const type = $("typeFilter")?.value || "";
-  const zona = $("zonaFilter")?.value || "";
-  const barrio = $("barrioFilter")?.value || "";
   if (city && !belongsToCity(item, city)) return false;
-  if (type && item.property_type !== type) return false;
-  if (zona && item.zona !== zona) return false;
-  if (barrio && item.barrio !== barrio) return false;
+  if (!matchesChosen("typeFilter", item.property_type)) return false;
+  if (!matchesChosen("zonaFilter", item.zona)) return false;
+  if (!matchesChosen("barrioFilter", item.barrio)) return false;
   if (!passesTraits(item, traits)) return false;
   if (!passesSize(item)) return false;
   return true;
@@ -2749,8 +2970,9 @@ function renderStats(stats) {
 
 async function loadMarket(force) {
   const city = currentCity();
-  const type = $("typeFilter")?.value || "";
-  const key = `${city}|${type}`;
+  const types = chosen("typeFilter");
+  const type = types.length === 1 ? types[0] : "";
+  const key = `${city}|${types.join(",")}`;
   if (!force && key === lastMarketKey) return;
   if (marketInFlight === key) return;
   marketInFlight = key;
@@ -2808,6 +3030,51 @@ function marketRow(item, extra) {
   </button>`;
 }
 
+function searchContextLine() {
+  const bits = [];
+  const city = $("cityFilter")?.selectedOptions?.[0]?.textContent?.trim();
+  if (city) bits.push(city);
+  const typeLabelText = $("typeFilter")?.querySelector(".multi-btn")?.textContent?.trim();
+  if (chosen("typeFilter").length && typeLabelText) bits.push(typeLabelText);
+  const maxPrice = Number($("maxPrice")?.value || 0);
+  if (maxPrice) bits.push(`hasta USD ${fmt(maxPrice)}`);
+  const query = $("freeTextSearch")?.value?.trim();
+  if (query) bits.push(query);
+  return bits.join(" · ") || "Según la ciudad y el tipo que estás mirando.";
+}
+
+function viewMedianM2() {
+  const values = (typeof filtered === "function" ? filtered() : [])
+    .map((item) => Number(item.price_m2))
+    .filter((n) => Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+  if (!values.length) return null;
+  return values[Math.floor(values.length / 2)];
+}
+
+function paintPriceAnalysis(data) {
+  const context = $("priceAnalysisContext");
+  if (context) context.textContent = searchContextLine();
+  const series = ((data && data.series) || []).map((row) => row.median_m2);
+  const chart = $("priceAnalysisChart");
+  if (chart) chart.innerHTML = sparkline(series, { upIsBad: true });
+  const readout = $("priceAnalysisReadout");
+  if (!readout) return;
+  const now = viewMedianM2();
+  const latest = data && data.latest && data.latest.median_m2;
+  readout.innerHTML = `
+    <div class="market-stat"><span>Esta búsqueda</span><b>${now ? `USD ${fmt(now)}` : "—"}</b></div>
+    <div class="market-stat"><span>Mediana de la zona</span><b>${latest ? `USD ${fmt(latest)}` : "—"}</b></div>
+  `;
+}
+
+function openPriceAnalysis() {
+  const box = $("priceAnalysis");
+  if (!box || typeof setFold !== "function") return;
+  setFold(box, true);
+  if (window.innerWidth > 980) box.scrollIntoView({ block: "nearest" });
+}
+
 function renderMarket(data) {
   if (!data || !$("marketPulse")) return;
   $("marketHeadline").textContent = data.headline || "";
@@ -2818,6 +3085,7 @@ function renderMarket(data) {
   const trendText = delta == null
     ? "sin curva aún"
     : `${delta > 0 ? "+" : ""}${String(delta).replace(".", ",")}%`;
+  paintPriceAnalysis(data);
   if ($("marketReadout")) {
     $("marketReadout").innerHTML = `
       <div class="market-stat"><span>USD/m² ahora</span><b>${latest.median_m2 ? fmt(latest.median_m2) : "—"}</b></div>
@@ -2996,6 +3264,7 @@ function cssId(value) {
   return String(value || "").replace(/[^a-z0-9]+/gi, "-");
 }
 
+initMultis();
 ["typeFilter", "zonaFilter", "barrioFilter", "maxPrice", "minM2", "maxM2", "minBeds", "minRooms", "minBaths", "favOnly", "dealBar", "sortBy"].forEach((id) => {
   if (!$(id)) return;
   $(id).addEventListener("input", () => {
@@ -3003,6 +3272,11 @@ function cssId(value) {
   });
   $(id).addEventListener("change", () => {
     if (id === "typeFilter") syncRoomFilters();
+    if (id === "minRooms" && !applyingFreeText) {
+      if ($("maxRooms")) $("maxRooms").value = "";
+      const roomOpt = $("minRooms")?.querySelector('option[value="1"]');
+      if (roomOpt) roomOpt.textContent = "1+";
+    }
     render();
     if (id === "typeFilter") loadMarket();
   });
@@ -3028,7 +3302,7 @@ $("cityFilter")?.addEventListener("change", () => {
   pickedPlace = placeFromCityFilter();
   rememberCityView(pickedPlace);
   focusedCity = next;
-  focusCity(next);
+  if (!frameAfterListings) focusCity(next);
   clearLoadedListings();
   load({ waitKind: "city" });
 });
@@ -3043,6 +3317,9 @@ $("dealBar")?.addEventListener("input", () => {
 document.addEventListener("click", (ev) => {
   document.querySelectorAll(".deal-help[open]").forEach((el) => {
     if (!el.contains(ev.target)) el.removeAttribute("open");
+  });
+  document.querySelectorAll(".multi.is-open").forEach((el) => {
+    if (!el.contains(ev.target)) closeMulti(el);
   });
 });
 
@@ -3153,6 +3430,16 @@ $("pauseBtn")?.addEventListener("click", async () => {
     body: JSON.stringify({ password }),
   });
   pollStatus(true);
+});
+
+$("openCompareBtn")?.addEventListener("click", () => {
+  if (window.openComparator) window.openComparator();
+});
+
+$("compareDock")?.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-cmp-remove]");
+  if (!btn || !window.removeCompare) return;
+  window.removeCompare(btn.dataset.cmpRemove);
 });
 
 function fastJobIds(s) {
@@ -3417,28 +3704,91 @@ function viewBounds(view) {
   return [[view.lat - dlat, view.lon - dlon], [view.lat + dlat, view.lon + dlon]];
 }
 
-function fitMapToItems(items) {
-  const points = (items || [])
-    .filter((item) => Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lon)))
+function pinPoints(items) {
+  return (items || [])
+    .filter((item) => item.lat && item.lon && Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lon)))
     .map((item) => [Number(item.lat), Number(item.lon)]);
-  console.log('[fitMapToItems] items:', items?.length, 'points:', points.length);
-  if (!points.length) {
-    console.log('[fitMapToItems] No valid points, skipping');
-    return;
-  }
+}
+
+function fitMapToItems(items) {
+  if (!map || Date.now() < earthZoomUntil) return;
+  const size = map.getSize();
+  if (!size || size.x < 40 || size.y < 40) map.invalidateSize();
+  const points = pinPoints(items);
+  if (!points.length) return;
   if (points.length === 1) {
-    console.log('[fitMapToItems] Single point, setView:', points[0]);
-    map.setView(points[0], 14, { animate: true });
+    map.setView(points[0], 15, { animate: true });
     return;
   }
-  const bounds = L.latLngBounds(points);
-  console.log('[fitMapToItems] bounds:', bounds.toBBoxString(), 'map zoom:', map.getZoom());
-  map.fitBounds(bounds, {
-    padding: [80, 80],
-    maxZoom: 16,
+  map.fitBounds(L.latLngBounds(points), {
+    padding: [56, 56],
+    maxZoom: 15,
     animate: true,
   });
-  console.log('[fitMapToItems] after fitBounds, map zoom:', map.getZoom());
+}
+
+function flyToPins(items, place) {
+  if (!map) return;
+  earthZoomUntil = Date.now() + 2800;
+  const go = () => {
+    const size = map.getSize();
+    if (!size || size.x < 40 || size.y < 40) map.invalidateSize();
+    const points = pinPoints(items);
+    const token = ++earthZoomToken;
+    earthZoomUntil = Date.now() + 2600;
+    map.stop();
+    const pad = [56, 56];
+    const fly = { duration: 2.1, easeLinearity: 0.16 };
+    const settle = () => {
+      if (token !== earthZoomToken || !points.length) return;
+      if (points.length === 1) {
+        map.setView(points[0], 15, { animate: false });
+        return;
+      }
+      map.fitBounds(L.latLngBounds(points), { padding: pad, maxZoom: 15, animate: false });
+    };
+    map.once("moveend", settle);
+    if (points.length > 1) {
+      map.flyToBounds(L.latLngBounds(points), { padding: pad, maxZoom: 15, ...fly });
+      return;
+    }
+    if (points.length === 1) {
+      map.flyTo(points[0], 15, fly);
+      return;
+    }
+    map.off("moveend", settle);
+    const spot = place || lastSearchPlace;
+    if (spot && spot.lat != null && spot.lon != null) {
+      map.flyTo([Number(spot.lat), Number(spot.lon)], Math.min(Number(spot.zoom) || 14, 15), fly);
+      return;
+    }
+    earthZoomUntil = 0;
+    const cityId = $("cityFilter")?.value;
+    if (cityId) focusCity(cityId);
+  };
+  if (window.innerWidth <= 980) {
+    setTab("map");
+    setTimeout(go, 90);
+    return;
+  }
+  go();
+}
+
+function frameVisiblePins(place) {
+  const spot = place || lastSearchPlace;
+  const items = typeof filtered === "function" ? sorted(filtered()) : [];
+  if (pinPoints(items).length) {
+    frameAfterListings = false;
+    flyToPins(items, spot);
+    return;
+  }
+  if (spot && spot.lat != null && spot.lon != null) {
+    flyToPins([], spot);
+    return;
+  }
+  const cityId = $("cityFilter")?.value;
+  if (cityId) focusCity(cityId);
+  frameAfterListings = false;
 }
 
 function focusCity(cityId) {
@@ -3862,6 +4212,15 @@ function fillSettings() {
   if ($("resendVerify")) $("resendVerify").hidden = Boolean(currentUser.email_verified);
 }
 
+function initHeatmapToggle() {
+  const toggle = $("heatmapToggle");
+  if (!toggle) return;
+  toggle.checked = heatLayer !== null;
+  toggle.onchange = () => {
+    toggleHeatmap(toggle.checked);
+  };
+}
+
 function setAuthTab(tab) {
   const register = tab === "register";
   document.querySelectorAll("[data-auth-tab]").forEach((btn) => {
@@ -3897,6 +4256,8 @@ function openSettings() {
     return;
   }
   fillSettings();
+  loadAlerts();
+  initHeatmapToggle();
   if ($("settingsMsg")) $("settingsMsg").hidden = true;
   $("settingsModal")?.showModal();
 }
@@ -3981,6 +4342,134 @@ async function downloadFavReport() {
   }
 }
 
+async function loadAlerts() {
+  if (!currentUser) return;
+  try {
+    const res = await fetch("/api/alerts");
+    if (!res.ok) return;
+    const alerts = await res.json();
+    renderAlerts(alerts);
+  } catch (_) {}
+}
+
+function alertSummary(filters) {
+  const data = filters || {};
+  const bits = [];
+  const city = data.cityFilter || data.city;
+  const type = data.typeFilter || data.type;
+  const barrio = data.barrioFilter || data.barrio;
+  const price = data.maxPrice || data.price_max;
+  if (city) bits.push(String(city));
+  if (barrio) bits.push(String(barrio));
+  if (type) bits.push(String(type));
+  if (price) bits.push(`hasta USD ${price}`);
+  if (data.minBeds) bits.push(`${data.minBeds}+ dorm`);
+  return bits.join(" · ") || "Filtros actuales";
+}
+
+function renderAlerts(alerts) {
+  const list = $("alertsList");
+  if (!list) return;
+  if (!alerts || !alerts.length) {
+    list.innerHTML = '<p class="muted">No hay alertas configuradas.</p>';
+    return;
+  }
+  list.innerHTML = alerts.map(a => `
+    <div class="alert-item" data-id="${escapeHtml(a.id)}">
+      <span class="alert-filters">${escapeHtml(alertSummary(a.filters))}</span>
+      <span class="alert-status">${a.active ? "✓ Activa" : "○ Inactiva"}</span>
+      <div class="alert-actions">
+        <button type="button" class="alert-toggle" data-active="${a.active ? "1" : "0"}">${a.active ? "Desactivar" : "Activar"}</button>
+        <button type="button" class="alert-delete danger">Eliminar</button>
+      </div>
+    </div>
+  `).join('');
+  list.querySelectorAll('.alert-toggle').forEach(btn => {
+    btn.addEventListener('click', async (ev) => {
+      const item = ev.target.closest('.alert-item');
+      if (!item) return;
+      const id = item.dataset.id;
+      const active = ev.target.dataset.active === "1" || ev.target.dataset.active === "true";
+      try {
+        const res = await fetch(`/api/alerts/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ active: !active })
+        });
+        if (res.ok) loadAlerts();
+      } catch (_) {}
+    });
+  });
+  list.querySelectorAll('.alert-delete').forEach(btn => {
+    btn.addEventListener('click', async (ev) => {
+      const item = ev.target.closest('.alert-item');
+      if (!item) return;
+      const id = item.dataset.id;
+      if (!confirm('Eliminar esta alerta?')) return;
+      try {
+        const res = await fetch(`/api/alerts/${id}`, { method: 'DELETE' });
+        if (res.ok) loadAlerts();
+      } catch (_) {}
+    });
+  });
+}
+
+async function createAlert(filters) {
+  if (!currentUser) return "";
+  try {
+    const res = await fetch("/api/alerts", {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filters })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      loadAlerts();
+      return "";
+    }
+    return data.error || "No se pudo crear la alerta.";
+  } catch (_) {}
+  return "No se pudo crear la alerta.";
+}
+
+async function testAlert(filters) {
+  if (!currentUser) return;
+  try {
+    const res = await fetch("/api/alerts/test", {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filters })
+    });
+    if (res.ok) return await res.json();
+  } catch (_) {}
+  return { count: 0, sample: [] };
+}
+
+async function openNewAlert() {
+  if (typeof currentFilters !== "function") {
+    flashAuth("No se pudieron leer los filtros.");
+    return;
+  }
+  const filters = currentFilters();
+  if (!filters.cityFilter) {
+    alert("Elegí una ciudad antes de crear la alerta.");
+    return;
+  }
+  const result = await testAlert(filters);
+  if (result.error) {
+    alert(result.error);
+    return;
+  }
+  if (result.count === 0) {
+    alert("Esos filtros no coinciden con ningún aviso actual.");
+    return;
+  }
+  const msg = `Se encontraron ${result.count} avisos. ¿Crear alerta con estos filtros?`;
+  if (!confirm(msg)) return;
+  const error = await createAlert(filters);
+  flashAuth(error || "Alerta creada. Te avisamos por mail cuando aparezca un aviso nuevo.");
+}
+
 async function hydrateAuth() {
   try {
     const res = await fetch("/api/auth/me");
@@ -4062,6 +4551,7 @@ $("authResend")?.addEventListener("click", async () => {
   showVerifyLink(ok, data.message || "Mail reenviado.", data.verify_url);
 });
 $("settingsClose")?.addEventListener("click", () => $("settingsModal")?.close());
+$("newAlertBtn")?.addEventListener("click", openNewAlert);
 $("authForm")?.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const register = $("authForm")?.getAttribute("data-tab") === "register";
@@ -4225,31 +4715,139 @@ function whenIdle(fn) {
   setTimeout(fn, 1200);
 }
 
+let applyingFreeText = false;
+
+function clearConfiguredFilters() {
+  ["typeFilter", "barrioFilter", "zonaFilter", "maxPrice", "minM2", "maxM2", "minBeds", "minRooms", "minBaths", "maxRooms"].forEach((id) => {
+    if ($(id)) $(id).value = "";
+  });
+  if ($("dealBar")) $("dealBar").value = "0";
+  document.querySelectorAll('input[name="listingTrait"]').forEach((cb) => {
+    cb.checked = false;
+  });
+}
+
+function switchToLoadedCity(place) {
+  const select = $("cityFilter");
+  if (!place?.id || !select) return false;
+  rememberCityView(place);
+  rememberPlace(place);
+  const has = [...select.options].some((opt) => opt.value === place.id);
+  if (!has) {
+    if (place.lat != null && place.lon != null && window.map) {
+      pickedPlace = place;
+      focusedCity = place.id;
+      window.map.setView([place.lat, place.lon], place.zoom || 13);
+    }
+    return false;
+  }
+  if ($("placeQuery")) $("placeQuery").value = placeCaption(place) || place.label || "";
+  if (select.value !== place.id) {
+    select.value = place.id;
+    select.dispatchEvent(new Event("change"));
+    return true;
+  }
+  pickedPlace = placeFromCityFilter() || place;
+  rememberCityView(pickedPlace);
+  focusedCity = place.id;
+  focusCity(place.id);
+  return true;
+}
+
+async function runFreeTextSearch() {
+  const freeTextInput = $("freeTextSearch");
+  const button = $("freeTextGo");
+  const query = (freeTextInput?.value || "").trim();
+  if (!query) return;
+  const previousCity = $("cityFilter")?.value || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Buscando";
+  }
+  try {
+    const res = await fetch("/api/free-text-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, city: previousCity }),
+    });
+    const data = res.ok ? await res.json() : {};
+    let filters = data.filters || {};
+    if (!Object.keys(filters).length && !data.place && query && typeof window.parseFreeText === "function") {
+      filters = window.parseFreeText(query) || {};
+    }
+    applyingFreeText = true;
+    clearConfiguredFilters();
+    const wantedBarrios = asList(filters.barrioFilter ?? filters.barrio);
+    if (wantedBarrios.length) landingBarrio = wantedBarrios.join(",");
+    if (typeof window.applyParsedFilters === "function") {
+      window.applyParsedFilters(filters, { skipRender: true, skipCity: true });
+    }
+    if (typeof syncRoomFilters === "function") syncRoomFilters();
+    const roomOpt = $("minRooms")?.querySelector('option[value="1"]');
+    const exactOne = Number(filters.maxRooms) === 1 && $("minRooms")?.value === "1";
+    if (roomOpt) roomOpt.textContent = exactOne ? "1" : "1+";
+    const place = data.place || null;
+    lastSearchPlace = place;
+    frameAfterListings = true;
+    const cityId = place?.id || filters.city || filters.cityFilter || "";
+    const switched = cityId && cityId !== previousCity
+      ? switchToLoadedCity(place || { id: cityId })
+      : false;
+    if (!switched && wantedBarrios.length && $("barrioFilter")) {
+      $("barrioFilter").value = wantedBarrios.join(",");
+    }
+    if (!switched && $("zonaFilter")) {
+      const wantedZonas = asList(filters.zonaFilter ?? filters.zona);
+      if (wantedZonas.length) $("zonaFilter").value = wantedZonas.join(",");
+    }
+    if (!switched) {
+      if (listingsReady && typeof render === "function") render();
+      else flyToPins(typeof filtered === "function" ? sorted(filtered()) : [], place);
+    } else if (place && place.lat != null && place.lon != null) {
+      flyToPins([], place);
+      frameAfterListings = true;
+    }
+    openPriceAnalysis();
+    if (typeof loadMarket === "function") loadMarket(true);
+    if ($("statusLine") && cityId && cityId !== previousCity && !switched) {
+      $("statusLine").textContent = "Esa ciudad no está cargada; apliqué el resto de los filtros.";
+    } else if ($("statusLine") && !Object.keys(filters).length && !cityId) {
+      $("statusLine").textContent = "No encontré filtros en esa búsqueda.";
+    }
+  } catch (_) {
+    if (query && typeof window.parseFreeText === "function" && typeof window.applyParsedFilters === "function") {
+      applyingFreeText = true;
+      clearConfiguredFilters();
+      window.applyParsedFilters(window.parseFreeText(query));
+    }
+  } finally {
+    applyingFreeText = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Buscar";
+    }
+  }
+}
+
 // Free-text search initialization
 function initFreeTextSearch() {
   const freeTextInput = $("freeTextSearch");
-  if (!freeTextInput) return;
-  
-  freeTextInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      const query = freeTextInput.value.trim();
-      if (!query) return;
-      
-      if (typeof window.parseFreeText === "function" && typeof window.applyParsedFilters === "function") {
-        const parsed = window.parseFreeText(query);
-        window.applyParsedFilters(parsed);
-      }
-    }
+  const form = $("searchStrip");
+  if (!freeTextInput && !form) return;
+
+  form?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    runFreeTextSearch();
   });
-  
+
   // Clear free text when filters change manually
   const filterIds = ["cityFilter", "typeFilter", "barrioFilter", "maxPrice", "minM2", "maxM2", "minBeds"];
   filterIds.forEach(id => {
     const el = $(id);
     if (el) {
       el.addEventListener("change", () => {
-        if (freeTextInput.value) freeTextInput.value = "";
+        if (applyingFreeText) return;
+        if (freeTextInput?.value) freeTextInput.value = "";
       });
     }
   });
@@ -4257,7 +4855,8 @@ function initFreeTextSearch() {
 
 // Filter presets initialization
 function initFilterPresets() {
-  // Add preset UI elements if not present
+  // Los filtros guardados vuelven cuando las cuentas estén habilitadas.
+  return;
   const filtersContainer = document.querySelector(".filters");
   if (!filtersContainer || filtersContainer.querySelector("#presetControls")) return;
   
@@ -4349,7 +4948,7 @@ const landingText = landingQuery.get("q") || "";
 if (landingCity) {
   try { localStorage.setItem("propmap.city", landingCity); } catch (_) {}
 }
-if (landingType && $("typeFilter") && [...$("typeFilter").options].some((opt) => opt.value === landingType)) {
+if (landingType && $("typeFilter")) {
   $("typeFilter").value = landingType;
   syncRoomFilters();
 }

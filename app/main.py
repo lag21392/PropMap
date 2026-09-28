@@ -17,9 +17,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import store
 from .listings_cache import start_warmup
 from .pipeline import add_manual, listings_payload, refresh, request_pause, set_slow_crawl, start_background_scraper, status
+from .alerts_worker import start_alerts_worker
 from .places import load_custom_places, place_from_suggestion, public_place, search_places
 from .search_auth import require_search_password
-
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
 
@@ -35,13 +35,17 @@ async def lifespan(_app: FastAPI):
     load_custom_places()
     if os.environ.get("PROPMAP_TEST") != "1":
         start_warmup()
-        start_background_scraper()
+        # Con la base de producción montada, el scrape y el sync de Matomo
+        # escribirían el mismo SQLite que el proceso de prod.
+        if os.environ.get("PROPMAP_SHARE_DB") != "1":
+            start_background_scraper()
+            from .matomo import start_matomo_sync
+
+            start_matomo_sync()
+        start_alerts_worker()
         from .watchdog import start as start_watchdog
 
         start_watchdog()
-        from .matomo import start_matomo_sync
-
-        start_matomo_sync()
     yield
 
 
@@ -209,6 +213,12 @@ class PlaceIn(BaseModel):
     lat: float | None = None
     lon: float | None = None
     province: str | None = None
+
+
+class FreeTextSearchIn(BaseModel):
+    query: str = ""
+    where: str = ""
+    city: str = ""
 
 
 class PauseIn(BaseModel):
@@ -453,6 +463,92 @@ def auth_import_pins(payload: PinsImportIn, request: Request) -> dict:
     return import_pins(user, payload.pins)
 
 
+# --- Alerts endpoints ---
+class AlertIn(BaseModel):
+    filters: dict = Field(default_factory=dict)
+
+class AlertToggleIn(BaseModel):
+    active: bool
+
+
+@app.post("/api/alerts")
+def api_alerts_create(payload: AlertIn, request: Request) -> JSONResponse:
+    from .alerts import add_alert, get_user_tier
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    tier = get_user_tier(user.id)
+    result = add_alert(user.id, payload.filters, tier)
+    if result.get("ok"):
+        alert = result["alert"]
+        return JSONResponse({"id": alert["id"], "filters": alert["filters"], "created_at": alert["created"], "active": 1 if alert["active"] else 0, "tier": alert["tier"]})
+    return JSONResponse(result, status_code=400)
+
+
+@app.get("/api/alerts")
+def api_alerts_list(request: Request) -> JSONResponse:
+    from .alerts import list_alerts
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    alerts = list_alerts(user.id)
+    return JSONResponse([
+        {
+            "id": a.get("id"),
+            "filters": a.get("filters") or {},
+            "created_at": a.get("created") or a.get("ts"),
+            "last_sent_at": a.get("last_sent"),
+            "active": 1 if a.get("active", True) else 0,
+            "tier": a.get("tier", "free"),
+        }
+        for a in alerts
+        if a.get("id")
+    ])
+
+
+@app.delete("/api/alerts/{alert_id}")
+def api_alerts_delete(alert_id: str, request: Request) -> JSONResponse:
+    from .alerts import delete_alert
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    result = delete_alert(alert_id, user.id)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 404)
+
+
+@app.patch("/api/alerts/{alert_id}")
+def api_alerts_toggle(alert_id: str, payload: AlertToggleIn, request: Request) -> JSONResponse:
+    from .alerts import update_alert
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    result = update_alert(alert_id, user.id, active=payload.active)
+    if result.get("ok"):
+        alert = result["alert"]
+        return JSONResponse({"ok": True, "active": 1 if alert["active"] else 0})
+    return JSONResponse(result, status_code=404)
+
+
+@app.post("/api/alerts/test")
+def api_alerts_test(payload: AlertIn, request: Request) -> JSONResponse:
+    from .alerts import test_alert
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    return JSONResponse(test_alert(payload.filters))
+
+
+@app.get("/api/alerts/worker/status")
+def api_alerts_worker_status(request: Request) -> JSONResponse:
+    from .alerts_worker import get_alerts_worker_status
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    return JSONResponse(get_alerts_worker_status())
+
+
+@app.post("/api/alerts/worker/run")
+def api_alerts_worker_run(request: Request) -> JSONResponse:
+    from .alerts_worker import run_alerts_worker_once
+    from .accounts import require_user
+    user = require_user(request, verified=True)
+    return JSONResponse(run_alerts_worker_once())
+
+
 @app.get("/admin")
 async def admin(request: Request) -> Response:
     return _html_page(request)
@@ -478,6 +574,14 @@ async def tablero_page(request: Request) -> Response:
         return login_page(next_url="/tablero")
     return FileResponse(
         STATIC / "tablero.html",
+        headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"},
+    )
+
+
+@app.get("/apoya")
+async def apoya_page(request: Request) -> Response:
+    return FileResponse(
+        STATIC / "apoya.html",
         headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"},
     )
 
@@ -817,6 +921,19 @@ def places(q: str = Query("", min_length=0)) -> dict:
     return {"places": search_places(q)}
 
 
+@app.post("/api/free-text-search")
+def free_text_search(payload: FreeTextSearchIn) -> dict:
+    """Arma los filtros de la búsqueda libre. Laya decide cada filtro; si no responde, quedan las reglas."""
+    store.init()
+    load_custom_places()
+    from .free_text_search import filters_for_query
+
+    filters, place, source = filters_for_query(payload.query, payload.where, payload.city)
+    if not filters:
+        return {"ok": True, "filters": {}, "place": place, "source": source, "message": "No se pudieron extraer filtros del texto"}
+    return {"ok": True, "filters": filters, "place": place, "source": source}
+
+
 @app.post("/api/place")
 def pick_place(payload: PlaceIn) -> dict:
     store.init()
@@ -1002,3 +1119,18 @@ async def health() -> dict:
     if os.environ.get("PROPMAP_TEST") != "1" and not beat["ok"]:
         raise HTTPException(503, "watchdog")
     return {"ok": True, "city": "multi", "watchdog": beat}
+
+@app.get("/api/compare")
+def compare(ids: str = Query(..., description="Comma separated listing ids")):
+    from .store import init, get_listing
+    from .http_timing import note
+    t0 = time.perf_counter()
+    init()
+    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+    items = []
+    for lid in id_list[:4]:
+        item = get_listing(lid)
+        if item:
+            items.append(item.to_public_dict())
+    note("compare", (time.perf_counter() - t0) * 1000, {"count": len(items)})
+    return {"ok": True, "listings": items, "count": len(items)}

@@ -54,6 +54,10 @@ class Account:
     email_masked: str
     email_verified: bool
     created_at: str
+    tier: str = "free"
+    stripe_customer_id: str = ""
+    stripe_subscription_id: str = ""
+    stripe_subscription_status: str = ""
 
 
 def init_tables() -> None:
@@ -69,7 +73,11 @@ def init_tables() -> None:
                 password_hash TEXT NOT NULL,
                 email_verified INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                verified_at TEXT DEFAULT ''
+                verified_at TEXT DEFAULT '',
+                tier TEXT NOT NULL DEFAULT 'free',
+                stripe_customer_id TEXT DEFAULT '',
+                stripe_subscription_id TEXT DEFAULT '',
+                stripe_subscription_status TEXT DEFAULT ''
             )
             """
         )
@@ -92,6 +100,15 @@ def init_tables() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON account_sessions(user_id)")
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        for name, ddl in (
+            ("tier", "TEXT DEFAULT 'free'"),
+            ("stripe_customer_id", "TEXT DEFAULT ''"),
+            ("stripe_subscription_id", "TEXT DEFAULT ''"),
+            ("stripe_subscription_status", "TEXT DEFAULT ''"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {ddl}")
         conn.commit()
 
 
@@ -303,12 +320,17 @@ def _client_ip(request: Request | None) -> str:
 def _row_to_account(row) -> Account:
     username = _decrypt(row["username_enc"])
     email = _decrypt(row["email_enc"])
+    keys = row.keys()
     return Account(
         id=row["id"],
         username=username,
         email_masked=mask_email(email),
         email_verified=bool(row["email_verified"]),
         created_at=row["created_at"] or "",
+        tier=(row["tier"] if "tier" in keys else None) or "free",
+        stripe_customer_id=row["stripe_customer_id"] if "stripe_customer_id" in keys else "",
+        stripe_subscription_id=row["stripe_subscription_id"] if "stripe_subscription_id" in keys else "",
+        stripe_subscription_status=row["stripe_subscription_status"] if "stripe_subscription_status" in keys else "",
     )
 
 
@@ -318,6 +340,8 @@ def public_account(account: Account) -> dict[str, Any]:
         "email_masked": account.email_masked,
         "email_verified": account.email_verified,
         "created_at": account.created_at,
+        "tier": account.tier,
+        "stripe_subscription_status": account.stripe_subscription_status,
     }
 
 
@@ -541,8 +565,9 @@ def register(
                 """
                 INSERT INTO accounts(
                     id, username_hmac, username_enc, email_hmac, email_enc,
-                    password_hash, email_verified, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+                    password_hash, email_verified, created_at,
+                    tier, stripe_customer_id, stripe_subscription_id, stripe_subscription_status
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'free', '', '', '')
                 """,
                 (
                     user_id,

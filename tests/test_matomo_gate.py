@@ -153,5 +153,5 @@ def test_robots_hides_admin_paths():
 
 def test_compose_binds_matomo_to_localhost():
     text = (main.ROOT / "compose.yaml").read_text(encoding="utf-8")
-    assert "127.0.0.1:3102:80" in text
-    assert '"3102:80"' not in text
+    assert "127.0.0.1:3112:80" in text
+    assert '"3112:80"' not in text

@@ -156,19 +156,22 @@ def test_apply_analysis_copies_province_from_city_record():
         "province": "chubut",
         "barrios": [],
     }
-    item = Listing(
-        source="zonaprop",
-        source_id="llm-prov-city",
-        url="https://example.com",
-        title="Casa",
-        property_type="casa",
-        city="ciudad-prov-test",
-        extra={"search_city": "ciudad-prov-test"},
-    )
-    apply_analysis(item, {"property_type": "casa", "notes": ""})
-    llm = item.extra.get("llm") or {}
-    place = item.extra.get("llm_place") or {}
-    assert "chubut" in str(llm.get("province") or place.get("province") or "").lower()
+    try:
+        item = Listing(
+            source="zonaprop",
+            source_id="llm-prov-city",
+            url="https://example.com",
+            title="Casa",
+            property_type="casa",
+            city="ciudad-prov-test",
+            extra={"search_city": "ciudad-prov-test"},
+        )
+        apply_analysis(item, {"property_type": "casa", "notes": ""})
+        llm = item.extra.get("llm") or {}
+        place = item.extra.get("llm_place") or {}
+        assert "chubut" in str(llm.get("province") or place.get("province") or "").lower()
+    finally:
+        CITIES.pop("ciudad-prov-test", None)
 
 
 def test_apply_analysis_does_not_keep_a_pin_in_the_river():

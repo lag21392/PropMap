@@ -20,7 +20,7 @@ o:
 docker compose up --build
 ```
 
-Abrí [http://127.0.0.1:8000](http://127.0.0.1:8000) y tocá **Buscar avisos ahora**.
+Abrí [http://127.0.0.1:8010](http://127.0.0.1:8010) y tocá **Buscar avisos ahora**. El 8000 queda para producción.
 
 Los avisos se guardan en `./data/` (SQLite). Para dejarla en segundo plano:
 
@@ -34,7 +34,7 @@ Parar: `docker compose down`.
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
 
 ## Qué muestra

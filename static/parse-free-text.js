@@ -26,7 +26,6 @@ const TYPE_MAP = {
   galpon: "galpon",
   galpón: "galpon",
   galpones: "galpon",
-  galpones: "galpon"
 };
 
 const TRAIT_MAP = [
@@ -65,12 +64,28 @@ function parseNumber(str) {
   return isFinite(n) ? n : null;
 }
 
-function findType(text) {
-  for (const [k, v] of Object.entries(TYPE_MAP)) {
-    const re = new RegExp(`\\b${k}\\b`);
-    if (re.test(text)) return v;
+function findTypes(text) {
+  const found = [];
+  const seen = new Set();
+  if (/\bmono\s*h?\s*ambientes?\b/.test(text)) {
+    found.push("departamento");
+    seen.add("departamento");
   }
-  return null;
+  for (const [k, v] of Object.entries(TYPE_MAP)) {
+    if (seen.has(v)) continue;
+    const re = new RegExp(`\\b${k}\\b`);
+    if (re.test(text)) {
+      seen.add(v);
+      found.push(v);
+    }
+  }
+  return found;
+}
+
+function findType(text) {
+  if (/\bmono\s*h?\s*ambientes?\b/.test(text)) return "monoambiente";
+  const found = findTypes(text);
+  return found[0] || null;
 }
 
 function findTrait(text) {
@@ -132,9 +147,52 @@ function parseRooms(text) {
   };
 }
 
+function escapeName(token) {
+  return token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function pickBarrios(text, names) {
+  const folded = normalize(text);
+  const hits = [];
+  const seen = new Set();
+  for (const name of names || []) {
+    const token = normalize(name);
+    if (!token || token.length < 4 || seen.has(token)) continue;
+    if (!new RegExp(`(?:^| )${escapeName(token)}(?: |$)`).test(folded)) continue;
+    seen.add(token);
+    hits.push(String(name));
+  }
+  hits.sort((a, b) => normalize(b).length - normalize(a).length);
+  const kept = [];
+  for (const name of hits) {
+    const token = normalize(name);
+    if (kept.some((longer) => normalize(longer) !== token && new RegExp(`(?:^| )${escapeName(token)}(?: |$)`).test(normalize(longer)))) continue;
+    kept.push(name);
+  }
+  const drop = new Set();
+  for (const left of kept) {
+    for (const right of kept) {
+      if (left === right) continue;
+      if (new RegExp(`(?:^| )${escapeName(normalize(left))} de ${escapeName(normalize(right))}(?: |$)`).test(folded)) drop.add(left);
+    }
+  }
+  const zoneWords = new Set(["norte", "sur", "este", "oeste", "centro"]);
+  const result = kept.filter((name) => {
+    if (drop.has(name)) return false;
+    const token = normalize(name);
+    return !(zoneWords.has(token) && new RegExp(`(?:^| )zona ${escapeName(token)}(?: |$)`).test(folded));
+  });
+  result.sort((a, b) => folded.indexOf(normalize(a)) - folded.indexOf(normalize(b)));
+  return result;
+}
+
+function pickBarrio(text, names) {
+  return pickBarrios(text, names)[0] || "";
+}
+
 function parsePlace(text) {
-  // Heurística simple: buscar último nombre propio que coincida con ciudades/barrios conocidos
   const known = [];
+  let barrioNames = [];
   try {
     const cities = window.lastCities || [];
     cities.forEach(c => {
@@ -142,17 +200,15 @@ function parsePlace(text) {
     });
     const placeBarrios = window.placeBarrios || {};
     const city = document.getElementById("cityFilter")?.value;
-    if (city && placeBarrios[city]) {
-      placeBarrios[city].forEach(b => known.push({ id: b, label: normalize(b), type: "barrio" }));
-    }
+    if (city && placeBarrios[city]) barrioNames = placeBarrios[city];
   } catch {}
+  const barrio = pickBarrio(text, barrioNames);
+  if (barrio) return { place: barrio, type: "barrio" };
   const words = normalize(text).split(" ");
   for (let i = words.length - 1; i >= 0; i--) {
     const candidate = words.slice(i).join(" ");
     const hit = known.find(k => k.label === candidate || candidate.startsWith(k.label + " "));
-    if (hit) {
-      return { place: hit.id, type: hit.type };
-    }
+    if (hit) return { place: hit.id, type: hit.type };
   }
   return null;
 }
@@ -185,10 +241,30 @@ function parseFreeText(query) {
     out.minBaths = rooms.minBaths;
   }
   out.traits = findTrait(text);
-  const place = parsePlace(text);
-  if (place) {
-    if (place.type === "city") out.city = place.place;
-    if (place.type === "barrio") out.barrio = place.place;
+  const types = findTypes(text);
+  const mono = /\bmono\s*h?\s*ambientes?\b/.test(text);
+  if (types.length > 1) out.type = types;
+  else if (types.length === 1) out.type = types[0];
+  if (mono && types.length === 1 && types[0] === "departamento") {
+    out.minRooms = 1;
+    out.maxRooms = 1;
+  }
+  let barrioNames = [];
+  let zonaNames = [];
+  try {
+    const city = document.getElementById("cityFilter")?.value;
+    barrioNames = (window.placeBarrios && city && window.placeBarrios[city]) || [];
+    zonaNames = [...document.querySelectorAll("#zonaFilter input")].map((box) => box.value);
+  } catch (_) {}
+  const barrios = pickBarrios(text, barrioNames);
+  if (barrios.length === 1) out.barrio = barrios[0];
+  else if (barrios.length > 1) out.barrio = barrios;
+  const zonas = pickBarrios(text, zonaNames);
+  if (zonas.length === 1) out.zona = zonas[0];
+  else if (zonas.length > 1) out.zona = zonas;
+  if (!barrios.length) {
+    const place = parsePlace(text);
+    if (place && place.type === "city") out.city = place.place;
   }
   return out;
 }
@@ -201,30 +277,43 @@ if (typeof window !== "undefined") {
   window.parseFreeText = parseFreeText;
 }
 
-function applyParsedFilters(parsed) {
+function applyParsedFilters(parsed, opts) {
   if (!parsed) return;
   const setVal = (id, val) => {
     const el = document.getElementById(id);
-    if (el && val != null && val !== "") el.value = String(val);
+    if (!el || val == null || val === "") return;
+    el.value = Array.isArray(val) ? val.join(",") : String(val);
   };
-  if (parsed.type) setVal("typeFilter", parsed.type);
-  if (parsed.city) setVal("cityFilter", parsed.city);
-  if (parsed.barrio) setVal("barrioFilter", parsed.barrio);
-  if (parsed.minBeds != null) setVal("minBeds", parsed.minBeds);
-  if (parsed.minRooms != null) setVal("minRooms", parsed.minRooms);
-  if (parsed.minBaths != null) setVal("minBaths", parsed.minBaths);
-  if (parsed.minM2 != null) setVal("minM2", parsed.minM2);
-  if (parsed.maxM2 != null) setVal("maxM2", parsed.maxM2);
-  if (parsed.maxPrice != null) setVal("maxPrice", parsed.maxPrice);
+  const type = parsed.type || parsed.typeFilter;
+  const city = parsed.city || parsed.cityFilter;
+  const barrio = parsed.barrio || parsed.barrioFilter;
+  const zona = parsed.zona || parsed.zonaFilter;
+  const minBeds = parsed.minBeds != null ? parsed.minBeds : parsed.min_beds;
+  const minRooms = parsed.minRooms != null ? parsed.minRooms : parsed.min_rooms;
+  const minBaths = parsed.minBaths != null ? parsed.minBaths : parsed.min_baths;
+  const minM2 = parsed.minM2 != null ? parsed.minM2 : parsed.min_m2;
+  const maxM2 = parsed.maxM2 != null ? parsed.maxM2 : parsed.max_m2;
+  const maxPrice = parsed.maxPrice != null ? parsed.maxPrice : parsed.max_price;
+  if (type) setVal("typeFilter", type);
+  if (!opts?.skipCity && city) setVal("cityFilter", city);
+  if (barrio) setVal("barrioFilter", barrio);
+  if (zona) setVal("zonaFilter", zona);
+  if (minBeds != null) setVal("minBeds", minBeds);
+  if (minRooms != null) setVal("minRooms", minRooms);
+  if (minBaths != null) setVal("minBaths", minBaths);
+  if (minM2 != null) setVal("minM2", minM2);
+  if (maxM2 != null) setVal("maxM2", maxM2);
+  if (maxPrice != null) setVal("maxPrice", maxPrice);
+  const maxRooms = parsed.maxRooms != null ? parsed.maxRooms : parsed.max_rooms;
+  if (maxRooms != null) setVal("maxRooms", maxRooms);
+  if (parsed.dealBar != null && parsed.dealBar !== "") setVal("dealBar", parsed.dealBar);
 
-  // traits checkboxes
   if (parsed.traits && parsed.traits.length) {
     document.querySelectorAll('input[name="listingTrait"]').forEach(cb => {
       cb.checked = parsed.traits.includes(cb.value);
     });
   }
-  // Trigger render
-  if (typeof render === "function") render();
+  if (!opts?.skipRender && typeof render === "function") render();
 }
 
 // ES module export for tests

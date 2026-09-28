@@ -62,9 +62,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui49" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui140" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui114" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui140" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="all" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -72,40 +72,30 @@
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/css/tokens.css" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui49" />
+  <link rel="stylesheet" href="/static/css/tokens.css?v=ui140" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui140" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
+  <form class="search-strip" id="searchStrip">
+    <h1 class="logo search-logo">
+      <span class="logo-mark" aria-hidden="true"></span>
+      <span class="logo-word">PROPMAP</span>
+    </h1>
+    <label class="search-strip-query">
+      <span class="sr-only">Buscar avisos</span>
+      <input id="freeTextSearch" type="search" placeholder="casa luminosa con patio en Palermo, 3 dormitorios, hasta 200 mil" autocomplete="off" spellcheck="false" />
+    </label>
+    <button type="submit" id="freeTextGo" class="primary">Buscar</button>
+    <button type="button" class="theme-toggle" id="themeToggle" title="Cambiar a modo oscuro" aria-label="Cambiar a modo oscuro">
+      <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 3.2a8.8 8.8 0 1 0 6.3 14.6A8.2 8.2 0 0 1 14.5 3.2Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+      <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+  </form>
   <div class="shell">
     <aside class="panel" id="pane-market" data-pane="market">
-      <header class="brand">
-        <div class="brand-top">
-          <div class="logo">
-            <span class="logo-mark" aria-hidden="true"></span>
-            <span class="logo-word">PROPMAP</span>
-          </div>
-          <div class="brand-actions">
-            <button type="button" class="theme-toggle" id="themeToggle" title="Cambiar tema" aria-label="Cambiar tema">🌓</button>
-            <a href="/apoya" class="donate-btn" title="Apoya PropMap">Apoya</a>
-            <button type="button" class="account-btn" id="accountBtn" aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu" title="Cuenta">
-              Cuenta
-            </button>
-            <button type="button" class="info-btn" id="helpBtn" aria-haspopup="dialog" aria-controls="helpModal" title="Cómo usar PropMap">
-              <span aria-hidden="true">i</span>
-              <span class="sr-only">Cómo usar PropMap</span>
-            </button>
-          </div>
-        </div>
-        <h1 class="brand-tagline">Casas, departamentos y terrenos en venta en Argentina, comparados en el mapa.</h1>
-      </header>
-
       <div class="panel-scroll">
       <div class="filters">
-        <label class="span-2 place-wrap">
-          <span>Búsqueda libre</span>
-          <input id="freeTextSearch" type="search" placeholder="Ej: casa 3 dormitorios Palermo hasta 200k USD" autocomplete="off" spellcheck="false" />
-        </label>
         <label class="place-wrap">Lugar
           <input id="placeQuery" type="search" placeholder="Escribí una ciudad" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="placeSuggest" />
           <div id="placeSuggest" class="place-suggest" hidden></div>
@@ -114,22 +104,30 @@
           <select id="cityFilter"></select>
         </label>
         <label>Tipo
-          <select id="typeFilter">
-            <option value="">Todos</option>
-            <option value="casa">Casas</option>
-            <option value="departamento">Departamentos</option>
-            <option value="ph">PH / dúplex</option>
-            <option value="terreno">Terrenos</option>
-            <option value="local">Locales</option>
-            <option value="oficina">Oficinas</option>
-            <option value="galpon">Galpones</option>
-          </select>
+          <div class="multi" id="typeFilter" data-empty="Todos">
+            <button type="button" class="multi-btn" aria-expanded="false" aria-haspopup="listbox">Todos</button>
+            <div class="multi-menu" role="listbox" hidden>
+              <label><input type="checkbox" value="casa" /> Casas</label>
+              <label><input type="checkbox" value="departamento" /> Departamentos</label>
+              <label><input type="checkbox" value="ph" /> PH / dúplex</label>
+              <label><input type="checkbox" value="terreno" /> Terrenos</label>
+              <label><input type="checkbox" value="local" /> Locales</label>
+              <label><input type="checkbox" value="oficina" /> Oficinas</label>
+              <label><input type="checkbox" value="galpon" /> Galpones</label>
+            </div>
+          </div>
         </label>
         <label>Barrio
-          <select id="barrioFilter"><option value="">Todos</option></select>
+          <div class="multi" id="barrioFilter" data-empty="Todos">
+            <button type="button" class="multi-btn" aria-expanded="false" aria-haspopup="listbox">Todos</button>
+            <div class="multi-menu" role="listbox" hidden></div>
+          </div>
         </label>
         <label>Zona
-          <select id="zonaFilter"><option value="">Todas</option></select>
+          <div class="multi" id="zonaFilter" data-empty="Todas">
+            <button type="button" class="multi-btn" aria-expanded="false" aria-haspopup="listbox">Todas</button>
+            <div class="multi-menu" role="listbox" hidden></div>
+          </div>
         </label>
         <label>Hasta USD
           <input id="maxPrice" type="number" min="0" step="5000" placeholder="sin tope" />
@@ -152,6 +150,7 @@
             </select>
           </label>
           <label>Ambientes
+            <input id="maxRooms" type="hidden" value="" />
             <select id="minRooms">
               <option value="">Cualquiera</option>
               <option value="1">1+</option>
@@ -268,6 +267,15 @@
 
       <div class="kpis" id="kpis"></div>
 
+      <section class="fold price-analysis" id="priceAnalysis" data-fold="prices" data-fold-default="closed">
+        <button type="button" class="fold-head" aria-expanded="false">Análisis de precios</button>
+        <div class="fold-body" hidden>
+          <p class="muted" id="priceAnalysisContext">Según la ciudad y el tipo que estás mirando.</p>
+          <div class="market-readout" id="priceAnalysisReadout"></div>
+          <div class="market-chart" id="priceAnalysisChart"></div>
+        </div>
+      </section>
+
       <section class="market-pulse" id="marketPulse">
         <div class="block-head">
           <h2>Pulso del mercado</h2>
@@ -338,10 +346,6 @@
     </aside>
 
     <aside class="list-rail" id="pane-list" data-pane="list" aria-label="Avisos">
-      <div class="block-head">
-        <h2>Avisos</h2>
-        <span id="listCount">…</span>
-      </div>
       <p class="searching-banner" id="searchingBanner" hidden role="status" aria-live="polite">Buscando propiedades… van a ir apareciendo acá.</p>
       <div class="list" id="list" aria-busy="true">
         <div class="list-loading" role="status" aria-live="polite">
@@ -353,6 +357,10 @@
           <div class="card-skel" aria-hidden="true"></div>
         </div>
       </div>
+      <div class="compare-dock" id="compareDock" hidden>
+        <p id="cmpHint">Elegí otro aviso para comparar.</p>
+        <button id="openCompareBtn" type="button" class="primary" disabled>Comparar</button>
+      </div>
     </aside>
 
     <main class="map-wrap" id="pane-map" data-pane="map">
@@ -363,10 +371,10 @@
         <span class="list-loading-pulse" aria-hidden="true"></span>
         <p data-loading-copy>Cargando propiedades… esperá un segundo.</p>
       </div>
-      <aside class="map-legend" id="mapLegend">
+      <aside class="map-legend collapsed" id="mapLegend">
         <div class="map-legend-head">
           <h3>Colores del mapa</h3>
-          <button type="button" id="toggleLegend" class="ghost">ocultar</button>
+          <button type="button" id="toggleLegend" class="ghost">mostrar</button>
         </div>
         <ul>
           <li><span class="dot deal"></span><span><strong>Verde brillante:</strong> oportunidad. El USD/m² quedó bastante por debajo de la mediana del mismo tipo en ese barrio (después de sacar outliers).</span></li>
@@ -551,6 +559,20 @@
         </label>
         <button type="button" class="danger" id="deleteAccountBtn">Eliminar mi cuenta</button>
       </fieldset>
+      <fieldset class="alerts-zone">
+        <legend>Alertas</legend>
+        <p>Recibí un mail cuando aparezcan avisos que coincidan con tus filtros.</p>
+        <button type="button" id="newAlertBtn">Nueva alerta</button>
+        <div id="alertsList" class="alerts-list"></div>
+      </fieldset>
+      <fieldset class="map-zone">
+        <legend>Mapa</legend>
+        <p>Activá el mapa de calor para ver la concentración de precios USD/m² por barrio.</p>
+        <label class="toggle-row">
+          <span>Mapa de calor (USD/m²)</span>
+          <input type="checkbox" id="heatmapToggle" />
+        </label>
+      </fieldset>
       <div class="dialog-actions">
         <button value="close" type="button" id="settingsClose">Cerrar</button>
       </div>
@@ -565,8 +587,10 @@
   <img src="/px.gif" width="1" height="1" alt="" decoding="async" class="px-beacon" />
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
-  <script defer src="/static/parse-free-text.js"></script>
-  <script defer src="/static/filter-presets.js"></script>
-  <script defer src="/static/app.js?v=ui114"></script>
+  <script defer src="/static/vendor/leaflet-heat/leaflet-heat.js"></script>
+  <script type="module" src="/static/parse-free-text.js?v=ui140"></script>
+  <script type="module" src="/static/filter-presets.js?v=ui115"></script>
+  <script type="module" src="/static/comparator.js?v=ui140"></script>
+  <script defer src="/static/app.js?v=ui140"></script>
 </body>
 </html>

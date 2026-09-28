@@ -345,13 +345,11 @@ def _run_predict(backend: tuple[str, Any, str], state: Any, questions: dict[str,
     raise AttributeError("el agente Laya no expone predict ni system_one")
 
 
-def decide(state: Any, question_keys: list[str] | None = None) -> list[LayaDecision]:
-    """Una sola pasada para todas las preguntas pedidas."""
-    if state in (None, "", {}, []):
+def decide_questions(state: Any, questions: dict[str, dict[str, Any]]) -> list[LayaDecision]:
+    """Una pasada de Laya con preguntas propias del llamador."""
+    if state in (None, "", {}, []) or not questions:
         return []
-    keys = question_keys or list(LAYA_QUESTIONS)
-    questions = {key: LAYA_QUESTIONS[key] for key in keys if key in LAYA_QUESTIONS}
-    if not questions:
+    if _testing():
         return []
     backend = _ensure_agent()
     if backend is None:
@@ -362,9 +360,18 @@ def decide(state: Any, question_keys: list[str] | None = None) -> list[LayaDecis
         elapsed = (time.time() - t0) * 1000
         logger.debug("Laya inferencia: %.1fms para %d preguntas", elapsed, len(questions))
         return parse_answers(result, questions)
-    except Exception:
-        logger.exception("Error en inferencia Laya")
+    except Exception as exc:
+        logger.warning("Laya no respondió (%s); sigo sin esas decisiones", exc)
         return []
+
+
+def decide(state: Any, question_keys: list[str] | None = None) -> list[LayaDecision]:
+    """Una sola pasada para todas las preguntas pedidas."""
+    if state in (None, "", {}, []):
+        return []
+    keys = question_keys or list(LAYA_QUESTIONS)
+    questions = {key: LAYA_QUESTIONS[key] for key in keys if key in LAYA_QUESTIONS}
+    return decide_questions(state, questions)
 
 
 def ask_laya(state_text: str, question_keys: list[str] | None = None) -> list[LayaDecision]:
