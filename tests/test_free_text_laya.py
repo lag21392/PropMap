@@ -165,3 +165,61 @@ def test_city_nickname_selects_the_loaded_city(monkeypatch):
     filters, place, _source = filters_for_query("ciudad de rawson", city="caba")
     assert place["id"] == "rawson-chubut"
     assert filters["cityFilter"] == "rawson-chubut"
+
+
+def test_price_tail_does_not_hide_the_city_or_invent_traits(monkeypatch):
+    from app import places
+    from app.laya_client import LayaDecision
+
+    monkeypatch.setattr(
+        "app.laya_client.decide_questions",
+        lambda *_args, **_kwargs: [
+            LayaDecision("property_kind", "choice", "departamento", 0.95),
+            LayaDecision("trait_balcony", "noul", True, 0.9),
+            LayaDecision("trait_bright", "noul", True, 0.9),
+            LayaDecision("trait_credit", "noul", True, 0.9),
+        ],
+    )
+    monkeypatch.setattr("app.free_text_search.barrio_in_city", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.free_text_search.zonas_in_city", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.listings_cache.cached_city_ids", lambda: ["rosario"])
+    monkeypatch.setattr("app.place_api.lookup_place", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("red")))
+    monkeypatch.setitem(places.CITIES, "rosario", {
+        "id": "rosario",
+        "label": "Rosario",
+        "lat": -32.95,
+        "lon": -60.64,
+        "province": "Santa Fe",
+        "zoom": 13,
+        "aliases": [],
+    })
+
+    assert _place_phrase("casa luminosa en la rosario a menos de 80 mil") == "rosario"
+    filters, place, source = filters_for_query(
+        "casa luminosa en la rosario a menos de 80 mil",
+        city="caba",
+    )
+    assert source == "laya"
+    assert place["id"] == "rosario"
+    assert filters["cityFilter"] == "rosario"
+    assert filters["typeFilter"] == "casa"
+    assert filters["maxPrice"] == 80000
+    assert filters["traits"] == ["bright"]
+
+    filters, place, _source = filters_for_query("ciudad de rosario", city="caba")
+    assert place["id"] == "rosario"
+    assert "typeFilter" not in filters
+    assert "traits" not in filters
+
+
+def test_search_uses_the_gpu_server_instead_of_loading_torch(monkeypatch):
+    from app import laya_client
+
+    monkeypatch.setenv("LAYA_SERVE_URL", "http://laya-gpu:8000")
+    monkeypatch.setenv("LAYA_MODEL", "multilingual")
+    monkeypatch.setattr(laya_client, "_load_local", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local")))
+
+    kind, endpoint, model = laya_client._load_backend()
+    assert kind == "http"
+    assert endpoint == "http://laya-gpu:8000/v1/systemone"
+    assert model == "multilingual"

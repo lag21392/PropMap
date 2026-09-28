@@ -1276,21 +1276,25 @@ function selectedTraits() {
   );
 }
 
+function traitAnswered(item, key) {
+  return item?.[key] != null && item[key] !== "";
+}
+
 function passesTraits(item, traits) {
   if (!traits || !traits.size) return true;
-  if (traits.has("credit") && item.mortgage_credit !== true) return false;
-  if (traits.has("owner") && item.owner_direct !== true) return false;
-  if (traits.has("expenses") && item.low_expenses !== true) return false;
-  if (traits.has("urgent") && item.urgent_sale !== true) return false;
-  if (traits.has("quiet") && item.environment !== "quiet") return false;
-  if (traits.has("good") && !isGoodCondition(item)) return false;
-  if (traits.has("balcony") && item.has_balcony !== true) return false;
-  if (traits.has("bright") && item.bright !== true) return false;
-  if (traits.has("growing") && item.growing_area !== true) return false;
-  if (traits.has("view") && item.open_view !== true) return false;
-  if (traits.has("patio") && item.has_patio !== true) return false;
-  if (traits.has("garage") && item.has_garage !== true) return false;
-  if (traits.has("terrace") && item.has_terrace !== true) return false;
+  if (traits.has("credit") && traitAnswered(item, "mortgage_credit") && item.mortgage_credit !== true) return false;
+  if (traits.has("owner") && traitAnswered(item, "owner_direct") && item.owner_direct !== true) return false;
+  if (traits.has("expenses") && traitAnswered(item, "low_expenses") && item.low_expenses !== true) return false;
+  if (traits.has("urgent") && traitAnswered(item, "urgent_sale") && item.urgent_sale !== true) return false;
+  if (traits.has("quiet") && traitAnswered(item, "environment") && item.environment !== "quiet") return false;
+  if (traits.has("good") && traitAnswered(item, "condition") && !isGoodCondition(item)) return false;
+  if (traits.has("balcony") && traitAnswered(item, "has_balcony") && item.has_balcony !== true) return false;
+  if (traits.has("bright") && traitAnswered(item, "bright") && item.bright !== true) return false;
+  if (traits.has("growing") && traitAnswered(item, "growing_area") && item.growing_area !== true) return false;
+  if (traits.has("view") && traitAnswered(item, "open_view") && item.open_view !== true) return false;
+  if (traits.has("patio") && traitAnswered(item, "has_patio") && item.has_patio !== true) return false;
+  if (traits.has("garage") && traitAnswered(item, "has_garage") && item.has_garage !== true) return false;
+  if (traits.has("terrace") && traitAnswered(item, "has_terrace") && item.has_terrace !== true) return false;
   return true;
 }
 
@@ -3749,6 +3753,9 @@ function flyToPins(items, place) {
     const fly = { duration: 2.1, easeLinearity: 0.16 };
     const settle = () => {
       if (token !== earthZoomToken) return;
+      map.invalidateSize({ pan: false });
+      mapPaintKey = "";
+      paintMapMarkers(sorted(filtered()));
       refreshMarkerLayout();
       if (!points.length) return;
       if (points.length === 1) {

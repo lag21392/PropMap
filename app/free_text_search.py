@@ -189,6 +189,8 @@ def find_traits(text: str) -> list[str]:
         keys: list[str] = []
         for key in trait["keys"]:
             for part in normalize(key).split():
+                if len(part) < 3:
+                    continue
                 keys.extend(_word_forms(part))
         for key in keys:
             if re.search(rf"\b{re.escape(key)}\b", text):
@@ -647,7 +649,8 @@ def _place_stop_words() -> set[str]:
 
 _PLACE_STOP_BASE = _SKIP_PLACE | {
     "en", "con", "de", "del", "la", "el", "los", "las", "y", "por", "para",
-    "hasta", "desde", "usd", "ars", "m2", "metros", "metro", "mil", "miles",
+    "a", "al", "hasta", "desde", "menos", "mas", "bajo", "sobre",
+    "usd", "ars", "m2", "metros", "metro", "mil", "miles",
     "dormitorio", "dormitorios", "habitacion", "habitaciones",
     "ambiente", "ambientes", "bano", "banos",
     "ciudad", "localidad", "provincia",
@@ -668,14 +671,15 @@ def _place_phrase(query: str) -> str:
 
 
 def _place_candidates(query: str) -> list[str]:
-    """Frases de lugar, de la más larga a la última palabra. «ciudad de rawson» queda en rawson."""
+    """Frases de lugar, de la más larga a cada palabra. «rosario a menos» también prueba rosario."""
     phrase = _place_phrase(query)
     parts = phrase.split()
     out: list[str] = []
     for size in range(len(parts), 0, -1):
-        tail = " ".join(parts[-size:])
-        if tail and tail not in out:
-            out.append(tail)
+        for start in range(0, len(parts) - size + 1):
+            chunk = " ".join(parts[start:start + size])
+            if chunk and chunk not in out:
+                out.append(chunk)
     return out
 
 
@@ -864,6 +868,19 @@ def filters_for_query(query: str, where: str = "", city: str = "") -> tuple[dict
         source = "laya"
     else:
         base = _apply_monoambiente(query, merge_search_decisions(base, []))
+    # Laya en frases cortas afirma rasgos que el texto no dice y deja el mapa vacío.
+    # El tipo y los rasgos salen de las palabras; Laya no inventa un filtro.
+    said = normalize(query)
+    said_types = find_types(said)
+    said_traits = find_traits(said)
+    if said_types:
+        base["typeFilter"] = _one_or_many(said_types)
+    else:
+        base.pop("typeFilter", None)
+    if said_traits:
+        base["traits"] = sorted(set(said_traits))
+    else:
+        base.pop("traits", None)
     public_place = None
     if place and place.get("id"):
         public_place = {key: place.get(key) for key in ("id", "label", "lat", "lon", "province", "zoom")}

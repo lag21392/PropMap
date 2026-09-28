@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# PyTorch 2.5.1 + CUDA 12.4 ya incluye sm_60, que corre en la GTX 1060 (6.1).
+# No reinstalar torch: el de PyPI es CUDA 13 y no tiene Pascal.
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    PYTHONPATH=/opt/laya \
+    LAYA_DEVICE=cuda \
+    LAYA_MODELS=multilingual \
+    LAYA_MAX_LOADED=1 \
+    LAYA_PRELOAD=1 \
+    LAYA_GPU_MEM_FRACTION=0.35 \
+    LAYA_HOST=0.0.0.0 \
+    LAYA_PORT=8000
+
+COPY scripts/laya_gpu_sitecustomize.py /opt/laya/sitecustomize.py
+
+RUN pip install --no-cache-dir --no-deps 'laya==0.3.21' 'transformers==4.57.6' \
+    && pip install --no-cache-dir \
+        'filelock' \
+        'huggingface_hub>=0.34,<1' \
+        'numpy>=1.20' \
+        'packaging' \
+        'pyyaml' \
+        'regex' \
+        'requests' \
+        'tokenizers>=0.22,<=0.23.0' \
+        'safetensors>=0.4' \
+        'tqdm' \
+        'fastapi>=0.110' \
+        'uvicorn>=0.27' \
+        'python-multipart>=0.0.9' \
+        'pydantic>=2' \
+    && python -c 'import torch; assert torch.__version__.startswith("2.5.1"), torch.__version__; assert torch.version.cuda.startswith("12.4"), torch.version.cuda'
+
+EXPOSE 8000
+ENTRYPOINT ["laya-serve"]

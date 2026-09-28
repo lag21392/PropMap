@@ -50,6 +50,25 @@ else
 fi
 
 export COMPOSE_FILE="$REPO_DIR/compose.prod.yaml"
+echo "[deploy] Levantando Laya en la GPU..."
+docker compose up -d --no-deps laya-gpu
+laya_status="unknown"
+laya_ok=0
+for _ in $(seq 1 40); do
+  laya_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' propmap-prod-laya 2>/dev/null || echo missing)"
+  if [ "$laya_status" = "healthy" ]; then
+    echo "[deploy] propmap-prod-laya healthy."
+    laya_ok=1
+    break
+  fi
+  sleep 5
+done
+if [ "$laya_ok" != "1" ]; then
+  echo "[deploy] ERROR: Laya no quedó healthy (estado: $laya_status)."
+  docker logs --tail 40 propmap-prod-laya || true
+  exit 1
+fi
+
 echo "[deploy] Levantando propmap-prod..."
 docker compose up -d --no-deps "${BUILD[@]}" propmap
 

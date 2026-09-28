@@ -196,8 +196,12 @@ def _testing() -> bool:
     return os.environ.get("PROPMAP_TEST") == "1"
 
 
-def _systemone_endpoint() -> str:
-    url = SYSTEMONE_URL.rstrip("/")
+def _serve_url() -> str:
+    return (os.getenv("LAYA_SERVE_URL") or "").strip().rstrip("/")
+
+
+def _http_endpoint(url: str) -> str:
+    url = url.rstrip("/")
     if not url:
         return ""
     if url.endswith("/systemone") or url.endswith("/decide"):
@@ -205,7 +209,18 @@ def _systemone_endpoint() -> str:
     return f"{url}/v1/systemone"
 
 
+def _systemone_endpoint() -> str:
+    return _http_endpoint(SYSTEMONE_URL)
+
+
 def _load_backend() -> tuple[str, Any, str] | None:
+    # Si hay un laya-serve en la GPU, la búsqueda habla por HTTP y este
+    # proceso no carga PyTorch. El modelo local queda para cuando no hay GPU.
+    serve = _serve_url()
+    if serve:
+        model = (os.getenv("LAYA_MODEL") or "multilingual").strip() or "multilingual"
+        logger.info("Laya en GPU vía %s (%s)", serve, model)
+        return "http", _http_endpoint(serve), model
     # El modelo local (convaiinnovations/laya) responde en español. El HTTP
     # de Jev queda solo si el paquete no está instalado.
     os.environ.setdefault("USE_TF", "0")
@@ -368,8 +383,14 @@ def _run_predict(backend: tuple[str, Any, str], state: Any, questions: dict[str,
     if kind == "http":
         import httpx
 
-        payload = {"state": state, "questions": questions, "model": os.getenv("SYSTEMONE_MODEL") or "kev-latest"}
-        resp = httpx.post(str(agent), json=payload, timeout=12.0)
+        if _serve_url():
+            model_name = model if model and model != "systemone" else (os.getenv("LAYA_MODEL") or "multilingual")
+            timeout = float(os.getenv("LAYA_HTTP_TIMEOUT", "30"))
+        else:
+            model_name = os.getenv("SYSTEMONE_MODEL") or "kev-latest"
+            timeout = 12.0
+        payload = {"state": state, "questions": questions, "model": model_name}
+        resp = httpx.post(str(agent), json=payload, timeout=timeout)
         resp.raise_for_status()
         return resp.json() or {}
     if kind == "router":
