@@ -154,13 +154,14 @@ def test_street_address_gets_zona_and_servicios_even_if_kind_approx():
     profile = compute_profile(item)
     assert profile["pin_grade"] == "exact"
     assert profile["axes"]["zona"]["score"] is not None
-    assert profile["axes"]["servicios"]["score"] is not None
+    assert profile["axes"]["servicios"]["score"] is None
     assert profile["axes"]["price_m2"]["score"] is not None
     public = item.to_public_dict()
     assert public["location_approx"] is False
     assert public["pin_grade"] == "exact"
     assert public["profile"]["pin_grade"] == "exact"
     assert public["profile"]["axes"]["zona"]["score"] is not None
+    assert public["profile"]["axes"]["servicios"]["score"] is None
     assert public["profile"]["total"] is not None
     assert public["profile"]["labels"]["servicios"] == "POIs cercanos"
 
@@ -225,7 +226,7 @@ def test_profile_total_is_mean_of_present_axes():
             }
         },
     )
-    profile = compute_profile(_depto(vs_barrio_pct=22.0))
+    profile = compute_profile(_depto(vs_barrio_pct=22.0), city_pois("test-city"))
     scores = [axis["score"] for axis in profile["axes"].values() if axis.get("score") is not None]
     assert scores
     assert profile["total"] == round(sum(scores) / len(scores), 1)

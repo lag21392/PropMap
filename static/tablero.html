@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui36" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui38" />
 </head>
 <body class="tablero-page">
   <header class="tablero-head">
@@ -26,7 +26,11 @@
   <!-- 1. Resumen: lo que hay que mirar primero -->
   <section class="tablero-summary" id="sumBlock" hidden>
     <p id="nowLead" class="tablero-now-lead"></p>
-    <dl class="tablero-tiles" id="sumKpis"></dl>
+    <div class="tablero-queues-wrap">
+      <table class="tablero-queues" id="queueTable">
+        <caption>Proceso</caption>
+      </table>
+    </div>
     <ul class="tablero-alerts" id="sumAlerts"></ul>
   </section>
 
@@ -39,8 +43,6 @@
       <dl class="tablero-kpis" id="llmKpis"></dl>
       <p class="tablero-sub">Etapas ahora</p>
       <div id="llmNowStack" class="tablero-stack" role="img" aria-label="Trabajo en vivo del LLM"></div>
-      <p class="tablero-sub">En la base</p>
-      <div id="llmStack" class="tablero-stack" role="img" aria-label="Stock del LLM"></div>
       <figure class="tablero-fig">
         <figcaption>Avisos terminados por minuto · últimas 24 h</figcaption>
         <svg id="llmChart" class="tablero-chart tablero-chart-tall" role="img" aria-label="Avisos que el LLM terminó por minuto"></svg>
@@ -53,8 +55,6 @@
       <p class="tablero-lead" id="fichaLead"></p>
       <p class="tablero-pace" id="fichaNow"></p>
       <dl class="tablero-kpis" id="fichaKpis"></dl>
-      <p class="tablero-sub">En la base</p>
-      <div id="fichaStack" class="tablero-stack" role="img" aria-label="Stock de fichas"></div>
       <figure class="tablero-fig">
         <figcaption>Fichas bajadas o fallidas por minuto · últimas 24 h</figcaption>
         <svg id="fichaChart" class="tablero-chart tablero-chart-tall" role="img" aria-label="Ritmo de fichas"></svg>
@@ -125,6 +125,6 @@
     </section>
   </div>
 
-  <script src="/static/tablero.js?v=19"></script>
+  <script src="/static/tablero.js?v=23"></script>
 </body>
 </html>

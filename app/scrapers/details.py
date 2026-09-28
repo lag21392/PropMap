@@ -113,12 +113,12 @@ def _drop_gone(item: Listing) -> Listing:
     return item
 
 
-def enrich_details(item: Listing, should_stop=lambda: False) -> Listing:
+def enrich_details(item: Listing, should_stop=lambda: False, *, force: bool = False) -> Listing:
     if should_stop() or not item.url:
         return analyze(item)
     from ..freshness import needs_detail_fetch
 
-    if not needs_detail_fetch(item):
+    if not force and not needs_detail_fetch(item):
         return analyze(item)
     from ..http_client import PageGone
 
@@ -142,23 +142,15 @@ def enrich_details(item: Listing, should_stop=lambda: False) -> Listing:
     _coords_from_html(item, html)
     if should_stop():
         return analyze(item)
-    pdf_text = _pdf_bits(html, item.url)
     extra = dict(item.extra or {})
-    if pdf_text:
-        extra["pdf_text"] = pdf_text[:4000]
-        if not item.description:
-            item.description = pdf_text[:1200]
-        elif pdf_text[:200] not in item.description:
-            item.description = (item.description + "\n" + pdf_text[:800])[:2000]
     extra["details_at"] = datetime.now(timezone.utc).isoformat()
     extra["details_parser"] = DETAILS_PARSER
     extra["detail_price"] = item.price
     extra["detail_m2"] = item.covered_m2 or item.total_m2
     item.extra = extra
     item.details_scraped = True
-    from . import locate_item
-
-    locate_item(item)
+    # El PDF y el geocoder no van en este hilo: una ficha que no vuelve
+    # se queda con los 6 cupos y la cola deja de bajar.
     return analyze(item)
 
 

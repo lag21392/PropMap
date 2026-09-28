@@ -345,6 +345,13 @@ def needs_improve(item: Listing) -> bool:
     extra = item.extra or {}
     if extra.get("duplicate_of") or extra.get("dedupe_hidden"):
         return False
+    if extra.get("llm_wait_ficha") and not (item.details_scraped or extra.get("details_at")):
+        return False
+    if extra.get("llm_wait_ficha") and (item.details_scraped or extra.get("details_at")):
+        return True
+    # Un parcial ya cerrado no vuelve a la GPU, aunque siga marcado como fino.
+    if extra.get("llm_partial") and extra.get("llm_ver") == LLM_SCHEMA:
+        return False
     if extra.get("llm_thin") and (item.details_scraped or extra.get("details_at")):
         return True
     if _city_unassigned(item) and not extra.get("llm_city_ok"):
@@ -352,8 +359,6 @@ def needs_improve(item: Listing) -> bool:
     if _has_data_fixes(item) and not extra.get("llm_repair"):
         return True
     if extra.get("llm_ver") == LLM_SCHEMA and extra.get("llm_ready") and not extra.get("llm_partial"):
-        return False
-    if extra.get("llm_partial") and extra.get("llm_ver") == LLM_SCHEMA:
         return False
     return True
 
@@ -683,30 +688,44 @@ def _ensure_workers_locked() -> None:
         pass
 
 
+# La limpieza va primero, pero no se queda con la GPU para siempre.
+# Cada tantos avisos, si hay una descripción armada, esa entra. No se corta el aviso en curso.
+_EXTRACT_BEFORE_COPY = 6
+_since_copy = 0
+
+
 def _take_copy_job() -> tuple | None:
     try:
-        from .llm_copy import fichas_pending, take_ready
+        from .llm_copy import take_ready
 
-        if fichas_pending():
-            return None
         return take_ready()
     except Exception:
         return None
 
 
 def _next_gpu_job(wait: float) -> tuple[str | None, tuple | None]:
-    """Un solo consumidor de GPU: extracción si hay prompt, si no descripción."""
+    """Una GPU, sin desalojar. Limpieza primero, con un hueco para descripciones."""
+    global _since_copy
+    if _since_copy >= _EXTRACT_BEFORE_COPY:
+        copy_job = _take_copy_job()
+        if copy_job is not None:
+            _since_copy = 0
+            return "copy", copy_job
     job = _take_prepared(0)
     if job is not None:
+        _since_copy += 1
         return "extract", job
     copy_job = _take_copy_job()
     if copy_job is not None:
+        _since_copy = 0
         return "copy", copy_job
     job = _take_prepared(max(0.0, wait))
     if job is not None:
+        _since_copy += 1
         return "extract", job
     copy_job = _take_copy_job()
     if copy_job is not None:
+        _since_copy = 0
         return "copy", copy_job
     return None, None
 
@@ -979,8 +998,9 @@ def _commit_llm_ok(item: Listing, data: dict[str, Any]) -> None:
     extra["llm_city_ok"] = True
     extra["llm_repair"] = True
     extra["llm_at"] = _now_iso()
+    # False, no pop: el merge con la fila vieja revive la clave si falta.
     if item.details_scraped or extra.get("details_at"):
-        extra.pop("llm_thin", None)
+        extra["llm_thin"] = False
     else:
         extra["llm_thin"] = True
     item.extra = extra
@@ -1017,10 +1037,24 @@ def _commit_llm_fail(listing_id: str, item: Listing) -> None:
     extra["llm_tries"] = int(extra.get("llm_tries") or 0) + 1
     item.extra = extra
     if extra["llm_tries"] >= MAX_TRIES:
+        has_ficha = bool(item.details_scraped or extra.get("details_at"))
+        if not has_ficha and not _city_unassigned(item):
+            extra["llm_wait_ficha"] = True
+            extra["llm_partial"] = False
+            extra["llm_ready"] = False
+            extra["await_llm"] = False
+            item.extra = extra
+            _save_llm_item(item)
+            _ops_note("llm", outcome="retry")
+            with _lock:
+                _seen.discard(listing_id)
+                _skip_until[listing_id] = time.time() + SKIP_FAIL_SEC
+            return
         if os.environ.get("PROPMAP_TEST") == "1":
             _enrich_with_laya(item)
         extra["llm_ready"] = True
         extra["llm_partial"] = True
+        extra["llm_thin"] = False
         extra["llm_ver"] = LLM_SCHEMA
         extra["await_llm"] = False
         extra["llm_city_ok"] = True
@@ -1292,10 +1326,6 @@ def _chat(messages: list[dict[str, Any]], *, use_tools: bool = False, max_tokens
         body["tools"] = tools
     url = f"{llm_url()}/v1/chat/completions"
     wait = CHAT_TIMEOUT_SEC + STUCK_SEC
-    # Backoff exponencial con jitter simple antes de intentar
-    import random
-    backoff = 0.5 * (2 ** min(3, int(time.time() % 5)))
-    time.sleep(backoff + random.uniform(0, 0.3))
     ticket = _gpu.acquire_ticket(timeout=wait)
     if ticket is None:
         return {}

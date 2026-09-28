@@ -21,6 +21,7 @@ def pump(prefer_cities: list[str] | None = None) -> dict[str, int]:
     llm_n = 0
     copy_n = 0
     signals_n = 0
+    poi_n = 0
     try:
         from .detail_fetch import refill as refill_details
 
@@ -45,7 +46,13 @@ def pump(prefer_cities: list[str] | None = None) -> dict[str, int]:
         signals_n = refill_signals(prefer)
     except Exception:
         log.exception("backfill etiquetas")
-    return {"details": details_n, "llm": llm_n, "copy": copy_n, "signals": signals_n}
+    try:
+        from .access import refill_poi
+
+        poi_n = refill_poi(prefer)
+    except Exception:
+        log.exception("backfill pois")
+    return {"details": details_n, "llm": llm_n, "copy": copy_n, "signals": signals_n, "poi": poi_n}
 
 
 def start() -> None:
@@ -54,6 +61,16 @@ def start() -> None:
         if _started or os.environ.get("PROPMAP_TEST") == "1":
             return
         _started = True
+
+    def fichas() -> None:
+        while True:
+            try:
+                from .detail_fetch import refill as refill_details
+
+                refill_details("")
+            except Exception:
+                log.exception("backfill fichas")
+            time.sleep(PUMP_SEC)
 
     def loop() -> None:
         while True:
@@ -69,4 +86,5 @@ def start() -> None:
                 log.exception("backfill loop")
             time.sleep(PUMP_SEC)
 
+    threading.Thread(target=fichas, daemon=True, name="propmap-fichas").start()
     threading.Thread(target=loop, daemon=True, name="propmap-backfill").start()

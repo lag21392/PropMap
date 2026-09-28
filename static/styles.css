@@ -882,8 +882,6 @@ input, select, textarea {
   border-radius: 14px;
   cursor: pointer;
   background: rgba(7, 16, 24, 0.55);
-  content-visibility: auto;
-  contain-intrinsic-size: 90px;
 }
 .card-left {
   display: flex;
@@ -948,11 +946,11 @@ input, select, textarea {
 }
 .rent-strip b { color: var(--teal); font-weight: 600; }
 .rent-estimate {
-  margin: 12px 0 4px;
+  margin: 0 0 4px;
   padding: 10px 12px;
-  border: 1px solid rgba(46, 196, 182, 0.22);
-  border-radius: 12px;
-  background: rgba(46, 196, 182, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper);
 }
 .rent-estimate h4 { margin: 0 0 8px; font-size: 14px; }
 .rent-row { display: grid; gap: 2px; margin: 0 0 8px; }
@@ -1095,7 +1093,8 @@ input, select, textarea {
   font-weight: 400;
 }
 .fold:not([open]) > summary::after { content: "▸"; }
-.fold > :not(summary):not(.fold-head) { padding: 0 12px 12px; }
+.fold > :not(summary):not(.fold-head):not(.rent-estimate) { padding: 0 12px 12px; }
+.fold > .rent-estimate { margin: 0 12px 12px; }
 .near-list {
   margin: 0 0 12px;
   padding: 10px 12px;
@@ -1512,7 +1511,19 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 .edit-form.is-locked .edit-fields { display: none; }
 .edit-hint { margin: 0; font-size: 12px; }
 .detail h3 { margin: 8px 0 4px; font-size: 16px; }
-.detail .desc { color: var(--muted); max-height: 42vh; overflow: auto; white-space: pre-wrap; }
+.detail .desc { color: var(--ink); max-height: none; overflow: visible; white-space: pre-wrap; }
+.desc-struct { margin: 0; }
+.desc-struct dt {
+  margin-top: 10px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.desc-struct dd { margin: 2px 0 0; }
+.detail-lead { margin: 4px 0 12px; }
+.detail-title { margin: 2px 0 8px; font-size: 18px; line-height: 1.35; font-weight: 500; }
+.detail-copy p { margin: 0 0 8px; font-size: 15px; line-height: 1.45; }
 .detail-head {
   display: flex;
   flex-direction: column;
@@ -1620,7 +1631,7 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 .fact span { display: block; color: var(--muted); font-size: 11px; }
 .fact b { font-size: 13px; }
 .detail h3 { margin: 8px 0 4px; font-size: 16px; }
-.detail .desc { color: var(--muted); max-height: 42vh; overflow: auto; white-space: pre-wrap; }
+.detail .desc { color: var(--ink); max-height: none; overflow: visible; white-space: pre-wrap; }
 .card .kind { font-size: 12px; }
 .headline { font-weight: 500; }
 .kind.terreno { background: rgba(196, 154, 108, 0.22); color: #e2c48e; }
@@ -1788,7 +1799,6 @@ body:not(.is-admin) .admin-only { display: none !important; }
 }
 .survey-frame::before { top: -2px; left: -2px; border-right: 0; border-bottom: 0; }
 .survey-frame::after { right: -2px; bottom: -2px; border-left: 0; border-top: 0; }
-.card { content-visibility: auto; contain-intrinsic-size: 0 120px; }
 .dock {
   display: none;
   position: fixed;
@@ -1999,7 +2009,7 @@ dialog, .welcome-dialog, .help-dialog {
 }
 .tag.loteo-fuera-de-mediana { color: #6b5a42; }
 .chip { background: rgba(42, 74, 60, 0.06); }
-.rent-estimate, .help-rent, .welcome-note {
+.help-rent, .welcome-note {
   border-color: rgba(42, 74, 60, 0.16);
   background: rgba(42, 74, 60, 0.05);
 }
@@ -2260,6 +2270,45 @@ a { color: var(--teal); }
   border: 1px solid var(--line);
   border-left: 4px solid var(--teal);
 }
+.tablero-queues-wrap {
+  overflow-x: auto;
+  margin: 12px 0 4px;
+}
+.tablero-queues {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.tablero-queues caption {
+  caption-side: top;
+  text-align: left;
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 18px;
+  font-weight: 700;
+  margin: 0 0 6px;
+}
+.tablero-queues th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 8px 6px 0;
+  white-space: nowrap;
+}
+.tablero-queues td {
+  padding: 8px 10px 8px 0;
+  border-top: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tablero-queues td:first-child { font-weight: 700; }
+.tablero-queues th.num,
+.tablero-queues td.num {
+  text-align: right;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px;
+}
+.tablero-queues td.is-need { font-weight: 700; }
 .tablero-tiles {
   display: grid;
   /* Seis KPIs: 3 y 3. Con auto-fit quedan columnas de sobra y huecos grises. */

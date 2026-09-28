@@ -106,6 +106,35 @@ def test_upsert_many_merges_existing_and_keeps_last_duplicate(tmp_path, monkeypa
     got2 = store.get_listing("zonaprop:u2")
     assert got2.extra.get("k") == "b"
 
+    cleaned = item(
+        "thin",
+        details_scraped=True,
+        extra={
+            "llm_thin": False,
+            "llm_ready": True,
+            "llm_ver": 7,
+            "llm_partial": False,
+            "details_at": "2026-01-01T00:00:00+00:00",
+        },
+    )
+    store.upsert_many(
+        [
+            item(
+                "thin",
+                details_scraped=True,
+                extra={"llm_thin": True, "llm_ready": True, "llm_ver": 7, "details_at": "2026-01-01T00:00:00+00:00"},
+            )
+        ]
+    )
+    store.upsert_many([cleaned])
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT needs_llm, json_extract(extra_json, '$.llm_thin') FROM listings WHERE id = ?",
+            ("zonaprop:thin",),
+        ).fetchone()
+    assert row[1] in (0, False)
+    assert row[0] == 0
+
     got2.score = 77.0
     got2.deal_label = "oportunidad"
     store.update_scores([got2])

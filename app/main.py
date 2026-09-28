@@ -717,10 +717,18 @@ def listings(
     city: str = Query(""),
     since: int = Query(-1),
     pins: bool = Query(False),
+    page: int = Query(-1),
 ):
     from .accounts import optional_user, overlay_pins
     from .jsoncodec import gunzip_bytes, loads as json_loads
-    from .listings_cache import listings_body, listings_pins_body, request_city_bytes, unchanged_listings, warming_payload
+    from .listings_cache import (
+        listings_body,
+        listings_card_page,
+        listings_pins_body,
+        request_city_bytes,
+        unchanged_listings,
+        warming_payload,
+    )
 
     t0 = time.perf_counter()
     extra = {"city": city or "", "pins": int(bool(pins))}
@@ -730,6 +738,13 @@ def listings(
 
     note("listings.warm", (time.perf_counter() - t0) * 1000, extra)
     want_gzip = (not user) and _wants_gzip(request)
+    if page >= 0 and not pins:
+        data = listings_card_page(city or None, page)
+        if data is None:
+            return _with_timing("listings", t0, warming_payload(city or None), extra)
+        if user and data.get("listings"):
+            data["listings"] = overlay_pins(data["listings"], user)
+        return _with_timing("listings.page", t0, data, extra)
     if pins:
         raw, encoding = listings_pins_body(city or None, gzip=want_gzip)
         if raw:
