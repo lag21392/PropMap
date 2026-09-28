@@ -46,6 +46,11 @@ async def lifespan(_app: FastAPI):
         from .watchdog import start as start_watchdog
 
         start_watchdog()
+        import threading
+
+        from .laya_client import warmup_laya
+
+        threading.Thread(target=warmup_laya, name="laya-warmup", daemon=True).start()
     yield
 
 

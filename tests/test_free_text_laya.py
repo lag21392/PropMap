@@ -115,3 +115,53 @@ def test_several_types_and_places_stay_as_lists(monkeypatch):
 def test_place_phrase_keeps_the_location_words():
     assert _place_phrase("casa 3 dormitorios palermo hasta 200k usd") == "palermo"
     assert _place_phrase("casa en villa carlos paz hasta 200k") == "villa carlos paz"
+    assert _place_phrase("casa luminosa madryn") == "madryn"
+    assert _place_phrase("ciudad de rawson") == "rawson"
+
+
+def test_city_nickname_selects_the_loaded_city(monkeypatch):
+    from app import places
+
+    monkeypatch.setattr("app.laya_client.decide_questions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.free_text_search.barrio_in_city", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.free_text_search.zonas_in_city", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.listings_cache.cached_city_ids", lambda: ["puerto-madryn", "rawson-chubut"])
+    monkeypatch.setattr("app.place_api.lookup_place", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("red")))
+    monkeypatch.setitem(places.CITIES, "puerto-madryn", {
+        "id": "puerto-madryn",
+        "label": "Puerto Madryn",
+        "lat": -42.77,
+        "lon": -65.04,
+        "province": "Chubut",
+        "zoom": 13,
+        "aliases": [],
+    })
+    monkeypatch.setitem(places.CITIES, "rawson", {
+        "id": "rawson",
+        "label": "Rawson",
+        "lat": -31.57,
+        "lon": -68.54,
+        "province": "San Juan",
+        "zoom": 13,
+        "aliases": [],
+    })
+    monkeypatch.setitem(places.CITIES, "rawson-chubut", {
+        "id": "rawson-chubut",
+        "label": "Rawson",
+        "lat": -43.3,
+        "lon": -65.1,
+        "province": "Chubut",
+        "zoom": 13,
+        "aliases": [],
+    })
+
+    filters, place, source = filters_for_query("casa luminosa madryn", city="caba")
+    assert source == "rules"
+    assert place["id"] == "puerto-madryn"
+    assert filters["cityFilter"] == "puerto-madryn"
+    assert filters["typeFilter"] == "casa"
+    assert "bright" in filters["traits"]
+
+    filters, place, _source = filters_for_query("ciudad de rawson", city="caba")
+    assert place["id"] == "rawson-chubut"
+    assert filters["cityFilter"] == "rawson-chubut"

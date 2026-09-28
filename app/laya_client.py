@@ -160,6 +160,27 @@ _agent: Any | None = None
 _agent_kind = ""
 _agent_model = ""
 _agent_failed = False
+_busy_depth = 0
+_busy_since = 0.0
+
+
+def laya_busy() -> bool:
+    """True mientras carga o responde. El watchdog no mata el proceso en esa ventana."""
+    if _busy_depth <= 0 or not _busy_since:
+        return False
+    return (time.time() - _busy_since) < 180.0
+
+
+def _set_busy(on: bool) -> None:
+    global _busy_depth, _busy_since
+    if on:
+        if _busy_depth == 0:
+            _busy_since = time.time()
+        _busy_depth += 1
+        return
+    _busy_depth = max(0, _busy_depth - 1)
+    if _busy_depth == 0:
+        _busy_since = 0.0
 
 
 @dataclass(slots=True)
@@ -185,15 +206,26 @@ def _systemone_endpoint() -> str:
 
 
 def _load_backend() -> tuple[str, Any, str] | None:
-    endpoint = _systemone_endpoint()
-    if endpoint:
-        return "http", endpoint, "systemone"
+    # El modelo local (convaiinnovations/laya) responde en español. El HTTP
+    # de Jev queda solo si el paquete no está instalado.
     os.environ.setdefault("USE_TF", "0")
     if LAYA_CACHE_DIR:
         os.environ.setdefault("HF_HOME", LAYA_CACHE_DIR)
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", LAYA_CACHE_DIR)
-    import laya
+    try:
+        import laya
+    except ImportError:
+        logger.info("El paquete laya no está instalado; uso el HTTP de Jev si está configurado")
+        return _load_http_backend()
 
+    try:
+        return _load_local(laya)
+    except Exception:
+        logger.exception("No pude cargar el modelo local de Laya")
+        return _load_http_backend()
+
+
+def _load_local(laya: Any) -> tuple[str, Any, str]:
     wanted = (LAYA_MODEL or "multilingual").strip()
     alias = {
         "multilingual": "multilingual",
@@ -234,6 +266,13 @@ def _load_backend() -> tuple[str, Any, str] | None:
     return "agent", agent, route or wanted
 
 
+def _load_http_backend() -> tuple[str, Any, str] | None:
+    endpoint = _systemone_endpoint()
+    if not endpoint:
+        return None
+    return "http", endpoint, "systemone"
+
+
 def _ensure_agent() -> tuple[str, Any, str] | None:
     global _agent, _agent_kind, _agent_model, _agent_failed
     if _testing() or _agent_failed:
@@ -246,7 +285,7 @@ def _ensure_agent() -> tuple[str, Any, str] | None:
         if _agent_failed:
             return None
         try:
-            logger.info("Cargando decisiones tipadas (%s)", LAYA_MODEL if not _systemone_endpoint() else "systemone")
+            logger.info("Cargando Laya (%s)", LAYA_MODEL or "multilingual")
             t0 = time.time()
             loaded = _load_backend()
             if not loaded:
@@ -351,10 +390,11 @@ def decide_questions(state: Any, questions: dict[str, dict[str, Any]]) -> list[L
         return []
     if _testing():
         return []
-    backend = _ensure_agent()
-    if backend is None:
-        return []
+    _set_busy(True)
     try:
+        backend = _ensure_agent()
+        if backend is None:
+            return []
         t0 = time.time()
         result = _run_predict(backend, state, questions)
         elapsed = (time.time() - t0) * 1000
@@ -363,6 +403,8 @@ def decide_questions(state: Any, questions: dict[str, dict[str, Any]]) -> list[L
     except Exception as exc:
         logger.warning("Laya no respondió (%s); sigo sin esas decisiones", exc)
         return []
+    finally:
+        _set_busy(False)
 
 
 def decide(state: Any, question_keys: list[str] | None = None) -> list[LayaDecision]:

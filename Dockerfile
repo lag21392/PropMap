@@ -17,8 +17,9 @@ COPY requirements.txt pyproject.toml ./
 RUN python -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV UV_TORCH_BACKEND=cpu
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python /opt/venv/bin/python -r requirements.txt
+    uv pip install --python /opt/venv/bin/python --torch-backend cpu -r requirements.txt
 
 FROM python:3.12-slim-bookworm AS runtime
 

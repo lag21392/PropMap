@@ -62,9 +62,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui140" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui145" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui140" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui145" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="all" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -72,8 +72,8 @@
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
-  <link rel="stylesheet" href="/static/css/tokens.css?v=ui140" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui140" />
+  <link rel="stylesheet" href="/static/css/tokens.css?v=ui145" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui145" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -86,7 +86,10 @@
       <span class="sr-only">Buscar avisos</span>
       <input id="freeTextSearch" type="search" placeholder="casa luminosa con patio en Palermo, 3 dormitorios, hasta 200 mil" autocomplete="off" spellcheck="false" />
     </label>
-    <button type="submit" id="freeTextGo" class="primary">Buscar</button>
+    <button type="submit" id="freeTextGo" class="primary search-go" aria-label="Buscar">
+      <svg class="search-go-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M16 16.5 20 20.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span class="search-go-label">Buscar</span>
+    </button>
     <button type="button" class="theme-toggle" id="themeToggle" title="Cambiar a modo oscuro" aria-label="Cambiar a modo oscuro">
       <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 3.2a8.8 8.8 0 1 0 6.3 14.6A8.2 8.2 0 0 1 14.5 3.2Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
       <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -588,9 +591,9 @@
   <script defer src="/static/vendor/leaflet/leaflet.js"></script>
   <script defer src="/static/vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
   <script defer src="/static/vendor/leaflet-heat/leaflet-heat.js"></script>
-  <script type="module" src="/static/parse-free-text.js?v=ui140"></script>
+  <script type="module" src="/static/parse-free-text.js?v=ui145"></script>
   <script type="module" src="/static/filter-presets.js?v=ui115"></script>
-  <script type="module" src="/static/comparator.js?v=ui140"></script>
-  <script defer src="/static/app.js?v=ui140"></script>
+  <script type="module" src="/static/comparator.js?v=ui145"></script>
+  <script defer src="/static/app.js?v=ui145"></script>
 </body>
 </html>

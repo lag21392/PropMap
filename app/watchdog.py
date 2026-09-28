@@ -114,6 +114,10 @@ def _stuck_reason() -> str:
     # cities_loading() no debe esperar el candado: si está tomado, ping_lock decide.
     if listings_cache.busy_building() or listings_cache.cities_loading():
         return ""
+    from .laya_client import laya_busy
+
+    if laya_busy():
+        return ""
     if not pipeline.ping_lock(LOCK_WAIT_SEC):
         return "candado del pipeline"
     if not listings_cache.ping_lock(LOCK_WAIT_SEC):

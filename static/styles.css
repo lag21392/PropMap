@@ -51,8 +51,8 @@ body {
   gap: 12px;
 }
 .search-logo .logo-word {
-  font-size: 16px;
-  letter-spacing: 0.14em;
+  font-size: 15px;
+  letter-spacing: 0.08em;
 }
 .search-logo .logo-mark {
   width: 36px;
@@ -88,6 +88,7 @@ body {
   padding: 10px 18px;
   border-radius: 999px;
 }
+.search-go-icon { display: none; }
 .search-strip .theme-toggle {
   width: 40px;
   height: 40px;
@@ -1995,8 +1996,13 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 }
 .deal-block input[type="range"] {
   width: 100%;
+  height: 32px;
   margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
   accent-color: var(--deal);
+  touch-action: pan-x;
 }
 .deal-track {
   height: 8px;
@@ -2105,7 +2111,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   }
   .panel, .list-rail, .map-wrap, .detail {
     position: fixed;
-    inset: 76px 10px calc(var(--dock) + 12px) 10px;
+    inset: var(--pane-top, 68px) 10px calc(var(--dock) + 12px) 10px;
     width: auto;
     height: auto;
     z-index: 1;
@@ -2141,13 +2147,59 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   body.tab-detail .detail { display: block; }
   body.tab-map .map-wrap { display: block; }
   body.tab-detail .detail.is-empty { display: flex; }
+  .panel,
+  .list-rail { overflow: hidden; }
+  .panel::before,
+  .list-rail::before,
+  .detail::before {
+    content: "";
+    width: 42px;
+    height: 5px;
+    border-radius: 99px;
+    background: var(--line);
+    flex: 0 0 auto;
+  }
+  .panel::before,
+  .list-rail::before {
+    display: block;
+    margin: 0 auto 10px;
+  }
+  .detail::before {
+    display: block;
+    position: sticky;
+    top: 6px;
+    margin: 0 auto 8px;
+    z-index: 2;
+  }
+  .panel-scroll,
+  .list-rail .list,
+  .detail {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
   .detail { box-shadow: none; border-left: 0; }
   .map-legend { display: none; }
   .map-hint { display: none; }
-  .search-strip { padding-left: 14px; }
-  .search-logo { margin-left: 0; gap: 8px; }
-  .search-logo .logo-word { font-size: 13px; letter-spacing: 0.12em; }
-  .search-logo .logo-mark { width: 30px; height: 30px; border-radius: 8px; }
+  .search-strip {
+    flex-wrap: nowrap;
+    gap: 6px;
+    padding: 6px 6px 6px 12px;
+  }
+  .search-strip input { font-size: 14px; padding: 6px 2px; }
+  .search-strip .primary { flex: 0 0 auto; padding: 8px 12px; }
+  .search-go-icon { display: block; width: 18px; height: 18px; }
+  .search-go-label { display: none; }
+  .search-strip .search-go {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    display: grid;
+    place-items: center;
+  }
+  .search-logo { margin-left: 0; gap: 6px; padding-right: 0; }
+  .search-logo .logo-word { font-size: 12px; letter-spacing: 0.08em; }
+  .search-logo .logo-mark { width: 26px; height: 26px; border-radius: 8px; }
+  .search-strip .theme-toggle { width: 34px; height: 34px; }
   .map-legal { bottom: 6px; left: 8px; right: 8px; max-width: none; }
   .map-account {
     display: inline-flex;
@@ -2257,6 +2309,26 @@ button {
   box-shadow: 0 0 0 4px rgba(61, 111, 138, 0.12);
 }
 .prop-pin span { box-shadow: 0 0 0 2px rgba(251, 252, 249, 0.95); }
+.leaflet-container .leaflet-div-icon.prop-pin,
+.leaflet-container .leaflet-div-icon.zone-pin,
+.leaflet-container .leaflet-div-icon.pin-hub {
+  background: transparent;
+  border: 0;
+}
+.prop-pin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.prop-pin.square span {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(251, 252, 249, 0.95);
+}
+.zone-pin.approx span {
+  box-shadow: none;
+}
 .pin-hub span {
   background: var(--teal);
   box-shadow: 0 0 0 2px rgba(251, 252, 249, 0.95);
@@ -3294,6 +3366,30 @@ button, .info-btn {
 }
 .compare-col .meta { color: var(--muted); font-size: 12px; }
 .compare-col a { font-size: 13px; }
+
+@media (max-width: 980px) {
+  .compare-dialog {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+    margin: auto;
+  }
+  .compare-dialog form {
+    max-height: calc(100dvh - 16px);
+    padding: 12px;
+    overflow: hidden;
+  }
+  .compare-scroll {
+    max-height: calc(100dvh - 96px);
+    touch-action: pan-x pan-y;
+    -webkit-overflow-scrolling: touch;
+  }
+  .compare-head h2 { font-size: 17px; }
+  .compare-table thead th { min-width: 132px; }
+  .compare-table thead th:first-child,
+  .compare-table tbody th { min-width: 96px; }
+  .compare-dock { margin: 8px 12px 4px 0; }
+}
 
 @media (min-width: 981px) {
   .shell {

@@ -174,13 +174,24 @@ def _one_or_many(values: list[str]):
     return values
 
 
+def _word_forms(word: str) -> set[str]:
+    forms = {word}
+    if len(word) >= 5 and word.endswith("o") and word not in _NO_GENDER:
+        stem = word[:-1]
+        forms.update({stem + "a", word + "s", stem + "as"})
+    return forms
+
+
 def find_traits(text: str) -> list[str]:
-    """Encuentra traits en el texto."""
+    """Encuentra traits en el texto. Acepta el adjetivo en femenino: luminosa."""
     found = set()
     for trait in TRAIT_MAP:
+        keys: list[str] = []
         for key in trait["keys"]:
-            pattern = r"\b" + re.escape(key) + r"\b"
-            if re.search(pattern, text):
+            for part in normalize(key).split():
+                keys.extend(_word_forms(part))
+        for key in keys:
+            if re.search(rf"\b{re.escape(key)}\b", text):
                 found.add(trait["value"])
                 break
     return list(found)
@@ -360,6 +371,11 @@ _SKIP_PLACE = set(TYPE_MAP) | {
     "dormitorio", "dormitorios", "ambiente", "ambientes", "bano", "banos",
     "hasta", "desde", "usd", "ars", "patio", "jardin", "cochera", "balcon",
     "luminoso", "terraza", "credito", "urgente",
+}
+_NO_GENDER = {"patio", "credito", "balcon", "galpon", "jardin", "cochera", "terraza", "garage", "garaje"}
+_GENERIC_PLACE = {
+    "puerto", "villa", "san", "santa", "santo", "general", "rio", "bahia",
+    "ciudad", "localidad", "provincia", "norte", "sur", "este", "oeste", "centro",
 }
 
 SEARCH_QUESTIONS: dict[str, dict] = {
@@ -620,26 +636,47 @@ def mentioned_place(query: str) -> dict | None:
     }
 
 
-_PLACE_STOP = _SKIP_PLACE | {
+def _place_stop_words() -> set[str]:
+    words = set(_PLACE_STOP_BASE)
+    for trait in TRAIT_MAP:
+        for key in trait["keys"]:
+            for part in normalize(key).split():
+                words |= _word_forms(part)
+    return words
+
+
+_PLACE_STOP_BASE = _SKIP_PLACE | {
     "en", "con", "de", "del", "la", "el", "los", "las", "y", "por", "para",
-    "hasta", "desde", "usd", "ars", "m2", "metros", "metro",
+    "hasta", "desde", "usd", "ars", "m2", "metros", "metro", "mil", "miles",
     "dormitorio", "dormitorios", "habitacion", "habitaciones",
     "ambiente", "ambientes", "bano", "banos",
+    "ciudad", "localidad", "provincia",
 }
 
 
 def _place_phrase(query: str) -> str:
     """Lo que queda del texto cuando se sacan números y palabras de filtro."""
+    stop = _place_stop_words()
     kept: list[str] = []
     for word in normalize(query).split():
-        if word in _PLACE_STOP or re.fullmatch(r"\d+[kmb]?", word):
-            if kept:
-                break
+        if word in stop or re.fullmatch(r"\d+[kmb]?", word):
             continue
         kept.append(word)
         if len(kept) == 4:
             break
     return " ".join(kept)
+
+
+def _place_candidates(query: str) -> list[str]:
+    """Frases de lugar, de la más larga a la última palabra. «ciudad de rawson» queda en rawson."""
+    phrase = _place_phrase(query)
+    parts = phrase.split()
+    out: list[str] = []
+    for size in range(len(parts), 0, -1):
+        tail = " ".join(parts[-size:])
+        if tail and tail not in out:
+            out.append(tail)
+    return out
 
 
 def _city_for_point(lat: float, lon: float) -> dict | None:
@@ -714,12 +751,68 @@ def resolve_named_place(phrase: str) -> dict | None:
     }
 
 
+def _catalog_place(phrase: str) -> dict | None:
+    """Ciudad ya cargada cuyo nombre contiene la frase. «madryn» encuentra Puerto Madryn."""
+    from .places import CITIES, fold, is_cache_artifact_id, _name_hit
+
+    folded = fold(normalize(phrase))
+    if len(folded) < 4 or folded in _GENERIC_PLACE:
+        return None
+    listed: set[str] = set()
+    try:
+        from .listings_cache import cached_city_ids
+
+        listed = set(cached_city_ids())
+    except Exception:
+        listed = set()
+    best = None
+    best_rank = None
+    for city_id, cfg in CITIES.items():
+        if is_cache_artifact_id(city_id):
+            continue
+        names = [str(cfg.get("label") or ""), str(city_id), *[str(item) for item in (cfg.get("aliases") or [])]]
+        names = [name for name in names if name]
+        if not names or not _name_hit(folded, names):
+            continue
+        label = fold(str(cfg.get("label") or city_id)).replace("-", " ")
+        exact = 0 if label == folded else 1
+        on_menu = 0 if city_id in listed else 1
+        rank = (exact, on_menu, len(label))
+        if best_rank is None or rank < best_rank:
+            best = cfg
+            best_rank = rank
+    if not best:
+        return None
+    return {
+        "id": best["id"],
+        "label": str(best.get("label") or best["id"]),
+        "lat": best.get("lat"),
+        "lon": best.get("lon"),
+        "province": best.get("province") or "",
+        "zoom": best.get("zoom") or 13,
+        "barrio": "",
+    }
+
+
 def resolve_place(query: str) -> dict | None:
     """Catálogo si el nombre ya está cargado; si no, Georef/Nominatim y la ciudad que contiene el punto."""
+    phrases = _place_candidates(query)
+    for phrase in phrases:
+        found = _catalog_place(phrase)
+        if found:
+            return found
     hit = mentioned_place(query)
     if hit:
         return hit
-    return resolve_named_place(_place_phrase(query))
+    if re.search(r"\bzona\b", normalize(query)):
+        return None
+    for phrase in phrases:
+        if " " not in phrase and phrase in _GENERIC_PLACE:
+            continue
+        found = resolve_named_place(phrase)
+        if found and (found.get("id") or found.get("lat") is not None):
+            return found
+    return None
 
 
 def _apply_monoambiente(query: str, base: dict) -> dict:

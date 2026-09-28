@@ -593,7 +593,7 @@ async function loadCardPages(city, seq) {
       fillBarrios();
     }
     refreshList({
-      map: mapPaintKey ? false : !pinsSettled,
+      map: frameAfterListings ? "now" : (mapPaintKey ? false : !pinsSettled),
       forceList: page === 0 || !data.more,
     });
     const total = Number(data.total || allListings.length);
@@ -1860,7 +1860,15 @@ function paintMapMarkers(items) {
     zoneLayer.addLayer(marker);
   });
   mapPaintKey = key;
+  refreshMarkerLayout();
   markClient("paintMap", performance.now() - t0, { n: items.length });
+}
+
+function refreshMarkerLayout() {
+  if (!map) return;
+  const size = map.getSize();
+  if (!size || size.x < 40 || size.y < 40) map.invalidateSize({ pan: false });
+  if (exactCluster && typeof exactCluster.refreshClusters === "function") exactCluster.refreshClusters();
 }
 
 // Heatmap functions
@@ -3740,7 +3748,9 @@ function flyToPins(items, place) {
     const pad = [56, 56];
     const fly = { duration: 2.1, easeLinearity: 0.16 };
     const settle = () => {
-      if (token !== earthZoomToken || !points.length) return;
+      if (token !== earthZoomToken) return;
+      refreshMarkerLayout();
+      if (!points.length) return;
       if (points.length === 1) {
         map.setView(points[0], 15, { animate: false });
         return;
@@ -4094,6 +4104,176 @@ try {
 document.querySelectorAll(".dock [data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => setTab(btn.dataset.tab));
 });
+
+function bindPaneSwipe() {
+  const order = ["map", "list", "detail", "market"];
+  const phone = window.matchMedia("(max-width: 980px)");
+  const calm = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let drag = null;
+
+  function tabNow() {
+    return order.find((tab) => document.body.classList.contains(`tab-${tab}`)) || "map";
+  }
+  function pane(tab) {
+    return document.querySelector(`[data-pane="${tab}"]`);
+  }
+  function scroller(el) {
+    if (!el) return null;
+    if (el.dataset.pane === "list") return el.querySelector(".list") || el;
+    if (el.dataset.pane === "market") return el.querySelector(".panel-scroll") || el;
+    return el;
+  }
+  function reveal(el, tab) {
+    if (!el) return;
+    el.style.display = tab === "detail" || tab === "map" ? "block" : "flex";
+    if (tab === "map") requestAnimationFrame(() => map.invalidateSize());
+  }
+  function clearPane(el) {
+    if (!el) return;
+    el.style.transition = "";
+    el.style.transform = "";
+    el.style.zIndex = "";
+    el.style.display = "";
+  }
+
+  document.addEventListener("touchstart", (ev) => {
+    if (!phone.matches || drag || ev.touches.length !== 1) return;
+    const target = ev.target;
+    if (target.closest("button, input, textarea, select, a, .deal-block, .cmp-btn, .fav-btn, .compare-dock, .compare-dialog, .multi.is-open, .multi-menu, .leaflet-container, .dock, .search-strip")) return;
+    const tab = tabNow();
+    const current = pane(tab);
+    if (!current || tab === "map" || !current.contains(target)) return;
+    const touch = ev.touches[0];
+    const box = scroller(current);
+    const inScroll = box && box.contains(target);
+    drag = {
+      x: touch.clientX,
+      y: touch.clientY,
+      dx: 0,
+      dy: 0,
+      mode: "",
+      tab,
+      pane: current,
+      scrollTop: inScroll ? box.scrollTop : 0,
+      neighbor: null,
+      under: null,
+    };
+  }, { passive: true });
+
+  document.addEventListener("touchmove", (ev) => {
+    if (!drag || ev.touches.length !== 1) return;
+    const touch = ev.touches[0];
+    drag.dx = touch.clientX - drag.x;
+    drag.dy = touch.clientY - drag.y;
+    if (!drag.mode) {
+      if (Math.abs(drag.dx) < 12 && Math.abs(drag.dy) < 12) return;
+      if (Math.abs(drag.dx) > Math.abs(drag.dy) + 6) drag.mode = "x";
+      else if (drag.dy > 0 && drag.scrollTop <= 1) drag.mode = "y";
+      else drag.mode = "scroll";
+    }
+    if (drag.mode === "scroll") return;
+    ev.preventDefault();
+    const w = drag.pane.getBoundingClientRect().width || 1;
+    drag.pane.style.transition = "none";
+    drag.pane.style.zIndex = "3";
+    if (drag.mode === "x") {
+      const idx = order.indexOf(drag.tab);
+      const dir = drag.dx < 0 ? 1 : -1;
+      const nextTab = order[idx + dir];
+      const next = nextTab ? pane(nextTab) : null;
+      if (drag.neighbor && drag.neighbor !== next) clearPane(drag.neighbor);
+      drag.neighbor = next;
+      const dx = next ? drag.dx : drag.dx * 0.22;
+      drag.pane.style.transform = `translate3d(${dx}px,0,0)`;
+      if (next) {
+        reveal(next, nextTab);
+        next.style.zIndex = "2";
+        next.style.transition = "none";
+        next.style.transform = `translate3d(${dx + dir * w}px,0,0)`;
+      }
+      return;
+    }
+    const mapPane = pane("map");
+    if (mapPane) {
+      reveal(mapPane, "map");
+      mapPane.style.zIndex = "1";
+      drag.under = mapPane;
+    }
+    drag.pane.style.transform = `translate3d(0,${Math.max(0, drag.dy)}px,0)`;
+  }, { passive: false });
+
+  function finish(ev) {
+    if (!drag) return;
+    const state = drag;
+    drag = null;
+    if (state.mode !== "x" && state.mode !== "y") {
+      clearPane(state.pane);
+      clearPane(state.neighbor);
+      clearPane(state.under);
+      return;
+    }
+    const w = state.pane.getBoundingClientRect().width || 1;
+    const h = state.pane.getBoundingClientRect().height || 1;
+    const commitX = state.mode === "x" && Math.abs(state.dx) > 64 && state.neighbor;
+    const commitY = state.mode === "y" && state.dy > 88;
+    const moved = Math.abs(state.dx) > 10 || Math.abs(state.dy) > 10;
+    if (moved) {
+      const stopClick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
+      document.addEventListener("click", stopClick, { capture: true, once: true });
+    }
+    const ms = calm.matches ? 0 : 220;
+    const ease = "transform 220ms cubic-bezier(0.16, 1, 0.3, 1)";
+    state.pane.style.transition = calm.matches ? "none" : ease;
+    if (state.neighbor) state.neighbor.style.transition = calm.matches ? "none" : ease;
+    if (commitX) {
+      const dir = state.dx < 0 ? 1 : -1;
+      state.pane.style.transform = `translate3d(${-dir * w}px,0,0)`;
+      state.neighbor.style.transform = "translate3d(0,0,0)";
+    } else if (commitY) {
+      state.pane.style.transform = `translate3d(0,${h}px,0)`;
+    } else {
+      state.pane.style.transform = "translate3d(0,0,0)";
+      if (state.neighbor) {
+        const dir = state.dx < 0 ? 1 : -1;
+        state.neighbor.style.transform = `translate3d(${dir * w}px,0,0)`;
+      }
+    }
+    window.setTimeout(() => {
+      const next = commitX ? state.neighbor.dataset.pane : commitY ? "map" : "";
+      clearPane(state.pane);
+      clearPane(state.neighbor);
+      clearPane(state.under);
+      if (next) setTab(next);
+    }, ms);
+    if (ev && ev.cancelable) ev.preventDefault();
+  }
+
+  document.addEventListener("touchend", finish);
+  document.addEventListener("touchcancel", () => finish());
+}
+bindPaneSwipe();
+
+function fitMobileChrome() {
+  const strip = document.querySelector(".search-strip");
+  if (!strip) return;
+  const phone = window.matchMedia("(max-width: 980px)").matches;
+  if (!phone) {
+    document.documentElement.style.removeProperty("--pane-top");
+    return;
+  }
+  const top = Math.ceil(strip.getBoundingClientRect().bottom + 8);
+  document.documentElement.style.setProperty("--pane-top", `${top}px`);
+  if (document.body.classList.contains("tab-map")) map.invalidateSize();
+}
+const searchStrip = document.querySelector(".search-strip");
+if (searchStrip && "ResizeObserver" in window) {
+  new ResizeObserver(() => fitMobileChrome()).observe(searchStrip);
+}
+window.addEventListener("resize", fitMobileChrome);
+fitMobileChrome();
 const startTab = new URL(location.href).searchParams.get("tab");
 if (startTab) setTab(startTab, false);
 
@@ -4750,8 +4930,7 @@ function switchToLoadedCity(place) {
   pickedPlace = placeFromCityFilter() || place;
   rememberCityView(pickedPlace);
   focusedCity = place.id;
-  focusCity(place.id);
-  return true;
+  return false;
 }
 
 async function runFreeTextSearch() {
@@ -4762,7 +4941,9 @@ async function runFreeTextSearch() {
   const previousCity = $("cityFilter")?.value || "";
   if (button) {
     button.disabled = true;
-    button.textContent = "Buscando";
+    button.setAttribute("aria-label", "Buscando");
+    const label = button.querySelector(".search-go-label");
+    if (label) label.textContent = "Buscando";
   }
   try {
     const res = await fetch("/api/free-text-search", {
@@ -4803,9 +4984,12 @@ async function runFreeTextSearch() {
     if (!switched) {
       if (listingsReady && typeof render === "function") render();
       else flyToPins(typeof filtered === "function" ? sorted(filtered()) : [], place);
-    } else if (place && place.lat != null && place.lon != null) {
-      flyToPins([], place);
+    } else {
       frameAfterListings = true;
+      if (window.innerWidth <= 980) setTab("map");
+      requestAnimationFrame(() => {
+        if (map) map.invalidateSize();
+      });
     }
     openPriceAnalysis();
     if (typeof loadMarket === "function") loadMarket(true);
@@ -4824,7 +5008,9 @@ async function runFreeTextSearch() {
     applyingFreeText = false;
     if (button) {
       button.disabled = false;
-      button.textContent = "Buscar";
+      button.setAttribute("aria-label", "Buscar");
+      const label = button.querySelector(".search-go-label");
+      if (label) label.textContent = "Buscar";
     }
   }
 }
