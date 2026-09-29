@@ -21,6 +21,7 @@ html { color-scheme: light; }
 body {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   font-family: "Atkinson Hyperlegible", system-ui, sans-serif;
   background: var(--bg);
   color: var(--ink);
@@ -117,9 +118,11 @@ h1, h2 {
 .shell {
   display: grid;
   grid-template-columns: minmax(280px, 340px) minmax(260px, 320px) 1fr minmax(300px, 380px);
+  grid-template-rows: minmax(0, 1fr);
   flex: 1 1 auto;
   height: auto;
   min-height: 0;
+  overflow: hidden;
 }
 .panel {
   display: flex;
@@ -1729,9 +1732,13 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
 .tag.quality { background: rgba(46, 196, 182, 0.12); color: var(--teal); }
 .detail {
   margin-top: 0;
+  display: flex;
+  flex-direction: column;
   height: 100%;
-  overflow: auto;
-  padding: 16px 12px 32px 16px;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
+  padding: 0;
   scrollbar-width: thin;
   scrollbar-gutter: stable;
   scrollbar-color: var(--line) transparent;
@@ -1741,6 +1748,17 @@ dialog::backdrop { background: rgba(0,0,0,0.55); }
     radial-gradient(700px 240px at 100% -10%, rgba(46, 196, 182, 0.12), transparent 55%),
     var(--panel);
   font-size: 13px;
+}
+.detail-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px 12px 32px 16px;
+  scrollbar-width: thin;
+  scrollbar-gutter: stable;
+  scrollbar-color: var(--line) transparent;
 }
 .detail.is-empty {
   display: flex;
@@ -3402,6 +3420,11 @@ button, .info-btn {
   .detail {
     border: 1px solid var(--line);
     border-radius: 22px;
+  }
+  .panel,
+  .list-rail,
+  .map-wrap,
+  .detail {
     overflow: hidden;
   }
   .leaflet-bar {

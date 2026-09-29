@@ -2749,6 +2749,7 @@ function showDetail(item) {
     `<span class="kind ${cls}">${escapeHtml(label)}</span>`
   )).join("");
   pane.innerHTML = `
+    <div class="detail-body">
     <button type="button" class="ghost detail-close" id="closeDetail">cerrar</button>
     <div class="detail-head">
       <div class="detail-kicker">
@@ -2802,7 +2803,10 @@ function showDetail(item) {
     </form>
     </details>
     ` : ""}
+    </div>
   `;
+  const body = pane.querySelector(".detail-body");
+  if (body) body.scrollTop = 0;
   $("closeDetail")?.addEventListener("click", closeDetail);
   pane.querySelectorAll(".detail-film button").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -3164,13 +3168,22 @@ function renderMarket(data) {
 
 async function fillPriceTrack(item) {
   const box = $("priceTrack");
-  if (!box) return;
+  if (!box || !item?.id) return;
+  const id = item.id;
   let data;
   try {
-    data = await (await fetch(`/api/listing-history?id=${encodeURIComponent(item.id)}`)).json();
+    const res = await fetch(`/api/listing-history?id=${encodeURIComponent(id)}`);
+    if (!res.ok) throw new Error(String(res.status));
+    data = await res.json();
   } catch {
+    const current = $("priceTrack");
+    if (current && selectedId === id) {
+      current.innerHTML = `<p class="muted">No pude cargar el historial de precio.</p>`;
+    }
     return;
   }
+  const current = $("priceTrack");
+  if (selectedId !== id || !current) return;
   const points = data.points || [];
   const usable = points.filter((p) => p.price_usd && !p.outlier);
   const chart = sparkline((usable.length ? usable : points).map((p) => p.price_usd), { upIsBad: true });
@@ -3186,7 +3199,7 @@ async function fillPriceTrack(item) {
       ? "Hay un precio disparatado en el historial; no lo usamos para la variación."
       : "Un solo registro por ahora.")
     : `Variación desde el primer dato: ${data.change_pct > 0 ? "+" : ""}${String(data.change_pct).replace(".", ",")}%.`;
-  box.innerHTML = `
+  current.innerHTML = `
     <h4>Seguimiento de precio</h4>
     <p class="muted">${change}</p>
     <div class="market-chart">${chart}</div>
