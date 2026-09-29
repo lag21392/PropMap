@@ -523,6 +523,7 @@ _poi_seen: set[str] = set()
 _poi_started = False
 _synced_cities: set[str] = set()
 _sync_lock = threading.Lock()
+_poi_publish_lock = threading.Lock()
 POI_BATCH = 8
 
 
@@ -598,9 +599,22 @@ def enqueue_poi_score(items: Listing | list[Listing] | None) -> None:
 
 
 def publish_known_poi_scores(prefer_city: str = "") -> int:
-    """Trae a la lista los scores que ya están en la base y el snap no muestra."""
+    """Trae a la lista los scores que ya están en la base y el snap no muestra.
+
+    Una ciudad por llamada: el planificador y el backfill no se quedan
+    escaneando todas las fichas antes de arrancar el scraping.
+    """
     if os.environ.get("PROPMAP_TEST") == "1":
         return 0
+    if not _poi_publish_lock.acquire(blocking=False):
+        return 0
+    try:
+        return _publish_one_city_poi_scores(prefer_city)
+    finally:
+        _poi_publish_lock.release()
+
+
+def _publish_one_city_poi_scores(prefer_city: str) -> int:
     from . import store
     from .geo import DEFAULT_CITY, same_place_ids
     from .listings_cache import cached_city_ids, remember_poi_axes, schedule_pin_flush
@@ -611,7 +625,6 @@ def publish_known_poi_scores(prefer_city: str = "") -> int:
         if not token or token in cities or token in {"fuera", "otros", "argentina"}:
             continue
         cities.append(token)
-    total = 0
     for cid in cities:
         with _sync_lock:
             if cid in _synced_cities:
@@ -621,14 +634,16 @@ def publish_known_poi_scores(prefer_city: str = "") -> int:
             axes = store.poi_axes_for_cities(wanted or [cid])
         except Exception:
             log.exception("no pude leer scores de POIs de %s", cid)
-            continue
+            with _sync_lock:
+                _synced_cities.add(cid)
+            return 0
         with _sync_lock:
             _synced_cities.add(cid)
         if axes:
             remember_poi_axes(axes)
-            total += len(axes)
         schedule_pin_flush(cid)
-    return total
+        return len(axes)
+    return 0
 
 
 def refill_poi(prefer_city: str = "") -> int:

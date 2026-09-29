@@ -879,6 +879,8 @@ def poi_axes_for_cities(cities: list[str]) -> dict[str, dict[str, Any]]:
     if not wanted:
         return {}
     marks = ",".join("?" * len(wanted))
+    # Por páginas: un solo SELECT de json_extract sobre Capital (miles de fichas)
+    # deja el snapshot abierto y el checkpoint de WAL traba los upsert del LLM.
     sql = f"""
         SELECT id,
                json_extract(extra_json, '$.profile.axes.servicios.score') AS score,
@@ -887,16 +889,27 @@ def poi_axes_for_cities(cities: list[str]) -> dict[str, dict[str, Any]]:
         FROM listings
         WHERE city IN ({marks})
           AND IFNULL(is_hidden, 0) = 0
+          AND id > ?
           AND json_extract(extra_json, '$.profile.axes.servicios.score') IS NOT NULL
+        ORDER BY id
+        LIMIT 400
     """
     out: dict[str, dict[str, Any]] = {}
-    with connect() as conn:
-        for row in conn.execute(sql, tuple(wanted)):
+    last = ""
+    while True:
+        with connect() as conn:
+            rows = list(conn.execute(sql, (*wanted, last)).fetchall())
+        if not rows:
+            break
+        for row in rows:
             out[row["id"]] = {
                 "score": row["score"],
                 "confidence": row["confidence"] or "high",
                 "note": row["note"] or "",
             }
+        last = row["id"]
+        if len(rows) < 400:
+            break
     return out
 
 

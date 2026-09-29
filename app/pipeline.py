@@ -1256,7 +1256,8 @@ def maybe_daily_refresh() -> None:
     store.init()
     load_custom_places()
     running = _running_ids()
-    _tick_background_upkeep(running)
+    # El mantenimiento (POIs, geo) no puede ir antes: un scan largo de la base
+    # deja el hilo diario ahí y la ciudad que toca no arranca.
     if crawl.aborted() and not running:
         return
     from .schedule import home_scrape_id, next_jobs

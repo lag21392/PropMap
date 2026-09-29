@@ -235,6 +235,8 @@ function clearLoadedListings() {
   markersById = {};
   zoneMarkersByKey = {};
   stackMarkers = [];
+  const list = $("list");
+  if (list) list.scrollTop = 0;
   if (approxBox) {
     map.removeLayer(approxBox);
     approxBox = null;
@@ -1702,7 +1704,11 @@ function paintListWindow(force = false) {
     }
     return;
   }
-  const start = Math.max(0, Math.floor(list.scrollTop / h) - 2);
+  let start = Math.max(0, Math.floor(list.scrollTop / h) - 2);
+  if (start >= items.length) {
+    list.scrollTop = 0;
+    start = 0;
+  }
   const end = Math.min(items.length, start + Math.ceil(view / h) + 4);
   const key = `${start}:${end}:${items.length}:${scrapeRunning}:${selectedId}`;
   if (!force && key === listWinRange && list.querySelector(".card")) return;
@@ -2396,9 +2402,9 @@ function compareIcon() {
 }
 
 function cardHtml(item) {
-  const img = listingImage(item.image, "thumb");
+  const img = listingImage((photoSet(item)[0] || ""), "thumb");
   const thumb = img
-    ? `<img src="${img}" alt="${escapeHtml(item.title || "Aviso en venta")}" width="104" height="112" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`
+    ? `<img src="${img}" alt="${escapeHtml(item.title || "Aviso en venta")}" width="104" height="112" decoding="async" referrerpolicy="no-referrer" />`
     : `<span class="card-ph" aria-hidden="true"></span>`;
   const kind = typeLabel(item);
   const bits = sizeBits(item);
@@ -3273,6 +3279,20 @@ function reportPhotoMiss(img) {
 document.addEventListener("error", (ev) => {
   const img = ev.target;
   if (!(img instanceof HTMLImageElement)) return;
+  if (!img.isConnected) return;
+  const src = img.currentSrc || img.src || "";
+  if (!src || src.startsWith("data:")) return;
+  // Al cambiar de ciudad la lista se redibuja y el navegador aborta la carga
+  // anterior. Ese error no es una foto caída: reintentar una vez.
+  if (img.dataset.photoTry !== "1") {
+    img.dataset.photoTry = "1";
+    requestAnimationFrame(() => {
+      if (!img.isConnected || img.naturalWidth > 0) return;
+      img.removeAttribute("src");
+      img.src = src;
+    });
+    return;
+  }
   reportPhotoMiss(img);
   if (img.classList.contains("detail-hero")) {
     img.closest(".detail-photos")?.remove();
