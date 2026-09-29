@@ -648,25 +648,31 @@ def _place_stop_words() -> set[str]:
 
 
 _PLACE_STOP_BASE = _SKIP_PLACE | {
-    "en", "con", "de", "del", "la", "el", "los", "las", "y", "por", "para",
+    "en", "con", "de", "del", "la", "el", "los", "las", "y", "o", "u", "ni", "por", "para",
     "a", "al", "hasta", "desde", "menos", "mas", "bajo", "sobre",
     "usd", "ars", "m2", "metros", "metro", "mil", "miles",
     "dormitorio", "dormitorios", "habitacion", "habitaciones",
     "ambiente", "ambientes", "bano", "banos",
     "ciudad", "localidad", "provincia",
 }
+_DESTINATION_KINDS = {"localidad", "municipio", "city", "town"}
+_PUBLIC_PLACE_KEYS = ("id", "label", "lat", "lon", "province", "zoom", "hint", "province_label")
 
 
 def _place_phrase(query: str) -> str:
-    """Lo que queda del texto cuando se sacan números y palabras de filtro."""
+    """Lo que queda del texto cuando se sacan números y palabras de filtro.
+
+    El lugar suele ir al final («… en rosario»). Si sobran palabras, se queda
+    el final y no el principio.
+    """
     stop = _place_stop_words()
     kept: list[str] = []
     for word in normalize(query).split():
         if word in stop or re.fullmatch(r"\d+[kmb]?", word):
             continue
         kept.append(word)
-        if len(kept) == 4:
-            break
+    if len(kept) > 4:
+        kept = kept[-4:]
     return " ".join(kept)
 
 
@@ -713,6 +719,26 @@ def _city_for_point(lat: float, lon: float) -> dict | None:
     return best
 
 
+def _view_from_lookup(found: dict) -> dict | None:
+    """Ciudad de Georef/Nominatim, aunque todavía no esté en el catálogo cargado."""
+    from .places import _from_georef_place
+
+    named = _from_georef_place(found)
+    if not named or not named.get("id") or named.get("lat") is None or named.get("lon") is None:
+        return None
+    return {
+        "id": named["id"],
+        "label": named.get("label") or "",
+        "lat": named.get("lat"),
+        "lon": named.get("lon"),
+        "province": named.get("province") or "",
+        "zoom": named.get("zoom") or 13,
+        "barrio": "",
+        "hint": named.get("hint") or "",
+        "province_label": named.get("province_label") or "",
+    }
+
+
 def resolve_named_place(phrase: str) -> dict | None:
     """Un nombre de lugar, tal como lo escribió la persona en Dónde."""
     text = (phrase or "").strip()
@@ -731,10 +757,18 @@ def resolve_named_place(phrase: str) -> dict | None:
     if not found or found.get("lat") is None or found.get("lon") is None:
         return None
     name = str(found.get("name") or text)
+    kind = fold(str(found.get("kind") or ""))
     parent = _city_for_point(float(found["lat"]), float(found["lon"]))
+    named = _view_from_lookup(found)
+    parent_names = set()
     if parent:
         parent_names = {fold(str(parent.get("label") or "")), fold(str(parent.get("id") or ""))}
-        barrio = "" if fold(name) in parent_names else name
+        parent_names.discard("")
+    same_parent = bool(parent) and fold(name) in parent_names
+    if named and kind in _DESTINATION_KINDS and not same_parent:
+        return named
+    if parent:
+        barrio = "" if same_parent else name
         return {
             "id": parent["id"],
             "label": parent.get("label") or parent["id"],
@@ -744,15 +778,7 @@ def resolve_named_place(phrase: str) -> dict | None:
             "zoom": parent.get("zoom") or 13,
             "barrio": barrio,
         }
-    return {
-        "id": "",
-        "label": name,
-        "lat": found.get("lat"),
-        "lon": found.get("lon"),
-        "province": found.get("province") or "",
-        "zoom": 13,
-        "barrio": name,
-    }
+    return named
 
 
 def _catalog_place(phrase: str) -> dict | None:
@@ -840,17 +866,19 @@ def filters_for_query(query: str, where: str = "", city: str = "") -> tuple[dict
         base["typeFilter"] = _one_or_many(types)
     base = _apply_monoambiente(query, base)
     place = resolve_named_place(where) if (where or "").strip() else None
-    local_barrios = [] if place else _as_list(barrio_in_city(query, city))
-    if local_barrios:
-        base["cityFilter"] = city
-        base["barrioFilter"] = _one_or_many(local_barrios)
-        place = None
-    elif not place:
+    if not place:
         place = resolve_place(query)
     if place and place.get("id"):
         base["cityFilter"] = place["id"]
-    if place and place.get("barrio"):
-        base["barrioFilter"] = place["barrio"]
+        barrio = str(place.get("barrio") or "").strip()
+        if barrio and normalize(barrio) != normalize(str(place.get("label") or "")):
+            base["barrioFilter"] = barrio
+    else:
+        local_barrios = _as_list(barrio_in_city(query, city))
+        if local_barrios:
+            base["cityFilter"] = city
+            base["barrioFilter"] = _one_or_many(local_barrios)
+        place = None
     zona_city = (place or {}).get("id") or city
     if re.search(r"\bzona\b", normalize(query)):
         zonas = zonas_in_city(query, zona_city)
@@ -883,7 +911,7 @@ def filters_for_query(query: str, where: str = "", city: str = "") -> tuple[dict
         base.pop("traits", None)
     public_place = None
     if place and place.get("id"):
-        public_place = {key: place.get(key) for key in ("id", "label", "lat", "lon", "province", "zoom")}
+        public_place = {key: place.get(key) for key in _PUBLIC_PLACE_KEYS if place.get(key) not in (None, "")}
     return base, public_place, source
 
 

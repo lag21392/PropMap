@@ -117,6 +117,9 @@ def test_place_phrase_keeps_the_location_words():
     assert _place_phrase("casa en villa carlos paz hasta 200k") == "villa carlos paz"
     assert _place_phrase("casa luminosa madryn") == "madryn"
     assert _place_phrase("ciudad de rawson") == "rawson"
+    assert _place_phrase("ph o casa en la  rosario a menos de 200000") == "rosario"
+    assert _place_phrase("puerto piramides") == "puerto piramides"
+    assert "puerto piramides" in _place_phrase("casa grande linda nueva cerca plaza en puerto piramides")
 
 
 def test_city_nickname_selects_the_loaded_city(monkeypatch):
@@ -210,6 +213,94 @@ def test_price_tail_does_not_hide_the_city_or_invent_traits(monkeypatch):
     assert place["id"] == "rosario"
     assert "typeFilter" not in filters
     assert "traits" not in filters
+
+
+def test_unloaded_city_in_the_sentence_becomes_the_search_place(monkeypatch):
+    from app import place_api, places
+
+    place_api.reset_cache()
+    place_api.remember("rosario", {
+        "name": "Rosario",
+        "province": "Santa Fe",
+        "lat": -32.95,
+        "lon": -60.64,
+        "kind": "localidad",
+    })
+    place_api.remember("puerto piramides", {
+        "name": "Puerto Pirámides",
+        "province": "Chubut",
+        "lat": -42.57,
+        "lon": -64.28,
+        "kind": "localidad",
+    })
+    place_api.remember("palermo", {
+        "name": "Palermo",
+        "province": "Ciudad Autónoma de Buenos Aires",
+        "lat": -34.58,
+        "lon": -58.43,
+        "kind": "asentamiento",
+    })
+    monkeypatch.setattr("app.laya_client.decide_questions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.free_text_search.barrio_in_city", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.free_text_search.zonas_in_city", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.listings_cache.cached_city_ids", lambda: ["puerto-madryn"])
+    real_lookup = place_api.lookup_place
+    monkeypatch.setattr(
+        "app.place_api.lookup_place",
+        lambda name, province_hint=None, remote=True: real_lookup(name, province_hint=province_hint, remote=False),
+    )
+    monkeypatch.setattr(
+        "app.place_api.provinces",
+        lambda: [
+            {"id": "82", "nombre": "Santa Fe", "slug": "santa-fe"},
+            {"id": "26", "nombre": "Chubut", "slug": "chubut"},
+            {"id": "02", "nombre": "Ciudad Autónoma de Buenos Aires", "slug": "capital-federal"},
+        ],
+    )
+    monkeypatch.setitem(places.CITIES, "puerto-madryn", {
+        "id": "puerto-madryn",
+        "label": "Puerto Madryn",
+        "lat": -42.77,
+        "lon": -65.04,
+        "province": "Chubut",
+        "zoom": 13,
+        "aliases": ["madryn"],
+        "radius_km": 25,
+    })
+    monkeypatch.setitem(places.CITIES, "caba", {
+        "id": "caba",
+        "label": "CABA",
+        "lat": -34.6,
+        "lon": -58.4,
+        "province": "capital-federal",
+        "zoom": 12,
+        "aliases": [],
+        "radius_km": 16,
+    })
+
+    filters, place, _source = filters_for_query(
+        "ph o casa en la  rosario a menos de 200000",
+        city="puerto-madryn",
+    )
+    assert place["id"] == "rosario-santa-fe"
+    assert place["label"] == "Rosario"
+    assert filters["cityFilter"] == "rosario-santa-fe"
+    assert filters["maxPrice"] == 200000
+    assert set(filters["typeFilter"]) == {"casa", "ph"}
+    assert "barrioFilter" not in filters
+
+    filters, place, _source = filters_for_query("casa en puerto piramides", city="puerto-madryn")
+    assert place["label"] == "Puerto Pirámides"
+    assert filters["cityFilter"] == "puerto-piramides-chubut"
+    assert filters["typeFilter"] == "casa"
+    assert "barrioFilter" not in filters
+
+    filters, place, _source = filters_for_query("departamento en palermo", city="puerto-madryn")
+    assert place["id"] == "caba"
+    assert filters["cityFilter"] == "caba"
+    assert filters["barrioFilter"] == "Palermo"
+    assert filters["typeFilter"] == "departamento"
+    place_api.reset_cache()
 
 
 def test_search_uses_the_gpu_server_instead_of_loading_torch(monkeypatch):

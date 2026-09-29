@@ -1035,10 +1035,10 @@ function fillCities(cities, opts = {}) {
   }
   if (
     pickedPlace?.id
+    && isLocatableCity(pickedPlace)
     && pickedPlace.lat != null
     && pickedPlace.lon != null
     && !byId.has(pickedPlace.id)
-    && cityReadyForCatalog(pickedPlace)
   ) {
     byId.set(pickedPlace.id, { ...(byId.get(pickedPlace.id) || {}), ...pickedPlace });
   }
@@ -3914,11 +3914,24 @@ function rememberPlace(place) {
   }
 }
 
+function ensureCityOption(place) {
+  const select = $("cityFilter");
+  if (!place?.id || !select || !isLocatableCity(place)) return false;
+  if ([...select.options].some((opt) => opt.value === place.id)) return true;
+  const opt = document.createElement("option");
+  opt.value = place.id;
+  opt.textContent = placeCaption(place) || place.label || place.id;
+  select.appendChild(opt);
+  return true;
+}
+
 function applyPlace(place) {
   if (!place || !place.id || !isLocatableCity(place)) return;
   pickedPlace = { ...(pickedPlace || {}), ...place };
+  rememberCityView(place);
   rememberPlace(place);
   const select = $("cityFilter");
+  ensureCityOption(place);
   if (select) {
     ignoreCityChange = true;
     if ([...select.options].some((o) => o.value === place.id)) select.value = place.id;
@@ -5029,9 +5042,17 @@ async function runFreeTextSearch() {
     lastSearchPlace = place;
     frameAfterListings = true;
     const cityId = place?.id || filters.city || filters.cityFilter || "";
-    const switched = cityId && cityId !== previousCity
-      ? switchToLoadedCity(place || { id: cityId })
-      : false;
+    let switched = false;
+    if (cityId && cityId !== previousCity) {
+      const select = $("cityFilter");
+      const inMenu = select && [...select.options].some((opt) => opt.value === cityId);
+      if (inMenu) {
+        switched = switchToLoadedCity(place || { id: cityId });
+      } else if (place?.lat != null && place?.lon != null) {
+        await choosePlace(place);
+        switched = true;
+      }
+    }
     if (!switched && wantedBarrios.length && $("barrioFilter")) {
       $("barrioFilter").value = wantedBarrios.join(",");
     }
