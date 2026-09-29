@@ -2165,7 +2165,7 @@ function rentEstimate(item) {
 const CHART_AXES = ["price_m2", "zona", "ambientes", "alquiler", "servicios"];
 const LOT_AXES = ["price_m2", "zona", "servicios"];
 const CHART_LABELS = {
-  price_m2: "USD/m²", zona: "Zona", ambientes: "Ambientes", alquiler: "Alquiler", servicios: "POIs cercanos",
+  price_m2: "USD/m²", zona: "Zona", ambientes: "Ambientes", alquiler: "Alquiler", servicios: "POIs",
 };
 const CHART_SHORT = {
   price_m2: "USD/m²", zona: "Zona", ambientes: "Amb.", alquiler: "Alquiler", servicios: "POIs",

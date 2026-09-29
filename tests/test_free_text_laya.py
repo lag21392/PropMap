@@ -303,6 +303,104 @@ def test_unloaded_city_in_the_sentence_becomes_the_search_place(monkeypatch):
     place_api.reset_cache()
 
 
+def _caba_and_flores_cities(monkeypatch):
+    from app import places
+
+    monkeypatch.setattr("app.laya_client.decide_questions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.place_api.lookup_place", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("red")))
+    monkeypatch.setattr("app.listings_cache.cached_city_ids", lambda: ["caba", "flores"])
+    monkeypatch.setattr(
+        "app.geo.barrios_for",
+        lambda city: [
+            {"name": "Recoleta"},
+            {"name": "Flores"},
+            {"name": "Palermo"},
+            {"name": "Belgrano"},
+            {"name": "Villa Flores"},
+        ] if city == "caba" else [],
+    )
+    monkeypatch.setitem(places.CITIES, "caba", {
+        "id": "caba",
+        "label": "CABA",
+        "lat": -34.6,
+        "lon": -58.4,
+        "province": "capital-federal",
+        "zoom": 12,
+        "aliases": ["capital federal"],
+    })
+    monkeypatch.setitem(places.CITIES, "flores", {
+        "id": "flores",
+        "label": "Flores",
+        "lat": -34.63,
+        "lon": -58.46,
+        "province": "capital-federal",
+        "zoom": 14,
+        "aliases": [],
+    })
+
+
+def test_or_between_barrios_keeps_each_name():
+    from app.free_text_search import pick_barrios
+
+    names = ["Recoleta", "Flores", "Palermo", "Villa Flores"]
+    assert pick_barrios(
+        "depto o casa luminosa en caba en el barrio recoleta o flores menos de 100000",
+        names,
+    ) == ["Recoleta", "Flores"]
+    assert pick_barrios("casa en palermo y belgrano", ["Palermo", "Belgrano", "Recoleta"]) == ["Palermo", "Belgrano"]
+
+
+def test_caba_sentence_sets_both_barrios_price_and_types(monkeypatch):
+    _caba_and_flores_cities(monkeypatch)
+    query = "depto o casa luminosa en caba en el barrio recoleta o flores menos de 100000"
+    filters, place, _source = filters_for_query(query, city="puerto-madryn")
+    assert place["id"] == "caba"
+    assert filters["cityFilter"] == "caba"
+    assert filters["barrioFilter"] == ["Recoleta", "Flores"]
+    assert set(filters["typeFilter"]) == {"casa", "departamento"}
+    assert filters["traits"] == ["bright"]
+    assert filters["maxPrice"] == 100000
+
+
+def test_same_barrios_when_the_search_already_is_in_caba(monkeypatch):
+    _caba_and_flores_cities(monkeypatch)
+    filters, place, _source = filters_for_query(
+        "depto o casa luminosa en el barrio recoleta o flores menos de 100000",
+        city="caba",
+    )
+    assert place is None
+    assert filters["cityFilter"] == "caba"
+    assert filters["barrioFilter"] == ["Recoleta", "Flores"]
+    assert set(filters["typeFilter"]) == {"casa", "departamento"}
+    assert filters["maxPrice"] == 100000
+
+
+def test_one_barrio_and_mil_price_stay_in_the_current_city(monkeypatch):
+    _caba_and_flores_cities(monkeypatch)
+    filters, place, _source = filters_for_query(
+        "depto luminoso en recoleta menos de 80 mil",
+        city="caba",
+    )
+    assert place is None
+    assert filters["cityFilter"] == "caba"
+    assert filters["barrioFilter"] == "Recoleta"
+    assert filters["typeFilter"] == "departamento"
+    assert filters["traits"] == ["bright"]
+    assert filters["maxPrice"] == 80000
+
+
+def test_y_between_barrios_does_not_open_another_city(monkeypatch):
+    _caba_and_flores_cities(monkeypatch)
+    filters, place, _source = filters_for_query(
+        "casa y depto en palermo y belgrano",
+        city="caba",
+    )
+    assert place is None
+    assert filters["cityFilter"] == "caba"
+    assert filters["barrioFilter"] == ["Palermo", "Belgrano"]
+    assert set(filters["typeFilter"]) == {"casa", "departamento"}
+
+
 def test_search_uses_the_gpu_server_instead_of_loading_torch(monkeypatch):
     from app import laya_client
 

@@ -653,10 +653,21 @@ _PLACE_STOP_BASE = _SKIP_PLACE | {
     "usd", "ars", "m2", "metros", "metro", "mil", "miles",
     "dormitorio", "dormitorios", "habitacion", "habitaciones",
     "ambiente", "ambientes", "bano", "banos",
-    "ciudad", "localidad", "provincia",
+    "ciudad", "localidad", "provincia", "barrio", "barrios",
 }
 _DESTINATION_KINDS = {"localidad", "municipio", "city", "town"}
 _PUBLIC_PLACE_KEYS = ("id", "label", "lat", "lon", "province", "zoom", "hint", "province_label")
+
+
+def _without_barrio_clause(query: str) -> str:
+    """Saca «barrio Recoleta o Flores» para que esos nombres no se tomen como ciudad."""
+    text = normalize(query)
+    text = re.sub(
+        r"\bbarrios?\s+(.+?)(?=\s+(?:menos|hasta|desde|max|con|apto)\b|$)",
+        " ",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _place_phrase(query: str) -> str:
@@ -867,17 +878,20 @@ def filters_for_query(query: str, where: str = "", city: str = "") -> tuple[dict
     base = _apply_monoambiente(query, base)
     place = resolve_named_place(where) if (where or "").strip() else None
     if not place:
-        place = resolve_place(query)
+        place = resolve_place(_without_barrio_clause(query) or query)
+    target = (place or {}).get("id") or city
+    named = _as_list(barrio_in_city(query, target)) if target else []
     if place and place.get("id"):
         base["cityFilter"] = place["id"]
+    if named:
+        if not (place and place.get("id")):
+            base["cityFilter"] = city
+        base["barrioFilter"] = _one_or_many(named)
+    elif place and place.get("id"):
         barrio = str(place.get("barrio") or "").strip()
         if barrio and normalize(barrio) != normalize(str(place.get("label") or "")):
             base["barrioFilter"] = barrio
     else:
-        local_barrios = _as_list(barrio_in_city(query, city))
-        if local_barrios:
-            base["cityFilter"] = city
-            base["barrioFilter"] = _one_or_many(local_barrios)
         place = None
     zona_city = (place or {}).get("id") or city
     if re.search(r"\bzona\b", normalize(query)):

@@ -17,7 +17,7 @@ AXIS_LABELS = {
     "zona": "Zona",
     "ambientes": "Ambientes",
     "alquiler": "Alquiler",
-    "servicios": "POIs cercanos",
+    "servicios": "POIs",
 }
 
 

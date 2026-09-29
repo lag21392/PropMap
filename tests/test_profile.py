@@ -163,7 +163,7 @@ def test_street_address_gets_zona_and_servicios_even_if_kind_approx():
     assert public["profile"]["axes"]["zona"]["score"] is not None
     assert public["profile"]["axes"]["servicios"]["score"] is None
     assert public["profile"]["total"] is not None
-    assert public["profile"]["labels"]["servicios"] == "POIs cercanos"
+    assert public["profile"]["labels"]["servicios"] == "POIs"
 
 
 def test_origin_for_madryn_is_not_caba():
@@ -211,7 +211,7 @@ def test_compute_profile_keeps_stored_access_without_pois():
     assert profile["axes"]["servicios"]["score"] == 80.0
     assert profile["access"]["nearby"]
     assert profile["total"] is not None
-    assert profile["labels"]["servicios"] == "POIs cercanos"
+    assert profile["labels"]["servicios"] == "POIs"
 
 
 def test_profile_total_is_mean_of_present_axes():
