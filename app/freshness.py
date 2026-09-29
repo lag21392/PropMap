@@ -75,10 +75,21 @@ def skip_detail_for_unknown_city(item: Listing) -> bool:
     return city_is_unassigned(item.city) and city_lookup_already_ran(item)
 
 
+def photo_link_due(item: Listing) -> bool:
+    """La foto del enlace no cargó y la ficha todavía no se revió después de eso."""
+    extra = item.extra or {}
+    miss = str(extra.get("photo_miss") or "")
+    if not miss or not item.url:
+        return False
+    return str(extra.get("photo_checked_at") or "") < miss
+
+
 def needs_detail_fetch(item: Listing, now: datetime | None = None) -> bool:
     """Ficha HTTP only if we never got it, or a later day and something actually changed."""
     if not item.url:
         return False
+    if photo_link_due(item):
+        return True
     if skip_detail_for_unknown_city(item):
         return False
     extra = item.extra or {}

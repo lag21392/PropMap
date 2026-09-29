@@ -3253,9 +3253,27 @@ function listingImage(url, role) {
   return href ? escapeHtml(href) : "";
 }
 
+const photoMissSent = new Set();
+
+function reportPhotoMiss(img) {
+  const card = img.closest("article.card, article");
+  const id = card?.dataset?.id || "";
+  if (!id || photoMissSent.has(id)) return;
+  const src = img.currentSrc || img.src || "";
+  if (!src || src.startsWith("data:")) return;
+  photoMissSent.add(id);
+  fetch("/api/photo-miss", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
 document.addEventListener("error", (ev) => {
   const img = ev.target;
   if (!(img instanceof HTMLImageElement)) return;
+  reportPhotoMiss(img);
   if (img.classList.contains("detail-hero")) {
     img.closest(".detail-photos")?.remove();
     return;

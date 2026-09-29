@@ -153,13 +153,14 @@ def enqueue(
                 if not ignore_cooling and _cooling_locked(item.id):
                     continue
                 loc_first = location_incomplete(item) or extra.get("await_llm")
+                photo_first = bool(extra.get("photo_miss"))
                 if item.id in _seen:
-                    if loc_first and item.id in _queue:
+                    if (photo_first or loc_first) and item.id in _queue:
                         _queue.remove(item.id)
                         _urgent.appendleft(item.id)
                     continue
                 _seen.add(item.id)
-                if loc_first:
+                if photo_first or loc_first:
                     _urgent.appendleft(item.id)
                 else:
                     _queue.append(item.id)
@@ -309,8 +310,18 @@ def _fetch_id(listing_id: str) -> None:
             ok = False
         _ops_note("details", outcome="ok" if ok else "fail")
         extra = dict(item.extra or {})
+        if (item.extra or {}).get("gone"):
+            with _lock:
+                _seen.discard(listing_id)
+                _skip_until.pop(listing_id, None)
+            return
         if ok:
             extra.pop("detail_tries", None)
+            if extra.get("photo_miss"):
+                extra.pop("photo_miss", None)
+                from datetime import datetime, timezone
+
+                extra["photo_checked_at"] = datetime.now(timezone.utc).isoformat()
             with _lock:
                 _skip_until.pop(listing_id, None)
         else:

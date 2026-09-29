@@ -45,6 +45,21 @@ def test_unknown_city_after_llm_pass_skips_ficha():
     assert needs_detail_fetch(placed) is True
 
 
+def test_broken_photo_link_needs_another_fetch():
+    now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
+    item = _item(
+        "1",
+        details_scraped=True,
+        extra={
+            "details_at": now.isoformat(),
+            "details_parser": DETAILS_PARSER,
+            "detail_price": 100000,
+            "photo_miss": "2026-08-24T20:00:00+00:00",
+        },
+    )
+    assert needs_detail_fetch(item, now=now) is True
+
+
 def test_already_downloaded_today_is_skipped():
     now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
     item = _item(

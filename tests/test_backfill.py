@@ -120,6 +120,24 @@ def test_llm_backlog_groups_same_city(tmp_path, monkeypatch):
     assert cities == sorted(cities)
 
 
+def test_detail_backlog_puts_broken_photo_links_first(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    broken = _item(
+        "broken",
+        details_scraped=True,
+        image="https://cdn.example/gone.jpg",
+        extra={"photo_miss": "2026-09-28T18:00:00+00:00", "details_at": "2026-09-28T12:00:00+00:00"},
+    )
+    pending = _item("need", details_scraped=False)
+    store.upsert_many([pending, broken])
+    ids = [row.id for row in store.fetch_detail_backlog(8)]
+    assert ids[0] == "zonaprop:broken"
+    assert "zonaprop:need" in ids
+
+
 def test_detail_backlog_skips_downloaded(tmp_path, monkeypatch):
     from app import store
 

@@ -226,6 +226,10 @@ class FreeTextSearchIn(BaseModel):
     city: str = ""
 
 
+class PhotoMissIn(BaseModel):
+    id: str = ""
+
+
 class PauseIn(BaseModel):
     city: str | None = None
     password: str | None = None
@@ -1045,6 +1049,20 @@ def favorites_report(request: Request) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="favoritos-propmap.pdf"'},
     )
+
+
+@app.post("/api/photo-miss")
+def photo_miss(payload: PhotoMissIn) -> dict:
+    """La foto del enlace no cargó. Queda primera en la pasada de fichas."""
+    store.init()
+    queued = store.mark_photo_miss(payload.id)
+    if queued and os.environ.get("PROPMAP_SHARE_DB") != "1":
+        item = store.get_listing(payload.id)
+        if item:
+            from .detail_fetch import enqueue
+
+            enqueue([item])
+    return {"ok": True, "queued": queued}
 
 
 @app.get("/api/listing")

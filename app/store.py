@@ -1257,14 +1257,38 @@ def fetch_detail_backlog(
     refresh = (refresh_city or "").strip()
     skip = [lid for lid in dict.fromkeys(skip_ids or ()) if lid][:240]
     picked: list[Listing] = []
+    photo_skip = ""
+    photo_params: list = []
+    if skip:
+        photo_skip = f" AND id NOT IN ({','.join('?' * len(skip))})"
+        photo_params.extend(skip)
+    photo_params.append(n)
+    picked = _fetch_backlog_rows(
+        f"""
+        SELECT * FROM listings
+        WHERE is_hidden = 0
+          AND IFNULL(url, '') != ''
+          AND length(trim(IFNULL(json_extract(extra_json, '$.photo_miss'), ''))) > 0
+          AND IFNULL(json_extract(extra_json, '$.photo_checked_at'), '')
+              < IFNULL(json_extract(extra_json, '$.photo_miss'), '')
+          {photo_skip}
+        ORDER BY json_extract(extra_json, '$.photo_miss') ASC
+        LIMIT ?
+        """,
+        tuple(photo_params),
+    )
+    seen = {item.id for item in picked}
+    skip = [lid for lid in dict.fromkeys([*skip, *seen]) if lid][:240]
+    if len(picked) >= n:
+        return picked[:n]
     if refresh:
         refresh_skip = ""
         refresh_params: list = [refresh, _local_today()]
         if skip:
             refresh_skip = f" AND id NOT IN ({','.join('?' * len(skip))})"
             refresh_params.extend(skip)
-        refresh_params.append(n)
-        picked = _fetch_backlog_rows(
+        refresh_params.append(n - len(picked))
+        picked = picked + _fetch_backlog_rows(
             f"""
             SELECT * FROM listings
             WHERE city = ?
@@ -1769,6 +1793,39 @@ def ops_sum_since(metric: str, start_min: int) -> int:
     except Exception:
         return 0
     return int(row[0] if row else 0)
+
+
+def mark_photo_miss(listing_id: str) -> bool:
+    """El enlace de la foto no existe. La próxima pasada de fichas lo mira primero."""
+    lid = (listing_id or "").strip()
+    item = get_listing(lid) if lid else None
+    if not item or not item.url or not item.image:
+        return False
+    from .freshness import photo_link_due, same_local_day
+    from .jsoncodec import dumps_text
+
+    extra = dict(item.extra or {})
+    if same_local_day(str(extra.get("photo_checked_at") or "")):
+        return False
+    if photo_link_due(item):
+        return False
+    from datetime import datetime, timezone
+
+    extra["photo_miss"] = datetime.now(timezone.utc).isoformat()
+    with _write:
+        with connect() as conn:
+            conn.execute(
+                "UPDATE listings SET extra_json = ? WHERE id = ?",
+                (dumps_text(extra), lid),
+            )
+            conn.commit()
+    try:
+        from .listings_cache import forget_ids
+
+        forget_ids([lid])
+    except Exception:
+        pass
+    return True
 
 
 def drop_listings(ids: list[str] | tuple[str, ...] | set[str]) -> int:
