@@ -2295,7 +2295,7 @@ function pentagonChart(profile, { mini = false, kind = "" } = {}) {
     ${mini ? "" : `<h4>Perfil del aviso</h4><p class="muted">${escapeHtml(pin)}</p>`}
     <div class="radar-plot">
     <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${n === 3 ? "Triángulo" : "Pentágono"} de scores, total ${totalLabel}">
-      <polygon class="radar-grid" points="${ring(1)}" />
+      <polygon class="radar-grid is-frame" points="${ring(1)}" />
       <polygon class="radar-grid" points="${ring(0.7)}" />
       <polygon class="radar-grid" points="${ring(0.4)}" />
       <g class="radar-spokes">${spokes.join("")}</g>

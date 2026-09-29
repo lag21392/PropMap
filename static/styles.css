@@ -1104,9 +1104,15 @@ input, select, textarea {
 .card-photo .radar-card.is-mini .radar-total {
   font-size: 13px;
 }
+html[data-theme="dark"] .radar-grid,
+html[data-theme="dark"] .radar-spokes line,
 html[data-theme="dark"] .card-photo .radar-grid,
 html[data-theme="dark"] .card-photo .radar-spokes line {
-  stroke: rgba(186, 208, 232, 0.4);
+  stroke: rgba(186, 208, 232, 0.42);
+}
+html[data-theme="dark"] .radar-grid.is-frame {
+  stroke: rgba(214, 226, 240, 0.82);
+  stroke-width: 1.5;
 }
 html[data-theme="dark"] .card-photo .radar-fill {
   fill: rgba(226, 181, 106, 0.32);
@@ -1206,7 +1212,8 @@ html[data-theme="dark"] .card-photo .radar-fill {
   margin: 0 auto;
 }
 .radar-card svg { width: 100%; height: auto; display: block; }
-.radar-grid { fill: none; stroke: rgba(42, 74, 60, 0.18); stroke-width: 1; }
+.radar-grid { fill: none; stroke: rgba(42, 74, 60, 0.28); stroke-width: 1; }
+.radar-grid.is-frame { stroke: rgba(42, 74, 60, 0.55); stroke-width: 1.5; }
 .radar-spokes line { stroke: rgba(42, 74, 60, 0.16); stroke-width: 1; }
 .radar-spokes line.is-missing { stroke: rgba(42, 74, 60, 0.28); stroke-dasharray: 3 3; }
 .radar-fill {
