@@ -2167,6 +2167,9 @@ const LOT_AXES = ["price_m2", "zona", "servicios"];
 const CHART_LABELS = {
   price_m2: "USD/m²", zona: "Zona", ambientes: "Ambientes", alquiler: "Alquiler", servicios: "POIs cercanos",
 };
+const CHART_SHORT = {
+  price_m2: "USD/m²", zona: "Zona", ambientes: "Amb.", alquiler: "Alquiler", servicios: "POIs",
+};
 
 function chartOrder(profile) {
   const order = profile?.order;
@@ -2202,23 +2205,14 @@ function stampProfile(profile) {
   return profile;
 }
 
-function poiScoreReady(profile) {
-  const axis = profile && profile.axes && profile.axes.servicios;
-  return !!(axis && axis.score != null && axis.score !== "");
-}
-
-function pentagonChart(profile, { mini = false, kind = "", allowPartial = false } = {}) {
-  if (!allowPartial && !poiScoreReady(profile)) return "";
-  if (allowPartial) {
-    const axes = profile && profile.axes;
-    const ready = axes && Object.values(axes).some((axis) => axis && axis.score != null);
-    if (!ready) return "";
-  }
+function pentagonChart(profile, { mini = false, kind = "" } = {}) {
   profile = profile && typeof profile === "object" ? profile : {};
   if (!profile.axes) profile.axes = {};
   if (kind === "terreno") profile.order = LOT_AXES.slice();
   else if (kind) profile.order = CHART_AXES.slice();
   stampProfile(profile);
+  const hasScore = Object.values(profile.axes).some((axis) => axis && axis.score != null);
+  if (mini && !hasScore) return "";
   const order = chartOrder(profile);
   const labels = profile.labels || CHART_LABELS;
   const n = order.length;
@@ -2287,6 +2281,13 @@ function pentagonChart(profile, { mini = false, kind = "", allowPartial = false 
       : (axis.note || axis.confidence || "");
     return `<li class="${missing ? "is-missing" : ""}"><b>${escapeHtml(labels[key] || key)}</b> ${val}<small>${escapeHtml(hint)}</small></li>`;
   }).join("")}</ul>`;
+  const legend = mini ? `<ul class="radar-legend">${order.map((key) => {
+    const axis = profile.axes[key] || {};
+    const missing = axis.score == null;
+    const val = missing ? "—" : Math.round(axis.score);
+    const name = CHART_SHORT[key] || labels[key] || key;
+    return `<li class="${missing ? "is-missing" : ""}"><b>${escapeHtml(name)}</b><span>${val}</span></li>`;
+  }).join("")}</ul>` : "";
   const pin = profile.pin_grade === "exact" || profile.pin_grade === "intersection"
     ? "ubicación exacta"
     : profile.pin_grade === "approx" ? "pin aproximado · zona y POIs cercanos en pausa" : "sin pin";
@@ -2304,6 +2305,7 @@ function pentagonChart(profile, { mini = false, kind = "", allowPartial = false 
     </svg>
     <span class="radar-total">${totalLabel}</span>
     </div>
+    ${legend}
     ${pendingLine}
     ${notes}
   </div>`;
@@ -2416,7 +2418,7 @@ function cardHtml(item) {
   const locBit = isExactPin(item) ? "ubicación real" : isLocationMissing(item) ? "sin ubicación" : "aprox.";
   const picked = window.getCompareIds ? window.getCompareIds().includes(item.id) : false;
   const dealNote = (item.deal_label || "").startsWith("revisar") ? item.deal_label : "";
-  const radar = pentagonChart(item.profile, { mini: true, kind: item.property_type, allowPartial: true });
+  const radar = pentagonChart(item.profile, { mini: true, kind: item.property_type });
   return `<article class="card${item.favorite ? " is-fav" : ""}${selected}${contacted}${approx}${radar ? "" : " is-photo-only"}" id="card-${cssId(item.id)}" data-id="${item.id}">
     <div class="card-photo">
       <div class="card-shot">

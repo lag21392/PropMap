@@ -1085,7 +1085,8 @@ input, select, textarea {
   min-height: 112px;
 }
 .card-photo .radar-card.is-mini {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
+  flex-direction: column;
   width: 104px;
   margin: 0;
   padding: 0;
@@ -1093,7 +1094,7 @@ input, select, textarea {
   background: transparent;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
 }
 .card-photo .radar-card.is-mini .radar-plot,
 .card-photo .radar-card.is-mini svg {
@@ -1276,6 +1277,31 @@ html[data-theme="dark"] .card-photo .radar-fill {
 .radar-card.is-mini .radar-total { font-size: 13px; }
 .radar-card.is-mini .radar-notes { display: none; }
 .radar-card.is-mini .radar-pending { display: none; }
+.radar-card.is-mini .radar-legend {
+  display: grid;
+  gap: 1px;
+  width: 104px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.radar-card.is-mini .radar-legend li {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 10px;
+  line-height: 1.25;
+  color: var(--muted);
+}
+.radar-card.is-mini .radar-legend b {
+  font-weight: 650;
+  color: var(--ink);
+}
+.radar-card.is-mini .radar-legend span {
+  font-variant-numeric: tabular-nums;
+  color: var(--teal);
+}
+.radar-card.is-mini .radar-legend li.is-missing span { color: var(--muted); }
 .ficha-bundle {
   margin: 0 0 12px;
   border: 1px solid var(--line);
