@@ -1,6 +1,7 @@
 from app.http_client import (
     PROXY_HEADERS,
     fetch_text,
+    portal_way,
     proxy_html_looks_valid,
     reset_fetch_state,
     translate_proxy_url,
@@ -12,6 +13,9 @@ class _Resp:
         self.status_code = status
         self.text = text
         self.url = url
+
+    def read(self):
+        return (self.text or "").encode()
 
     def raise_for_status(self):
         import httpx
@@ -430,6 +434,94 @@ def test_fetch_text_uses_translate_when_local_listing_blocked(monkeypatch):
     )
     text = fetch_text(url, paced=False, retries=1)
     assert "ficha via yandex" in text
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()
+
+
+def test_ficha_skips_translate_when_it_keeps_failing(monkeypatch):
+    """Si Yandex viene fallando en este portal, la próxima ficha arranca por otro lado."""
+    from app import crawl, egress, routing
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "1")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.delenv("TOR_ENABLED", raising=False)
+    egress.reset()
+    url = "https://www.zonaprop.com.ar/propiedades/clasificado/vive.html"
+    html = "<html>ficha directa" + ("." * 9000) + "</html>"
+    hits = []
+
+    class _Counting(_Client):
+        def get(self, href: str):
+            hits.append(href)
+            return super().get(href)
+
+    monkeypatch.setattr(
+        "app.http_client.httpx.Client",
+        lambda **kw: _Counting({"https://www.zonaprop.com.ar/": _Resp(200, html, url)}, **kw),
+    )
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    monkeypatch.setattr("app.http_client._try_stealth_fetch", lambda *_a, **_k: None)
+
+    # Por defecto la ficha sale por el traductor.
+    assert portal_way(url) == "translate"
+    for _ in range(8):
+        routing.note("www.zonaprop.com.ar", "ficha", "translate", False)
+    routing.note("www.zonaprop.com.ar", "ficha", "local", True)
+
+    text = fetch_text(url, paced=False, retries=1)
+    assert "ficha directa" in text
+    assert hits == [url], "no debería gastar un intento en el traductor"
+    crawl.reset()
+    reset_fetch_state()
+    egress.reset()
+
+
+def test_list_uses_translate_when_tor_lanes_are_cooling(monkeypatch):
+    from app import crawl, egress
+
+    reset_fetch_state()
+    crawl.reset()
+    monkeypatch.setenv("PROPMAP_TOR_TEST", "1")
+    monkeypatch.setenv("TOR_ENABLED", "1")
+    monkeypatch.setenv("TOR_SOCKS", "socks5h://127.0.0.1:19050")
+    monkeypatch.setenv("TOR_CIRCUITS", "2")
+    monkeypatch.setenv("SCRAPE_USE_LOCAL", "0")
+    monkeypatch.delenv("SCRAPE_PROXIES", raising=False)
+    monkeypatch.setattr(egress, "_socks_supported", lambda _url: True)
+    monkeypatch.setattr(egress, "_maybe_grow", lambda: False)
+    egress.reset()
+    url = "https://www.zonaprop.com.ar/departamentos-venta-capital-federal.html"
+    html = 'data-url="/aviso"' + ("." * 4000)
+    for lane in egress.lanes():
+        crawl.note_http(403, "www.zonaprop.com.ar", lane=lane.id)
+    proxies = []
+
+    class _Client:
+        def __init__(self, **kw):
+            self.proxy = kw.get("proxy")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def get(self, href: str):
+            proxies.append(self.proxy)
+            if self.proxy:
+                raise AssertionError("un carril en pausa no se vuelve a usar")
+            return _Resp(200, html, href)
+
+    monkeypatch.setattr("app.http_client.httpx.Client", lambda **kw: _Client(**kw))
+    monkeypatch.setattr("app.http_client.crawl.wait", lambda **kw: None)
+    monkeypatch.setattr("app.http_client.crawl.aborted", lambda: False)
+    text = fetch_text(url, paced=False, retries=1)
+    assert "data-url" in text
+    assert proxies == [None]
     crawl.reset()
     reset_fetch_state()
     egress.reset()

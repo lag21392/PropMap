@@ -14,11 +14,15 @@ COUNTRY_STALE_SEC = 30 * 3600
 STARVE_SEC = 45 * 60
 SEARCH_BOOST_SEC = 2 * 3600
 HOUR = 3600
+PRIORITY_CITY_KEY = "priority_city"
+PRIORITY_UNTIL_KEY = "priority_until"
 
 _lock = threading.Lock()
 _demand: dict[str, dict] = {}
 _loaded = False
 _persist = True
+_priority_memo = ""
+_priority_at = 0.0
 
 
 def is_country_place(city: str | None) -> bool:
@@ -27,11 +31,13 @@ def is_country_place(city: str | None) -> bool:
 
 
 def reset() -> None:
-    global _loaded, _persist
+    global _loaded, _persist, _priority_memo, _priority_at
     with _lock:
         _demand.clear()
         _loaded = True
         _persist = False
+        _priority_memo = ""
+        _priority_at = 0.0
 
 
 def load() -> None:
@@ -173,9 +179,10 @@ def pool_ids() -> list[str]:
     load_custom_places()
     ids: set[str] = {COUNTRY_ID, DEFAULT_CITY}
     ids.update(listed_place_ids())
-    home = home_scrape_id()
-    if home:
-        ids.add(home)
+    # Los lugares del catálogo siguen en la rotación aunque hoy no tengan prioridad.
+    from .places import priority_place_ids
+
+    ids.update(priority_place_ids())
     return sorted(
         cid
         for cid in ids
@@ -184,14 +191,48 @@ def pool_ids() -> list[str]:
 
 
 def home_scrape_id() -> str:
-    """Primer lugar de prioridad (Puerto Madryn, resuelto por API/catálogo)."""
-    try:
-        from .places import priority_place_ids
+    """Ciudad con prioridad hoy. Vencida la ventana, todas pesan igual."""
+    return priority_city()
 
-        ids = priority_place_ids()
+
+def priority_city() -> str:
+    """La ciudad priorizada mientras la ventana siga abierta.
+
+    Sin ventana vigente devuelve vacío y el turno lo decide el puntaje de cada
+    ciudad: demanda, antigüedad y cuánto hace que espera.
+    """
+    global _priority_memo, _priority_at
+    now = time.time()
+    if _priority_at and now - _priority_at < 20:
+        return _priority_memo
+    from . import store
+
+    try:
+        city = store.get_meta(PRIORITY_CITY_KEY).strip()
+        until = store.get_meta(PRIORITY_UNTIL_KEY).strip()
     except Exception:
-        return ""
-    return ids[0] if ids else ""
+        return _priority_memo
+    _priority_memo = city if (city and until and _today() <= until) else ""
+    _priority_at = now
+    return _priority_memo
+
+
+def set_priority_city(city_id: str, until: str = "") -> str:
+    """Prioriza una ciudad hasta el final de `until` (YYYY-MM-DD; por defecto, hoy)."""
+    global _priority_memo, _priority_at
+    from . import store
+
+    cid = _canon(city_id)
+    day = (until or _today()).strip()
+    store.set_meta(PRIORITY_CITY_KEY, cid)
+    store.set_meta(PRIORITY_UNTIL_KEY, day if cid else "")
+    _priority_memo = cid if cid and _today() <= day else ""
+    _priority_at = time.time()
+    return _priority_memo
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def score(city_id: str, now: float | None = None) -> float:

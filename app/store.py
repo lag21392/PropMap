@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock, local
+from threading import Event, Lock, Thread, local
 from typing import Any
 
 from .jsoncodec import dumps_text, loads as json_loads
@@ -21,8 +22,13 @@ _tls = local()
 _counts_memo: dict[str, int] = {}
 _counts_at = 0.0
 COUNTS_TTL_SEC = 25.0
-# 4 MB por hilo. -80000 (80 MB) × el pool de uvicorn se iba a varios GB y no volvía.
-CACHE_KB = 4000
+# Reduced from 4000 KB to 1024 KB per connection to reduce memory usage
+CACHE_KB = 1024
+WAL_JOURNAL_LIMIT = 128 * 1024 * 1024
+WAL_CHECKPOINT_SEC = 45.0
+_wal_stop = Event()
+_wal_thread: Thread | None = None
+log = logging.getLogger(__name__)
 _SQL_IN_CHUNK = 400
 EDIT_FIELDS = (
     "title", "price", "currency", "address", "covered_m2", "total_m2",
@@ -123,7 +129,49 @@ def _open_conn(timeout: float = 10) -> sqlite3.Connection:
     conn.execute(f"PRAGMA cache_size=-{CACHE_KB}")
     conn.execute("PRAGMA busy_timeout=8000")
     conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute(f"PRAGMA journal_size_limit={WAL_JOURNAL_LIMIT}")
     return conn
+
+
+def checkpoint(mode: str = "PASSIVE") -> tuple[int, int, int]:
+    """Pasa frames del WAL al .sqlite. PASSIVE no espera a otros lectores."""
+    allowed = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+    if mode not in allowed:
+        raise ValueError(mode)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        if not row:
+            return (0, 0, 0)
+        return (int(row[0]), int(row[1]), int(row[2]))
+    finally:
+        conn.close()
+
+
+def start_wal_checkpointer() -> None:
+    global _wal_thread
+    if os.environ.get("PROPMAP_TEST") == "1":
+        return
+    if _wal_thread and _wal_thread.is_alive():
+        return
+    _wal_stop.clear()
+    _wal_thread = Thread(target=_wal_loop, daemon=True, name="wal-checkpoint")
+    _wal_thread.start()
+
+
+def _wal_loop() -> None:
+    while not _wal_stop.wait(WAL_CHECKPOINT_SEC):
+        try:
+            busy, frames, ckpt = checkpoint("PASSIVE")
+            if frames > 8000:
+                log.warning(
+                    "WAL grande: %s frames, checkpointed %s, busy %s",
+                    frames,
+                    ckpt,
+                    busy,
+                )
+        except sqlite3.Error:
+            log.exception("wal_checkpoint")
 
 
 def connect() -> _TlsConn:
@@ -385,6 +433,7 @@ def init() -> None:
     from .accounts import init_tables
 
     init_tables()
+    start_wal_checkpointer()
 
 
 def replace_portal_listings(source: str, listings: list[Listing]) -> None:
@@ -725,18 +774,25 @@ def upsert_listings(listings: list[Listing], delete_source: str | None = None, *
     for item in listings:
         unique[item.id] = item
     batch = list(unique.values())
-    with _write:
-        with connect() as conn:
-            if delete_source:
-                conn.execute("DELETE FROM listings WHERE source = ?", (delete_source,))
-            if batch:
-                existing = {} if delete_source else _rows_by_ids(conn, [item.id for item in batch])
-                for item in batch:
-                    row = existing.get(item.id)
-                    if row:
-                        _merge_existing(item, row)
-                conn.executemany(_UPSERT_SQL, [_upsert_params(item, now) for item in batch])
-            conn.commit()
+    for attempt in range(4):
+        try:
+            with _write:
+                with connect() as conn:
+                    if delete_source:
+                        conn.execute("DELETE FROM listings WHERE source = ?", (delete_source,))
+                    if batch:
+                        existing = {} if delete_source else _rows_by_ids(conn, [item.id for item in batch])
+                        for item in batch:
+                            row = existing.get(item.id)
+                            if row:
+                                _merge_existing(item, row)
+                        conn.executemany(_UPSERT_SQL, [_upsert_params(item, now) for item in batch])
+                    conn.commit()
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 3:
+                raise
+            time.sleep(0.4 * (attempt + 1))
     from .market import sync_listing_prices
 
     sync_listing_prices(batch)

@@ -218,6 +218,8 @@ def apply_poi_overlay(rows: list[dict[str, Any]] | None) -> int:
             axes = {}
             profile["axes"] = axes
         serv = axes.get("servicios") if isinstance(axes.get("servicios"), dict) else {}
+        if serv.get("score") is not None:
+            continue
         if serv.get("score") == incoming.get("score") and (serv.get("note") or "") == (incoming.get("note") or ""):
             continue
         axes["servicios"] = dict(incoming)
@@ -1210,7 +1212,9 @@ def request_city_bytes(city: str | None, *, refresh: bool = False) -> None:
                     return
                 if n and snap.get("encoded") and not snap.get("warming"):
                     return
-                if n and not snap.get("warming"):
+                # Una ciudad sin avisos ya leída tampoco se vuelve a cargar: alcanza
+                # con encolar el encode, si no se relee la base en cada pedido.
+                if not snap.get("warming"):
                     _schedule_encode(view_city)
                     return
             if snap.get("encoded") and not snap.get("warming") and not incomplete:

@@ -6,15 +6,14 @@ import os
 import re
 import shutil
 import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
-
-from . import crawl
+import threading
+from . import crawl, routing
 
 HEADERS = {
     "User-Agent": (
@@ -35,14 +34,23 @@ PROXY_HEADERS = {
 PROXY_HOSTS = ("properati.com",)
 LOCAL_HOSTS = ("zonaprop.com", "argenprop.com", "mercadolibre.com")
 TRANSLATE_PROXY = "https://translate.yandex.com/translate"
-TRANSLATE_LANGS = ("es-en", "es-es")
+# Expanded language pairs for better fallback coverage
+TRANSLATE_LANGS = ("es-en", "es-es", "es-pt", "es-fr", "es-it", "es-de", "en-es", "pt-es", "fr-es")
 SGAI_SCRAPE = "https://v2-api.scrapegraphai.com/api/scrape"
+
+# Connection pool: shared httpx clients per proxy for connection reuse
+_client_pool: dict[str, httpx.Client] = {}
+_client_lock = threading.Lock()
+
+# Optimized connection limits for higher throughput
+_MAX_CONNECTIONS = 100
+_MAX_KEEPALIVE = 20
+_TIMEOUT = 25.0  # Reduced from 35s
 _DETAIL_URL = re.compile(
     r"/detalle/|/propiedades/clasificado/|/MLA-|/inmueble/|--\d{5,}(?:[/?#]|$)",
     re.I,
 )
 _blocked_until: dict[str, float] = {}
-_tls = threading.local()
 PAGE_CACHE_TTL = 12 * 3600
 
 
@@ -52,6 +60,14 @@ class PageGone(RuntimeError):
 
 def reset_fetch_state() -> None:
     _blocked_until.clear()
+    routing.reset()
+    with _client_lock:
+        for client in _client_pool.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        _client_pool.clear()
     from .egress import reset as reset_egress
     from .ops import reset as reset_ops
 
@@ -77,11 +93,45 @@ def _client_kwargs(timeout: float, headers: dict[str, str], proxy: str | None) -
         "headers": headers,
         "follow_redirects": True,
         "timeout": timeout,
+        "limits": httpx.Limits(
+            max_connections=_MAX_CONNECTIONS,
+            max_keepalive_connections=_MAX_KEEPALIVE,
+        ),
     }
     if proxy:
         kwargs["proxy"] = proxy
     return kwargs
 
+
+def _get_pooled_client(timeout: float, headers: dict[str, str], proxy: str | None) -> httpx.Client:
+    """Get or create a shared httpx.Client for connection reuse."""
+    key = proxy or "__direct__"
+    with _client_lock:
+        client = _client_pool.get(key)
+        if client is not None:
+            try:
+                _ = client.is_closed
+                return client
+            except Exception:
+                _client_pool.pop(key, None)
+
+    # Create new client outside lock to avoid blocking
+    hdrs = headers or HEADERS
+    wait_s = timeout if os.environ.get("PROPMAP_TEST") == "1" else max(timeout, 55.0 if proxy else _TIMEOUT)
+    new_client = httpx.Client(**_client_kwargs(wait_s, hdrs, proxy))
+
+    with _client_lock:
+        # Double-check pattern
+        existing = _client_pool.get(key)
+        if existing is not None:
+            try:
+                _ = existing.is_closed
+                new_client.close()
+                return existing
+            except Exception:
+                _client_pool.pop(key, None)
+        _client_pool[key] = new_client
+        return new_client
 
 def _httpx_get(
     url: str,
@@ -89,24 +139,13 @@ def _httpx_get(
     headers: dict[str, str] | None = None,
     proxy: str | None = None,
 ) -> httpx.Response:
+    """Fetch URL using pooled httpx.Client for connection reuse."""
     hdrs = headers or HEADERS
-    wait_s = max(timeout, 55.0 if proxy else 35.0)
-    if os.environ.get("PROPMAP_TEST") == "1":
-        with httpx.Client(**_client_kwargs(timeout, hdrs, proxy)) as client:
-            return client.get(url)
-    clients = getattr(_tls, "clients", None)
-    if not isinstance(clients, dict):
-        clients = {}
-        _tls.clients = clients
-    key = f"{id(hdrs) if hdrs is HEADERS else 'custom'}|{proxy or ''}"
-    client = clients.get(key)
-    if client is None:
-        client = httpx.Client(
-            **_client_kwargs(wait_s, hdrs, proxy),
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-        )
-        clients[key] = client
-    return client.get(url)
+    wait_s = timeout if os.environ.get("PROPMAP_TEST") == "1" else max(timeout, 55.0 if proxy else _TIMEOUT)
+    client = _get_pooled_client(wait_s, hdrs, proxy)
+    response = client.get(url)
+    response.read()
+    return response
 
 
 def portal_way(url: str = "", listing_id: str = "") -> str:
@@ -142,7 +181,7 @@ def portal_host(url: str = "", listing_id: str = "") -> str:
 
 
 def fetch_text(url: str, timeout: float = 35.0, retries: int = 3, paced: bool = True) -> str:
-    """Sale por el carril que ya sabemos que anda. Un 404/410 da de baja el aviso."""
+    """Sale por el método que viene andando en este portal. Un 404/410 da de baja el aviso."""
     from .egress import can_fetch, lanes
 
     cached = _read_page_cache(url)
@@ -150,7 +189,7 @@ def fetch_text(url: str, timeout: float = 35.0, retries: int = 3, paced: bool = 
         return cached
     host = urlparse(url).netloc
     listing = _looks_like_listing(url)
-    way = portal_way(url)
+    way = routing.best(host, routing.kind_of(listing), portal_way(url))
     if (
         way != "translate"
         and _host_is_blocked(host)
@@ -168,16 +207,19 @@ def fetch_text(url: str, timeout: float = 35.0, retries: int = 3, paced: bool = 
 
 def _remember_ok(url: str, listing: bool, text: str, lane: str, host: str) -> str:
     _observe(host, lane, 200)
+    routing.note(host, routing.kind_of(listing), routing.way_of_lane(lane), True)
     return _remember_page(url, text)
 
 
 def _fetch_via_translate(url: str, timeout: float, paced: bool, listing: bool) -> str:
+    """Un método por vez. Si el traductor está en pausa, pasa al siguiente sin esperar."""
     host = urlparse(url).netloc
     proxied = _try_blocked_fallback(url, timeout, paced)
     if proxied is None:
         proxied = _try_translate_listing(url, timeout, paced)
     if proxied is not None and (not listing or _listing_html_ok(url, proxied)):
         return _remember_ok(url, listing, proxied, "translate", host)
+    routing.note(host, routing.kind_of(listing), "translate", False)
     stealth = _try_stealth_fetch(url, timeout)
     if stealth and (not listing or _listing_html_ok(url, stealth)):
         return _remember_ok(url, listing, stealth, "stealth", host)
@@ -213,6 +255,7 @@ def _fetch_via_local(
             response.raise_for_status()
             text = response.text
             if not listing or _listing_html_ok(url, text):
+                routing.note(host, routing.kind_of(listing), "local", True)
                 return _remember_page(url, text)
             last_error = RuntimeError("ficha incompleta")
         except PageGone:
@@ -230,6 +273,7 @@ def _fetch_via_local(
                     last_error = urllib_exc
         finally:
             release_local(host, hold=paced)
+        routing.note(host, routing.kind_of(listing), "local", False)
     if fallbacks:
         proxied = _try_translate_listing(url, timeout, paced)
         if proxied is not None:
@@ -249,6 +293,11 @@ def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries
     tries = min(4, len(hidden)) if hidden else (1 if _host_needs_proxy(url) else retries)
     skip_direct = _host_is_blocked(host) and _host_needs_proxy(url) and not can_fetch(host)
     tried: set[str] = set()
+    attempted = False
+    # Un carril por página. El resto queda libre para las páginas que van en paralelo.
+    if hidden:
+        tries = min(2, len(hidden))
+
     if not skip_direct:
         for attempt in range(max(1, tries)):
             lane = pick(host, exclude=tried)
@@ -257,9 +306,12 @@ def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries
             if hidden and lane.kind == "direct":
                 break
             if paced:
+                if crawl.cooling(host, lane.id):
+                    continue
                 crawl.wait(host=host, lane=lane.id)
                 if crawl.aborted():
                     raise RuntimeError("búsqueda pausada")
+            attempted = True
             try:
                 if not lane.proxy:
                     note_local_use(host)
@@ -286,6 +338,7 @@ def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries
                     last_error = RuntimeError("ficha incompleta")
                     tried.add(lane.id)
                     continue
+                routing.note(host, routing.kind_of(listing), "tor", True)
                 return _remember_page(url, text)
             except PageGone:
                 raise
@@ -293,7 +346,13 @@ def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries
                 last_error = exc
                 note_error(lane.id)
                 tried.add(lane.id)
-                time.sleep(1.2 * (attempt + 1))
+    if attempted:
+        routing.note(host, routing.kind_of(listing), "tor", False)
+    if not attempted or (hidden and tried):
+        # Carril en pausa o sin hueco: el traductor sigue con esta página, sin dormir.
+        alt = _try_translate_page(url, timeout, paced, listing)
+        if alt:
+            return _remember_ok(url, listing, alt, "translate", host)
     stealth = _try_stealth_fetch(url, timeout)
     if stealth and (not listing or _listing_html_ok(url, stealth)):
         return _remember_ok(url, listing, stealth, "stealth", host)
@@ -319,6 +378,7 @@ def _fetch_via_tor(url: str, timeout: float, paced: bool, listing: bool, retries
             response.raise_for_status()
             text = response.text
             if not listing or _listing_html_ok(url, text):
+                routing.note(host, routing.kind_of(listing), "local", True)
                 return _remember_page(url, text)
             last_error = RuntimeError("ficha incompleta")
         except PageGone:
@@ -367,7 +427,7 @@ def _host_is_blocked(host: str) -> bool:
     return until > time.time()
 
 
-def _mark_blocked(host: str, seconds: float = 25 * 60) -> None:
+def _mark_blocked(host: str, seconds: float = 10 * 60) -> None:
     key = (host or "").lower()
     if not key:
         return
@@ -526,8 +586,13 @@ def _try_blocked_fallback(url: str, timeout: float, paced: bool) -> str | None:
 def _try_translate_listing(url: str, timeout: float, paced: bool) -> str | None:
     if not _looks_like_listing(url):
         return None
+    return _try_translate_page(url, timeout, paced, listing=True)
+
+
+def _try_translate_page(url: str, timeout: float, paced: bool, listing: bool) -> str | None:
+    """Un idioma del traductor. Si Yandex está en pausa, vuelve al toque."""
     try:
-        return _fetch_translate_proxy(url, timeout, paced, listing=True)
+        return _fetch_translate_proxy(url, timeout, paced, listing=listing)
     except PageGone:
         raise
     except Exception:
@@ -535,65 +600,84 @@ def _try_translate_listing(url: str, timeout: float, paced: bool) -> str | None:
 
 
 def _try_hidden_fetch(url: str, timeout: float, paced: bool, listing: bool) -> str | None:
-    """Un intento por Tor/proxy ya electo, sin esperar el cooldown de 403."""
+    """Un solo carril oculto. Los demás quedan para otras páginas."""
     from .egress import lanes, note_error, pick
 
     host = urlparse(url).netloc
     hidden = [lane for lane in lanes() if lane.kind != "direct"]
     if not hidden:
         return None
-    tried: set[str] = set()
-    for _ in range(min(3, len(hidden))):
-        lane = pick(host, exclude=tried)
-        if lane is None or lane.kind == "direct":
+    lane = pick(host)
+    if lane is None or lane.kind == "direct":
+        return None
+    if paced:
+        if crawl.cooling(host, lane.id):
             return None
-        tried.add(lane.id)
-        if paced:
-            crawl.wait(host=host, lane=lane.id)
-            if crawl.aborted():
-                return None
-        try:
-            response = _httpx_get(url, timeout, proxy=lane.proxy)
-            crawl.note_http(response.status_code, host, lane=lane.id)
-            _observe(host, lane.id, response.status_code)
-            if response.status_code in {404, 410}:
-                raise PageGone(f"HTTP {response.status_code}")
-            if response.status_code in {401, 403, 405, 429, 503}:
-                note_error(lane.id)
-                continue
-            response.raise_for_status()
-            text = response.text
-            if listing and not _listing_html_ok(url, text):
-                continue
-            return text
-        except PageGone:
-            raise
-        except Exception:
+        crawl.wait(host=host, lane=lane.id)
+        if crawl.aborted():
+            return None
+    try:
+        response = _httpx_get(url, timeout, proxy=lane.proxy)
+        crawl.note_http(response.status_code, host, lane=lane.id)
+        _observe(host, lane.id, response.status_code)
+        if response.status_code in {404, 410}:
+            raise PageGone(f"HTTP {response.status_code}")
+        if response.status_code in {401, 403, 405, 429, 503}:
             note_error(lane.id)
-    return None
+            return None
+        response.raise_for_status()
+        text = response.text
+        if listing and not _listing_html_ok(url, text):
+            return None
+        return text
+    except PageGone:
+        raise
+    except Exception:
+        note_error(lane.id)
+        return None
+
+
+_lang_lock = threading.Lock()
+_lang_i = 0
+
+
+def _translate_langs(n: int = 3) -> list[str]:
+    """Rota el idioma de arranque para que páginas en paralelo no peguen todas al mismo."""
+    global _lang_i
+    with _lang_lock:
+        start = _lang_i
+        _lang_i += 1
+    total = len(TRANSLATE_LANGS)
+    return [TRANSLATE_LANGS[(start + i) % total] for i in range(min(n, total))]
 
 
 def _fetch_translate_proxy(url: str, timeout: float, paced: bool, listing: bool = False) -> str:
-    last_error: Exception | None = None
-    for lang in TRANSLATE_LANGS:
+    """Un idioma por vez. Si el primero responde, no se piden los demás.
+
+    El pacing y el cooldown se aíslan por portal *destino*, no por el canal
+    de Yandex: si MercadoLibre 400/403 sobre Yandex, solo sus fichas esperan;
+    ZonaProp/Argenprop/Properati siguen bajando sin robarse los tiempos.
+    """
+    channel = urlparse(TRANSLATE_PROXY).netloc  # translate.yandex.com
+    dest = urlparse(url).netloc or channel  # el portal de verdad
+    if paced and (crawl.cooling(channel) or crawl.host_cooling(channel, "direct")):
+        raise RuntimeError("traductor en pausa")
+
+    def try_lang(lang: str) -> str | None:
         proxy = translate_proxy_url(url, lang)
-        host = urlparse(proxy).netloc
         if paced:
-            if crawl.cooling(host) or crawl.host_cooling(host, "direct"):
-                last_error = RuntimeError("traductor en pausa")
-                break
-            crawl.wait(host=host)
+            if crawl.cooling(dest, "translate"):
+                return None
+            crawl.wait(host=dest, lane="translate")
             if crawl.aborted():
-                raise RuntimeError("búsqueda pausada")
+                return None
         try:
             with httpx.Client(headers=PROXY_HEADERS, follow_redirects=True, timeout=max(timeout, 25.0)) as client:
                 response = client.get(proxy)
-                crawl.note_http(response.status_code, host)
-                _observe(host, "translate", response.status_code)
+                crawl.note_http(response.status_code, dest, lane="translate")
+                _observe(dest, "translate", response.status_code)
                 if response.status_code in {400, 429, 503}:
-                    last_error = RuntimeError(f"HTTP {response.status_code}")
-                    time.sleep(1.5)
-                    continue
+                    return None
                 response.raise_for_status()
                 text = response.text
             if listing:
@@ -601,10 +685,15 @@ def _fetch_translate_proxy(url: str, timeout: float, paced: bool, listing: bool 
                     return text
             elif proxy_html_looks_valid(text):
                 return text
-            last_error = RuntimeError("el proxy no devolvió la ficha")
-        except Exception as exc:
-            last_error = exc
-    raise last_error or RuntimeError("el proxy no devolvió la ficha")
+        except Exception:
+            pass
+        return None
+
+    for lang in _translate_langs(3):
+        result = try_lang(lang)
+        if result:
+            return result
+    raise RuntimeError("el proxy no devolvió la ficha")
 
 
 def _fetch_urllib(url: str, timeout: float) -> str:

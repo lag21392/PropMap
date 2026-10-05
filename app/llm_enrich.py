@@ -33,7 +33,7 @@ PREP_WORKERS = 2
 READY_CAP = 3
 # Sin tope: el único slot de GPU no puede quedarse esperando a que SQLite
 # termine de guardar. El hilo llm-apply drena la cola en orden.
-_out_q: queue.Queue[Any] = queue.Queue(maxsize=64)
+_out_q: queue.Queue[Any] = queue.Queue()
 _out_lock = threading.Lock()
 _out_worker: threading.Thread | None = None
 _prov_lock = threading.Lock()

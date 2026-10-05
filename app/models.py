@@ -223,9 +223,13 @@ class Listing:
 
         grade = live_pin_grade(self)
         data["pin_grade"] = grade
-        from .profile import compute_profile
+        from .profile import compute_profile, stamp_profile
 
         data["profile"] = compute_profile(self, {})
+        from .listings_cache import apply_poi_overlay
+
+        if apply_poi_overlay([data]):
+            data["profile"] = stamp_profile(data["profile"])
         from .listing_signals import signals_for
 
         data.update(signals_for(self))

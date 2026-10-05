@@ -249,19 +249,38 @@ def detect_type(text: str, fallback: str) -> str:
 
 
 def page_workers() -> int:
-    """Cuántas páginas de un mismo portal se piden a la vez (un carril Tor cada una)."""
+    """Cuántas páginas de un mismo portal van en vuelo (un carril libre cada una)."""
     if os.environ.get("PROPMAP_TEST") == "1":
         return 1
     try:
         from ..egress import lane_count
 
-        return max(1, min(4, lane_count()))
+        return max(1, min(8, lane_count()))
     except Exception:
         return 1
 
 
+def _accept_page(chunk, seen: set[str]) -> tuple[list, bool]:
+    """Devuelve los avisos nuevos de la página y si hay que dejar de pedir las siguientes."""
+    from .. import freshness
+
+    if not chunk:
+        return [], True
+    fresh = [x for x in chunk if x.source_id not in seen]
+    if not fresh:
+        return [], True
+    unknown = [x for x in fresh if not freshness.is_known(x.id)]
+    for x in fresh:
+        seen.add(x.source_id)
+    return fresh, len(chunk) < 8 or not unknown
+
+
 def paginate(fetch_page, max_pages: int | None = None, should_stop=None, on_chunk=None) -> list:
-    from concurrent.futures import as_completed
+    """Ventana deslizante: en cuanto termina la página más baja, entra la siguiente.
+
+    Así una página lenta no frena al resto. Los resultados se aplican en orden.
+    """
+    from concurrent.futures import FIRST_COMPLETED, wait
 
     from .. import freshness
     from ..concurrency import get_io_executor
@@ -270,48 +289,62 @@ def paginate(fetch_page, max_pages: int | None = None, should_stop=None, on_chun
     items = []
     seen: set[str] = set()
     limit = max_pages if max_pages is not None else list_page_limit()
-    width = page_workers()
-    page = 1
+    width = max(1, page_workers())
     executor = get_io_executor()
-    while page <= limit:
+    next_page = 1
+    expect = 1
+    stop = False
+    inflight: dict = {}
+    ready: dict[int, list] = {}
+
+    def launch() -> None:
+        nonlocal next_page
+        while not stop and next_page <= limit and len(inflight) < width:
+            if should_stop and should_stop():
+                return
+            num = next_page
+            next_page += 1
+            if width == 1:
+                ready[num] = fetch_page(num) or []
+                return
+            inflight[executor.submit(_fetch_page_safe, fetch_page, num)] = num
+
+    launch()
+    while expect <= limit:
         if should_stop and should_stop():
             break
-        batch = list(range(page, min(limit, page + width - 1) + 1))
-        fetched: dict[int, list] = {}
-        if len(batch) == 1:
-            fetched[batch[0]] = fetch_page(batch[0]) or []
-        else:
-            futs = {executor.submit(fetch_page, num): num for num in batch}
-            for fut in as_completed(futs):
-                num = futs[fut]
+        if expect not in ready:
+            if not inflight:
+                break
+            done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
+            for fut in done:
+                num = inflight.pop(fut)
                 try:
-                    fetched[num] = fut.result() or []
+                    ready[num] = fut.result() or []
                 except Exception:
-                    fetched[num] = []
-        stop = False
-        for num in batch:
-            chunk = fetched.get(num) or []
-            if not chunk:
-                stop = True
-                break
-            fresh = [x for x in chunk if x.source_id not in seen]
-            if not fresh:
-                stop = True
-                break
-            unknown = [x for x in fresh if not freshness.is_known(x.id)]
-            for x in fresh:
-                seen.add(x.source_id)
+                    ready[num] = []
+            if not stop:
+                launch()
+            continue
+        chunk = ready.pop(expect)
+        fresh, stop = _accept_page(chunk, seen)
+        if fresh:
             items.extend(fresh)
             if on_chunk:
                 on_chunk(fresh)
             freshness.note_ids(x.id for x in fresh)
-            if len(chunk) < 8 or not unknown:
-                stop = True
-                break
         if stop:
             break
-        page += len(batch)
+        expect += 1
+        launch()
     return items
+
+
+def _fetch_page_safe(fetch_page, num: int) -> list:
+    try:
+        return fetch_page(num) or []
+    except Exception:
+        return []
 
 
 def tree(url: str):

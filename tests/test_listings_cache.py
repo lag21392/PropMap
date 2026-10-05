@@ -378,12 +378,14 @@ def test_load_city_final_snap_keeps_description_and_rent(monkeypatch):
     monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
     reset()
     item = _item("ficha-1", "caba")
-    item.description = "Living comedor al frente con balcón y cocina independiente."
+    # El aviso original puede traer teléfonos y nombres: a la página sale la ficha redactada.
+    item.description = "Living comedor al frente. Llamar al 11-5555-5555."
     item.extra = {
         "monthly_rent_usd": 450,
         "monthly_yield_pct": 5.2,
         "nightly_usd": 38,
         "temporal_yield_pct": 8.1,
+        "copy": {"ver": 2, "text": "Qué es: dos ambientes en Palermo con balcón."},
     }
     monkeypatch.setattr("app.store.init", lambda: None)
     monkeypatch.setattr("app.store.fetch_by_cities", lambda _ids: [item])
@@ -397,7 +399,8 @@ def test_load_city_final_snap_keeps_description_and_rent(monkeypatch):
     data = json.loads(raw)
     assert data.get("warming") is not True
     row = data["listings"][0]
-    assert "Living" in (row.get("description") or "")
+    assert "dos ambientes en Palermo" in (row.get("description") or "")
+    assert "5555" not in (row.get("description") or ""), "el aviso original no sale a la página"
     assert row.get("monthly_yield_pct") == 5.2
     assert row.get("monthly_rent_usd") == 450
     pins, _penc = listings_cache.listings_pins_body("caba")

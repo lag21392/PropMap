@@ -82,16 +82,17 @@ _scheduler_started = False
 _rest_gen: dict[str, int] = {}
 DAILY_SEC = 24 * 3600
 CHECK_EVERY_SEC = 8
-BETWEEN_CITIES_SEC = 3
-MAX_JOBS = 1
-MAX_BACKGROUND = 1
-PORTAL_WORKERS = 4
+BETWEEN_CITIES_SEC = 1
+MAX_JOBS = 3
+MAX_BACKGROUND = 2
+PORTAL_WORKERS = 8
 
 
 def _egress_snapshot() -> dict:
     from .egress import snapshot as egress_snapshot
+    from .routing import snapshot as routing_snapshot
 
-    return egress_snapshot()
+    return {**egress_snapshot(), "routing": routing_snapshot()}
 
 
 _last_public: dict = {}
@@ -730,10 +731,8 @@ def _scrape_one_city(
             "mercadolibre": "inmuebles.mercadolibre.com.ar",
         }.get(name, "")
         if host and not can_fetch(host):
-            report(f"{city['label']}: {name} en pausa por bloqueo, sigo con otros portales.")
-            with count_lock:
-                counts.setdefault(f"{name}:{city_id}", 0)
-            return name, False
+            # Los carriles Tor están en pausa. El listado sigue por traductor u otro método.
+            report(f"{city['label']}: {name} sin carril libre, sigo por otro método.")
         with crawl.job_context(slow=slow_flag, should_stop=stop):
             try:
                 items = scraper(
@@ -849,38 +848,37 @@ def _enrich_details(
             f"{city_label}: {total} fichas pendientes, {skipped} ya bajadas."
         )
 
-    from .detail_fetch import workers as detail_workers
-
-    workers = detail_workers()
-
-    def _one(item: Listing) -> Listing:
-        try:
-            enrich_details(item, should_stop=stop)
-        except Exception:
-            analyze(item)
-        return item
+    from .detail_fetch import detail_slot
 
     done = 0
-    with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
-        futs = [pool.submit(_one, item) for item in pending]
-        for fut in as_completed(futs):
-            if stop():
-                report(f"Pausa pedida. Fichas {city_label}: {done}/{total}.")
-                return True
+    for item in pending:
+        if stop():
+            report(f"Pausa pedida. Fichas {city_label}: {done}/{total}.")
+            return True
+        detail_ok = False
+        try:
+            with detail_slot():
+                enrich_details(item, should_stop=stop)
+            detail_ok = bool(item.details_scraped)
+        except Exception:
+            analyze(item)
+        finally:
             try:
-                item = fut.result()
+                from .ops import note as ops_note
+
+                ops_note("details", outcome="ok" if detail_ok else "fail")
             except Exception:
-                continue
-            if (item.extra or {}).get("gone"):
-                done += 1
-                continue
-            store.upsert_many([item])
-            enqueue([item])
+                pass
+        if (item.extra or {}).get("gone"):
             done += 1
-            wait = crawl.snapshot().get("wait_s") or 0
-            extra = f" · espera {wait:.0f}s" if crawl.is_slow() and wait else ""
-            label = (item.address or item.title or "")[:48]
-            report(f"{city_label}: ficha {done}/{total}{extra} · {label}")
+            continue
+        store.upsert_many([item])
+        enqueue([item])
+        done += 1
+        wait = crawl.snapshot().get("wait_s") or 0
+        extra = f" · espera {wait:.0f}s" if crawl.is_slow() and wait else ""
+        label = (item.address or item.title or "")[:48]
+        report(f"{city_label}: ficha {done}/{total}{extra} · {label}")
     return False
 
 
@@ -1258,8 +1256,10 @@ def maybe_daily_refresh() -> None:
     running = _running_ids()
     # El mantenimiento (POIs, geo) no puede ir antes: un scan largo de la base
     # deja el hilo diario ahí y la ciudad que toca no arranca.
-    if crawl.aborted() and not running:
-        return
+    if not running:
+        # La pausa vale para la búsqueda que estaba en curso, no para el motor.
+        crawl.clear_abort()
+        _stop.clear()
     from .schedule import home_scrape_id, next_jobs
 
     try:

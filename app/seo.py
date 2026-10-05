@@ -7,6 +7,7 @@ import json
 import os
 import re
 import statistics
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,8 @@ _MIN_TYPE = 4
 _CACHE_SEC = 60.0
 _rows_at = 0.0
 _rows_memo: list | None = None
+_refresh_lock = threading.Lock()
+_refreshing = False
 _KIND = {
     "casa": ("Casas", "Casas en venta"),
     "departamento": ("Departamentos", "Departamentos en venta"),
@@ -107,8 +110,7 @@ def sitemap_xml(request) -> str:
     origin = origin_for(request)
     pages = (
         ("/", STATIC / "index.html", "weekly", "1.0"),
-        ("/legal", STATIC / "legal.html", "monthly", "0.3"),
-    )
+        ("/legal", STATIC / "legal.html", "monthly", "0.3"),    )
     chunks = []
     for path, file, freq, priority in pages:
         stamp = datetime.fromtimestamp(file.stat().st_mtime, timezone.utc).date().isoformat()
@@ -149,7 +151,8 @@ def sitemap_cities_xml(request) -> str:
 
 def footer_nav() -> str:
     try:
-        rows = iter_cities()
+        # La portada es async: este listado no puede frenar el hilo de la API.
+        rows = iter_cities(wait=False)
     except Exception:
         rows = []
     parts = ['<a href="/ciudades">Ciudades con avisos</a>']
@@ -221,17 +224,41 @@ def city_page(request, slug: str, tipo: str | None = None) -> tuple[str, int, di
     return body, 200, headers
 
 
-def iter_cities() -> list[dict]:
+def iter_cities(*, wait: bool = True) -> list[dict]:
     global _rows_at, _rows_memo
     testing = os.environ.get("PROPMAP_TEST") == "1"
     now = time.monotonic()
-    if not testing and _rows_memo is not None and now - _rows_at < _CACHE_SEC:
+    fresh = _rows_memo is not None and now - _rows_at < _CACHE_SEC
+    if not testing and fresh:
         return _rows_memo
+    if not wait and not testing:
+        _schedule_city_refresh()
+        return list(_rows_memo or [])
     rows = _load_cities()
     if not testing:
         _rows_memo = rows
         _rows_at = now
     return rows
+
+
+def _schedule_city_refresh() -> None:
+    global _refreshing
+    with _refresh_lock:
+        if _refreshing:
+            return
+        _refreshing = True
+    threading.Thread(target=_refresh_cities, daemon=True, name="seo-cities").start()
+
+
+def _refresh_cities() -> None:
+    global _rows_at, _rows_memo, _refreshing
+    try:
+        rows = _load_cities()
+        _rows_memo = rows
+        _rows_at = time.monotonic()
+    finally:
+        with _refresh_lock:
+            _refreshing = False
 
 
 def find_city(token: str) -> dict | None:

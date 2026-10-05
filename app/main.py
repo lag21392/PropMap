@@ -28,9 +28,13 @@ STATIC = ROOT / "static"
 async def lifespan(_app: FastAPI):
     from anyio.to_thread import current_default_thread_limiter
 
+    from .watchdog import mark_serving, start as start_watchdog
+
     current_default_thread_limiter().total_tokens = max(
         64, current_default_thread_limiter().total_tokens
     )
+    if os.environ.get("PROPMAP_TEST") != "1":
+        start_watchdog()
     store.init()
     load_custom_places()
     if os.environ.get("PROPMAP_TEST") != "1":
@@ -43,15 +47,18 @@ async def lifespan(_app: FastAPI):
 
             start_matomo_sync()
         start_alerts_worker()
-        from .watchdog import start as start_watchdog
-
-        start_watchdog()
         import threading
 
         from .laya_client import warmup_laya
 
         threading.Thread(target=warmup_laya, name="laya-warmup", daemon=True).start()
+        mark_serving()
     yield
+    if os.environ.get("PROPMAP_TEST") != "1":
+        try:
+            store.checkpoint("PASSIVE")
+        except Exception:
+            pass
 
 
 _CSP = (

@@ -152,6 +152,10 @@ def test_robots_hides_admin_paths():
 
 
 def test_compose_binds_matomo_to_localhost():
+    """El puerto cambia entre desarrollo y producción; lo que no cambia es que no sale a internet."""
+    import re
+
     text = (main.ROOT / "compose.yaml").read_text(encoding="utf-8")
-    assert "127.0.0.1:3112:80" in text
-    assert '"3112:80"' not in text
+    assert re.search(r'"127\.0\.0\.1:\d+:80"', text), "Matomo tiene que publicarse solo en loopback"
+    expuesto = re.findall(r'^\s*-\s*"(?:\[::\]:)?\d+:80"\s*$', text, re.M)
+    assert expuesto == [], f"Matomo queda expuesto en todas las interfaces: {expuesto}"

@@ -15,35 +15,38 @@ from .errors import PageGone
 from .stealth import _try_stealth_fetch
 
 TRANSLATE_PROXY = "https://translate.yandex.com/translate"
-TRANSLATE_LANGS = ("es-en", "es-es")
+# Expanded language pairs for better fallback coverage
+TRANSLATE_LANGS = ("es-en", "es-es", "es-pt", "es-fr", "es-it", "es-de", "en-es", "pt-es", "fr-es")
 
 def translate_proxy_url(url: str, lang: str = "es-en") -> str:
     from urllib.parse import quote
     return f"{TRANSLATE_PROXY}?lang={lang}&url={quote(url, safe='')}"
 
 def _fetch_translate_proxy(url: str, timeout: float, paced: bool, listing: bool = False) -> str:
+    """Fetch via translate proxy with parallel language attempts for speed."""
+    import concurrent.futures
     from app import crawl
 
-    last_error: Exception | None = None
-    for lang in TRANSLATE_LANGS:
+    # Fast path: try first 6 languages in parallel, then remaining if needed
+    primary_langs = TRANSLATE_LANGS[:6]
+    fallback_langs = TRANSLATE_LANGS[6:]
+
+    def try_lang(lang: str) -> str | None:
         proxy = translate_proxy_url(url, lang)
         host = urlparse(proxy).netloc
         if paced:
             if crawl.cooling(host) or crawl.host_cooling(host, "direct"):
-                last_error = RuntimeError("traductor en pausa")
-                break
+                return None
             crawl.wait(host=host)
             if crawl.aborted():
-                raise RuntimeError("búsqueda pausada")
+                return None
         try:
             with httpx.Client(headers=client.PROXY_HEADERS, follow_redirects=True, timeout=max(timeout, 25.0)) as cli:
                 response = cli.get(proxy)
                 crawl.note_http(response.status_code, host)
                 observability._observe(host, "translate", response.status_code)
                 if response.status_code in {400, 429, 503}:
-                    last_error = RuntimeError(f"HTTP {response.status_code}")
-                    time.sleep(1.5)
-                    continue
+                    return None
                 response.raise_for_status()
                 text = response.text
             if listing:
@@ -51,10 +54,28 @@ def _fetch_translate_proxy(url: str, timeout: float, paced: bool, listing: bool 
                     return text
             elif validators.proxy_html_looks_valid(text):
                 return text
-            last_error = RuntimeError("el proxy no devolvió la ficha")
-        except Exception as exc:
-            last_error = exc
-    raise last_error or RuntimeError("el proxy no devolvió la ficha")
+        except Exception:
+            pass
+        return None
+
+    # Try primary languages in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(try_lang, lang): lang for lang in primary_langs}
+        for future in concurrent.futures.as_completed(futures, timeout=timeout):
+            try:
+                result = future.result()
+                if result:
+                    return result
+            except Exception:
+                pass
+
+    # Sequential fallback for remaining languages (less common)
+    for lang in fallback_langs:
+        result = try_lang(lang)
+        if result:
+            return result
+
+    raise RuntimeError("el proxy no devolvió la ficha")
 
 def _fetch_urllib(url: str, timeout: float) -> str:
     import urllib.error

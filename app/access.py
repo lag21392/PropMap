@@ -506,8 +506,24 @@ def near_payload(
         out["pending"] = False
         out["city"] = cid
         return out
-    # No calcular acá: un score armado en la lectura no está en la ficha y
-    # el pentágono muestra un número que desaparece al recargar.
+    if pin_is_precise(item) and item.lat is not None and item.lon is not None and item.city:
+        from .osm_poi import ensure_city_pois
+
+        pois = city_pois(item.city)
+        if any(pois.get(key) for key in pois):
+            live = compute_access(item, pois)
+            if live.get("score") is not None:
+                try:
+                    _save_access(item, live)
+                except Exception:
+                    log.exception("no pude guardar los POIs de %s", item.id)
+                out = dict(live)
+                out["pending"] = False
+                out["city"] = cid
+                return out
+        else:
+            ensure_city_pois(item.city, blocking=False)
+            enqueue_poi_score(item)
     out = dict(stored) if stored else {}
     out["pending"] = True
     out["score"] = None

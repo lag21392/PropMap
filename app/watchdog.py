@@ -28,6 +28,8 @@ _started = 0.0
 _fails = 0
 _ok_once = False
 _stop = threading.Event()
+_serving = threading.Event()
+_serving.set()
 _thread: threading.Thread | None = None
 
 
@@ -60,9 +62,15 @@ def start() -> None:
         return
     _started = time.time()
     _stop.clear()
+    _serving.clear()
     _write(ok=True)
     _thread = threading.Thread(target=_loop, daemon=True, name="watchdog")
     _thread.start()
+
+
+def mark_serving() -> None:
+    """El healthcheck de Docker puede latir durante el open de SQLite; /api/alive recién después."""
+    _serving.set()
 
 
 def stop() -> None:
@@ -109,6 +117,8 @@ def _dump_threads() -> None:
 
 def _stuck_reason() -> str:
     """Vacío si todo responde; si no, qué chequeo se trabó (para no adivinar en los logs)."""
+    if not _serving.is_set():
+        return ""
     from . import listings_cache, pipeline
 
     # cities_loading() no debe esperar el candado: si está tomado, ping_lock decide.
