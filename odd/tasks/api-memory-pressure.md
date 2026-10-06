@@ -45,5 +45,7 @@ The production Uvicorn process was observed at about 20 GiB RSS, almost entirely
 - Pressure-eviction follow-up: `PYTHONPATH=. pytest -q tests/test_listings_cache.py tests/test_daily_cycle.py tests/test_store_pool.py tests/test_store_extra.py` — 74 passed in 3.21s.
 - Parent spot-check on the final worktree: same focused suite — 74 passed in 2.91s.
 - `git diff --check` passed.
-- Native receipt review preflight returned `immutable_review_transport_unsupported` for this runtime; final native risk assessment was medium with `review_due=false` (`under_budget`). No review approval or deployment is claimed.
+- Work-unit commit: `53cbc39581949e428170d67cf0054a18ad1e3afc` (`fix: reduce API memory pressure during scrapes`).
+- Native receipt review is unavailable in this runtime: preflight returned `immutable_review_transport_unsupported`, and committed-only assessment returned `unassessable`/`review_due=true`. No review approval or deployment is claimed.
+- Git's automatic maintenance reported a pre-existing empty object in the shared repository; the commit succeeded and the object was not modified.
 - Engram mirror remains pending because no Engram tools are available in this session.
