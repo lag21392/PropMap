@@ -12,7 +12,7 @@ The production Uvicorn process was observed at about 20 GiB RSS, almost entirely
 
 - Fix memory retained by the listing/card cache and reduce redundant full-catalog materialization during scrapes.
 - Preserve user-visible listings, ordering, persistence, and scraper retry behavior.
-- Preserve all pre-existing worktree changes; do not touch runtime data or restart production.
+- Preserve all pre-existing worktree changes; do not touch runtime data. Production restart was initially out of scope; the user later explicitly authorized deploying and starting the updated Docker service.
 - Route: delegated direct; coordinated changes require code, regression tests, and this task record.
 - TDD: no explicit project/session mode found; use focused pytest.
 - Delivery: `feature-branch-chain`, selected pragmatically for the existing feature branch after no answer was available; no PR was created.
@@ -49,3 +49,5 @@ The production Uvicorn process was observed at about 20 GiB RSS, almost entirely
 - Native receipt review is unavailable in this runtime: preflight returned `immutable_review_transport_unsupported`, and committed-only assessment returned `unassessable`/`review_due=true`. No review approval or deployment is claimed.
 - Git's automatic maintenance reported a pre-existing empty object in the shared repository; the commit succeeded and the object was not modified.
 - Engram mirror remains pending because no Engram tools are available in this session.
+- After the user's explicit deployment request, `docker compose -f compose.prod.yaml up -d --build propmap` built `propmap:prod` and started the configured service and its Compose dependencies; no port override or `PROPMAP_SHARE_DB` override was applied. The app is healthy on the configured host port `8000` with restart policy `unless-stopped`.
+- Deployment smoke checks: `/`, `/static/app.js`, `/api/health`, and `/api/status` returned HTTP 200; health returned `ok: true`. Initial API container memory was 583.9 MiB with 23 GiB available on host. No code or port configuration was changed as part of deployment.
