@@ -854,6 +854,35 @@ def test_search_places_prefix_shows_city_and_province(monkeypatch):
         reset_listed_places()
 
 
+def test_search_places_matches_province(monkeypatch):
+    from app.geo import CITY_ALIASES, CITIES, register_city
+    from app.places import forget_place, reset_listed_places, reset_search_cache, search_places
+
+    reset_listed_places()
+    reset_search_cache()
+    monkeypatch.setattr("app.places._nominatim", lambda *a, **k: [])
+    monkeypatch.setattr("app.places.search_city_places", lambda *a, **k: [])
+    register_city(
+        "rawson-chubut",
+        label="Rawson",
+        lat=-43.3002,
+        lon=-65.1023,
+        province="chubut",
+        builtin=False,
+    )
+    try:
+        rows = [row for row in search_places("Chubut") if row.get("id") == "rawson-chubut"]
+        assert rows
+        assert rows[0]["label"] == "Rawson"
+        assert "Chubut" in str(rows[0].get("province_label") or rows[0].get("hint") or "")
+    finally:
+        forget_place("rawson-chubut")
+        CITIES.pop("rawson-chubut", None)
+        for token, owner in list(CITY_ALIASES.items()):
+            if owner == "rawson-chubut" or token == "rawson-chubut":
+                CITY_ALIASES.pop(token, None)
+        reset_listed_places()
+
 def test_listed_cities_keeps_homonyms(monkeypatch):
     from app.geo import CITY_ALIASES, CITIES, register_city
     from app.place_api import remember

@@ -419,7 +419,14 @@ def preload_priority_places() -> list[str]:
 
 def _row_matches_query(query: str, row: dict) -> bool:
     names = [str(row.get("label") or ""), str(row.get("id") or ""), str(row.get("slug") or "")]
-    return _name_hit(fold(query), [name for name in names if name])
+    names = [name for name in names if name]
+    folded = fold(query)
+    if _name_hit(folded, names):
+        return True
+    prov = str(row.get("province_label") or row.get("province") or "")
+    if prov and _name_hit(folded, [prov]):
+        return True
+    return False
 
 
 def search_places(query: str, limit: int = 8) -> list[dict]:
@@ -440,6 +447,10 @@ def search_places(query: str, limit: int = 8) -> list[dict]:
         names = [cfg["label"], city_id, *(cfg.get("aliases") or [])]
         if _name_hit(folded, names) and _listed_row_is_city(city_id, cfg):
             add(_public_city(cfg))
+        elif cfg.get("province"):
+            prov = _province_display(str(cfg["province"]))
+            if prov and _name_hit(folded, [prov]) and _listed_row_is_city(city_id, cfg):
+                add(_public_city(cfg))
     cached = _read_search_cache(folded)
     if cached:
         for row in cached:

@@ -892,6 +892,21 @@ def listings(
     return _with_timing("listings", t0, warming_payload(city or None), extra)
 
 
+@app.get("/api/rentals")
+def rentals(
+    city: str = Query(""),
+    period: str = Query("", pattern="^(monthly|nightly|weekly)?$"),
+) -> dict:
+    from . import store
+
+    rows = store.fetch_rentals(city or None)
+    if city:
+        rows = [row for row in rows if row.get("city") == city]
+    if period:
+        rows = [row for row in rows if row.get("period") == period]
+    return {"city": city, "period": period or None, "listings": rows}
+
+
 @app.get("/api/pois")
 def pois(city: str = Query(""), summary: bool = Query(True)) -> dict:
     from .osm_poi import CAT_LABEL, city_pois, ensure_city_pois, origin_for_city, pending

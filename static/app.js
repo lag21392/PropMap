@@ -113,6 +113,7 @@ let stackMarkers = [];
 let approxBox = null;
 
 let allListings = [];
+let listingMode = "buy";
 let listWindowItems = [];
 let listWinRange = "";
 let listCardH = 200;
@@ -618,6 +619,63 @@ async function loadCardPages(city, seq) {
   }
 }
 
+function setListingMode(mode) {
+  if (mode !== "buy" && mode !== "rent") return;
+  if (listingMode === mode) return;
+  listingMode = mode;
+  document.body.classList.toggle("rent-mode", mode === "rent");
+  document.querySelectorAll("[data-listing-mode]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.listingMode === mode));
+  });
+  $("rentalPeriodControl").hidden = mode !== "rent";
+  document.querySelectorAll("#sortBy [data-sale-only]").forEach((option) => {
+    option.hidden = mode === "rent";
+  });
+  $("sortBy").value = mode === "rent" ? "price-asc" : "deal";
+  if ($("freeTextSearch")) {
+    $("freeTextSearch").value = "";
+    $("freeTextSearch").placeholder = mode === "rent"
+      ? "Palabras del aviso, barrio o zona"
+      : "casa luminosa con patio en Palermo, 3 dormitorios, hasta 200 mil";
+  }
+  clearLoadedListings();
+  if (mode === "rent") loadRentals();
+  else load({ waitKind: "init" });
+}
+
+function rentalStatusLine() {
+  const uncertain = allListings.filter((item) => !rentalPriceUsable(item)).length;
+  return `Mostrando ${allListings.length} alquileres; ${uncertain} requieren confirmar precio o período en el aviso.`;
+}
+
+async function loadRentals() {
+  const city = currentCity();
+  const seq = ++viewSeq;
+  listingsReady = false;
+  showListingsWait("city");
+  try {
+    const params = new URLSearchParams({ city });
+    const response = await timedFetch(`/api/rentals?${params}`, "rentals");
+    if (!response.ok) throw new Error(String(response.status));
+    const data = await response.json();
+    if (seq !== viewSeq || listingMode !== "rent") return;
+    allListings = data.listings || [];
+    listingsReady = true;
+    hideListingsWait();
+    fillZonas(cityItems());
+    fillBarrios();
+    render();
+    $("statusLine").textContent = rentalStatusLine();
+  } catch (_) {
+    if (seq !== viewSeq || listingMode !== "rent") return;
+    allListings = [];
+    listingsReady = true;
+    hideListingsWait();
+    render();
+    $("statusLine").textContent = "No pudimos cargar los alquileres. Probá de nuevo en un momento.";
+  }
+}
+
 async function load(opts = {}) {
   const city = currentCity();
   if (loadInFlight && opts.live) return;
@@ -799,6 +857,20 @@ function renderKpis(stats) {
 
 
 function renderKpisFromItems(items) {
+  if (listingMode === "rent") {
+    const monthly = items.filter((item) => item.period === "monthly" && rentalPriceUsable(item));
+    const nightly = items.filter((item) => item.period === "nightly" && rentalPriceUsable(item));
+    const weekly = items.filter((item) => item.period === "weekly" && rentalPriceUsable(item));
+    const confirm = items.length - monthly.length - nightly.length - weekly.length;
+    $("kpis").innerHTML = [
+      kpi(items.length, "alquileres en esta vista"),
+      kpi(monthly.length, "mensuales"),
+      kpi(nightly.length, "por noche"),
+      kpi(weekly.length, "por semana"),
+      kpi(confirm, "importe a confirmar"),
+    ].join("");
+    return;
+  }
   const comps = items.filter((x) => !x.exclude_from_comps);
   const usd = comps.map((x) => x.price_usd).filter(Boolean).sort((a, b) => a - b);
   const m2 = comps.map((x) => x.price_m2).filter(Boolean).sort((a, b) => a - b);
@@ -916,6 +988,15 @@ function placeCaption(c) {
   const hint = String(c.hint || "").trim();
   if (hint) return hint;
   return String(c.label || c.id || "");
+}
+
+function placeProvinceLabel(c) {
+  if (!c) return "";
+  const named = String(c.province_label || "").trim();
+  if (named) return named;
+  const slug = String(c.province || "").trim();
+  if (slug) return slug.replace(/-/g, " ");
+  return "";
 }
 
 function placeSuggestSub(p) {
@@ -1054,7 +1135,23 @@ function fillCities(cities, opts = {}) {
     if (manual) manual.innerHTML = "";
     return;
   }
-  const options = rows.map((c) => `<option value="${c.id}">${placeCaption(c)}</option>`).join("");
+  const optionList = (list) => list.map((c) => `<option value="${c.id}">${placeCaption(c)}</option>`).join("");
+  const groups = new Map(); // province label -> [{c, order}]
+  rows.forEach((c) => {
+    const prov = placeProvinceLabel(c) || "";
+    if (!groups.has(prov)) groups.set(prov, []);
+    groups.get(prov).push(c);
+  });
+  const provOrder = [...groups.keys()].sort((a, b) => a.localeCompare(b, "es"));
+  let options = "";
+  provOrder.forEach((prov) => {
+    const list = groups.get(prov);
+    if (!prov) {
+      options += optionList(list);
+      return;
+    }
+    options += `<optgroup label="${prov}">${optionList(list)}</optgroup>`;
+  });
   select.innerHTML = options;
   if (manual) manual.innerHTML = options;
   const ids = rows.map((c) => c.id);
@@ -1303,6 +1400,24 @@ function passesTraits(item, traits) {
 function filtered() {
   const city = currentCity();
   const max = Number($("maxPrice").value || 0);
+  if (listingMode === "rent") {
+    const period = $("rentalPeriod")?.value || "";
+    const query = ($("freeTextSearch")?.value || "").trim().toLocaleLowerCase("es-AR");
+    return allListings.filter((item) => {
+      if (city && !belongsToCity(item, city)) return false;
+      if (!matchesChosen("typeFilter", item.property_type)) return false;
+      if (!matchesChosen("zonaFilter", item.zona)) return false;
+      if (!matchesChosen("barrioFilter", item.barrio)) return false;
+      if (max && (!rentalPriceUsable(item) || item.price_usd > max)) return false;
+      if (period && (item.period !== period || !rentalPriceUsable(item))) return false;
+      if (!passesSize(item)) return false;
+      if (query) {
+        const searchable = `${item.title || ""} ${item.address || ""} ${item.barrio || ""} ${item.zona || ""}`.toLocaleLowerCase("es-AR");
+        if (!searchable.includes(query)) return false;
+      }
+      return true;
+    });
+  }
   const minDeal = Number($("dealBar")?.value || 0);
   const favs = $("favOnly").checked;
   const traits = selectedTraits();
@@ -1641,9 +1756,13 @@ function openPickPopup(latlng, items, title) {
 }
 
 function sorted(items) {
-  const key = $("sortBy")?.value || "deal";
+  const selectedKey = $("sortBy")?.value || "deal";
+  const key = listingMode === "rent" && selectedKey === "deal" ? "price-asc" : selectedKey;
   const copy = items.slice();
   copy.sort((a, b) => {
+    if (listingMode === "rent" && rentalPriceUsable(a) !== rentalPriceUsable(b)) {
+      return rentalPriceUsable(a) ? -1 : 1;
+    }
     if (a.favorite !== b.favorite) return a.favorite ? -1 : 1;
     let cmp = 0;
     if (key === "price-asc") cmp = (a.price_usd || 1e15) - (b.price_usd || 1e15);
@@ -1735,6 +1854,8 @@ function paintList(items) {
       list.innerHTML = listingsWaitHtml(waitCopy("scrape"));
     } else if (allListings.length) {
       list.innerHTML = `<p class="status">Nada con esos filtros.</p>`;
+    } else if (listingMode === "rent") {
+      list.innerHTML = `<p class="status">No hay alquileres cargados para este lugar.</p>`;
     } else {
       list.innerHTML = `<p class="status">${emptyPlaceCopy()}</p>`;
     }
@@ -2404,7 +2525,7 @@ function compareIcon() {
 }
 
 function cardHtml(item) {
-  const img = listingImage((photoSet(item)[0] || ""), "thumb");
+  const img = listingMode === "rent" ? "" : listingImage((photoSet(item)[0] || ""), "thumb");
   const thumb = img
     ? `<img src="${img}" alt="${escapeHtml(item.title || "Aviso en venta")}" width="104" height="112" decoding="async" referrerpolicy="no-referrer" />`
     : `<span class="card-ph" aria-hidden="true"></span>`;
@@ -2418,7 +2539,11 @@ function cardHtml(item) {
   const locBit = isExactPin(item) ? "ubicación real" : isLocationMissing(item) ? "sin ubicación" : "aprox.";
   const picked = window.getCompareIds ? window.getCompareIds().includes(item.id) : false;
   const dealNote = (item.deal_label || "").startsWith("revisar") ? item.deal_label : "";
-  const radar = pentagonChart(item.profile, { mini: true, kind: item.property_type });
+  const radar = listingMode === "rent" ? "" : pentagonChart(item.profile, { mini: true, kind: item.property_type });
+  const actions = listingMode === "rent" ? "" : `<div class="card-actions">
+          <button class="fav-btn" type="button" data-fav="${item.id}" title="Favorito" aria-label="Favorito">${starIcon()}</button>
+          <button class="cmp-btn${picked ? " is-on" : ""}" type="button" data-cmp="${item.id}" title="Comparar" aria-label="Comparar este aviso" aria-pressed="${picked ? "true" : "false"}">${compareIcon()}</button>
+        </div>`;
   return `<article class="card${item.favorite ? " is-fav" : ""}${selected}${contacted}${approx}${radar ? "" : " is-photo-only"}" id="card-${cssId(item.id)}" data-id="${item.id}">
     <div class="card-photo">
       <div class="card-shot">
@@ -2430,17 +2555,14 @@ function cardHtml(item) {
     <div class="card-body">
       <div class="card-top">
         <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
-        <div class="card-actions">
-          <button class="fav-btn" type="button" data-fav="${item.id}" title="Favorito" aria-label="Favorito">${starIcon()}</button>
-          <button class="cmp-btn${picked ? " is-on" : ""}" type="button" data-cmp="${item.id}" title="Comparar" aria-label="Comparar este aviso" aria-pressed="${picked ? "true" : "false"}">${compareIcon()}</button>
-        </div>
+        ${actions}
       </div>
-      <p class="price">${money(item)}</p>
+      <p class="price">${displayPrice(item)}</p>
       <p class="headline">${escapeHtml(bits.join(" · ") || item.title || "")}</p>
       <p class="place">${escapeHtml(place)}</p>
       <p class="meta">${escapeHtml(sourceSummary(item))} · ${locBit}${item.contacted ? " · contactado" : ""}${dealNote ? ` · ${escapeHtml(dealNote)}` : ""}</p>
       ${chips ? `<div class="chips">${chips}</div>` : ""}
-      ${rentStrip(item)}
+      ${listingMode === "rent" ? "" : rentStrip(item)}
     </div>
   </article>`;
 }
@@ -2639,7 +2761,7 @@ async function hydrateFicha(item) {
 }
 
 function fillListingFicha(item) {
-  if (!item || isFichaReady(item)) return;
+  if (listingMode === "rent" || !item || isFichaReady(item)) return;
   const id = item.id;
   hydrateFicha(item).then((full) => {
     if (selectedId !== id || !full) return;
@@ -2681,6 +2803,7 @@ function showDetail(item) {
   const pane = $("detailPane");
   if (!pane) return;
   pane.classList.remove("is-empty");
+  const isRental = listingMode === "rent";
   const kind = typeLabel(item);
   const chips = listingTags(item).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
   const reasons = (item.deal_reasons || []).map((a) => `<span class="chip">${escapeHtml(a)}</span>`).join("");
@@ -2702,7 +2825,8 @@ function showDetail(item) {
     ["Zona", item.zona || "—"],
     ["Ciudad", cityName],
     ["Tipo", kind],
-    ["Precio", money(item)],
+    ["Precio", isRental ? money(item) : displayPrice(item)],
+    ["Período", isRental ? rentalPeriodLabel(item) : "—"],
     ["Cubiertos", item.covered_m2 ? `${fmt(item.covered_m2)} m²` : "—"],
     ["Terreno / lote", (item.lot_m2 || item.total_m2) ? `${fmt(item.lot_m2 || item.total_m2)} m²` : "—"],
     ["Ambientes", ambientesOf(item) ?? "—"],
@@ -2731,6 +2855,11 @@ function showDetail(item) {
     ["Publicado", published],
     ["Fuente", sourceSummary(item)],
   ].filter(([k, v]) => {
+    if (isRental && (![
+      "Dirección", "Intersección", "Entre calles", "Ubicación aproximada", "Punto en el mapa",
+      "Barrio", "Zona", "Ciudad", "Tipo", "Precio", "Período", "Cubiertos", "Ambientes",
+      "Dormitorios", "Baños", "Publicado", "Fuente",
+    ].includes(k) || v === "—")) return false;
     if (item.property_type === "terreno" && ["Ambientes", "Dormitorios", "Baños"].includes(k)) return false;
     if (["Ubicación aproximada", "Entre calles", "Dueño directo", "Expensas bajas", "Venta urgente", "Entorno", "Balcón", "Luminoso", "Barrio en crecimiento", "Vista abierta", "Patio", "Cochera", "Terraza"].includes(k) && (v === "—" || !v)) return false;
     return true;
@@ -2747,7 +2876,7 @@ function showDetail(item) {
   const missingMark = isLocationMissing(item)
     ? `<p class="loc-missing">Sin dirección, intersección ni ubicación aproximada del aviso.</p>`
     : "";
-  const flags = listingKindFlags(item).map(([cls, label]) => (
+  const flags = (isRental ? [] : listingKindFlags(item)).map(([cls, label]) => (
     `<span class="kind ${cls}">${escapeHtml(label)}</span>`
   )).join("");
   pane.innerHTML = `
@@ -2756,7 +2885,7 @@ function showDetail(item) {
     <div class="detail-head">
       <div class="detail-kicker">
         <span class="kind ${cssId(item.property_type)}">${escapeHtml(kind)}</span>
-        <strong class="detail-price">${money(item)}</strong>
+        <strong class="detail-price">${displayPrice(item)}</strong>
       </div>
       ${flags ? `<div class="detail-flags">${flags}</div>` : ""}
     </div>
@@ -2765,18 +2894,18 @@ function showDetail(item) {
     ${missingMark}
     ${sourceLinkHtml(item, "detail-link") || "<p class='muted'>Sin link al aviso original</p>"}
     <div class="ficha-bundle">
-      ${pentagonChart(item.profile, { kind: item.property_type })}
+      ${isRental ? "" : pentagonChart(item.profile, { kind: item.property_type })}
       <details class="fold ficha-fold" open>
         <summary>Ficha</summary>
         <div class="facts">${facts}</div>
-        <div class="price-track" id="priceTrack"><p class="muted">Cargando historial de precio…</p></div>
-        <p>${escapeHtml(item.deal_label || "")}${item.vs_barrio_pct != null ? ` · ${item.vs_barrio_pct > 0 ? "-" : "+"}${Math.abs(item.vs_barrio_pct)}% vs barrio` : ""}</p>
+        ${isRental ? "" : `<div class="price-track" id="priceTrack"><p class="muted">Cargando historial de precio…</p></div>`}
+        ${isRental ? "" : `<p>${escapeHtml(item.deal_label || "")}${item.vs_barrio_pct != null ? ` · ${item.vs_barrio_pct > 0 ? "-" : "+"}${Math.abs(item.vs_barrio_pct)}% vs barrio` : ""}</p>`}
         ${reasons ? `<div class="chips">${reasons}</div>` : ""}
         ${fixes ? `<div class="chips">${fixes}</div>` : ""}
         ${chips ? `<div class="chips">${chips}</div>` : ""}
       </details>
     </div>
-    ${item.property_type === "terreno" ? "" : `<details class="fold" open>
+    ${isRental || item.property_type === "terreno" ? "" : `<details class="fold" open>
       <summary>Cuánto podría alquilar</summary>
       ${rentEstimate(item) || "<p class='muted'>Sin estimación de alquiler para este aviso.</p>"}
     </details>`}
@@ -2784,7 +2913,7 @@ function showDetail(item) {
       <summary>Cerca en el mapa</summary>
       <div id="nearBox">${nearbyHtml(item, groupNearby(item.nearby || []), isExactPin(item) && !(item.nearby || []).length)}</div>
     </details>
-    ${currentUser ? `
+    ${currentUser && !isRental ? `
     <details class="fold" open>
       <summary>Notas y correcciones</summary>
       <form class="edit-form" id="editForm">
@@ -2974,6 +3103,7 @@ function barrioAverages() {
 }
 
 function renderStats(stats) {
+  if (listingMode === "rent") return;
   const body = $("statsBody");
   if (!body) return;
   const head = document.querySelector("#statsCard .fold-head");
@@ -3169,6 +3299,7 @@ function renderMarket(data) {
 }
 
 async function fillPriceTrack(item) {
+  if (listingMode === "rent") return;
   const box = $("priceTrack");
   if (!box || !item?.id) return;
   const id = item.id;
@@ -3213,6 +3344,30 @@ function money(item) {
   const usd = item.price_usd || ((item.currency || "USD").toUpperCase() === "USD" ? item.price : null);
   if (!usd) return "Consultar";
   return `USD ${fmt(usd)}`;
+}
+
+function displayPrice(item) {
+  if (listingMode !== "rent") return money(item);
+  if (!rentalPriceUsable(item)) {
+    return `Consultar en el aviso <span class="rent-period">· período a confirmar</span>`;
+  }
+  const unit = item.period === "nightly" ? "noche" : item.period === "weekly" ? "semana" : "mes";
+  return `${money(item)} <span class="rent-period">/ ${unit}</span>`;
+}
+
+function rentalPriceUsable(item) {
+  const price = Number(item?.price_usd);
+  if (!Number.isFinite(price) || price <= 0) return false;
+  if (item.period === "nightly") return price >= 18 && price <= 220;
+  if (item.period === "weekly") return price >= 60 && price <= 4000;
+  return item.period === "monthly" && price > 180;
+}
+
+function rentalPeriodLabel(item) {
+  if (!rentalPriceUsable(item)) return "A confirmar en el aviso";
+  if (item.period === "nightly") return "Por noche";
+  if (item.period === "weekly") return "Por semana";
+  return "Mensual";
 }
 
 function fmt(n) {
@@ -3329,6 +3484,11 @@ function cssId(value) {
   return String(value || "").replace(/[^a-z0-9]+/gi, "-");
 }
 
+document.querySelectorAll("[data-listing-mode]").forEach((button) => {
+  button.addEventListener("click", () => setListingMode(button.dataset.listingMode));
+});
+$("rentalPeriod")?.addEventListener("change", render);
+
 initMultis();
 ["typeFilter", "zonaFilter", "barrioFilter", "maxPrice", "minM2", "maxM2", "minBeds", "minRooms", "minBaths", "favOnly", "dealBar", "sortBy"].forEach((id) => {
   if (!$(id)) return;
@@ -3369,7 +3529,8 @@ $("cityFilter")?.addEventListener("change", () => {
   focusedCity = next;
   if (!frameAfterListings) focusCity(next);
   clearLoadedListings();
-  load({ waitKind: "city" });
+  if (listingMode === "rent") loadRentals();
+  else load({ waitKind: "city" });
 });
 
 $("dealBar")?.addEventListener("input", () => {
@@ -3689,7 +3850,9 @@ async function pollStatus(force) {
   const now = Date.now();
   const due = !lastListingsFetchAt || now - lastListingsFetchAt > 8000;
   try {
-    if (viewingThis) {
+    if (listingMode === "rent") {
+      $("statusLine").textContent = rentalStatusLine();
+    } else if (viewingThis) {
       if (due) await load({ live: true });
       else $("statusLine").textContent = publicStatusLine(s);
     } else if (cityWasRunning[city] || force) {
@@ -5011,6 +5174,10 @@ async function runFreeTextSearch() {
   const button = $("freeTextGo");
   const query = (freeTextInput?.value || "").trim();
   if (!query) return;
+  if (listingMode === "rent") {
+    render();
+    return;
+  }
   const previousCity = $("cityFilter")?.value || "";
   if (button) {
     button.disabled = true;

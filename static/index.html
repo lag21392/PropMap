@@ -5,24 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#2f5346" />
   <meta name="color-scheme" content="light dark" />
-  <title>Casas en venta en Argentina · Mapa con score | PropMap</title>
-  <meta name="description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
+  <title>Inmuebles en venta y alquiler en Argentina | PropMap</title>
+  <meta name="description" content="Explorá avisos inmobiliarios en venta y alquiler en Argentina. Compará precios, ubicaciones y períodos de alquiler." />
   <meta name="robots" content="index, follow, max-image-preview:large" />
   <link rel="canonical" href="__ORIGIN__/" />
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
   <meta property="og:type" content="website" />
   <meta property="og:locale" content="es_AR" />
   <meta property="og:site_name" content="PropMap" />
-  <meta property="og:title" content="Casas en venta en Argentina · Mapa con score | PropMap" />
-  <meta property="og:description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
+  <meta property="og:title" content="Inmuebles en venta y alquiler en Argentina | PropMap" />
+  <meta property="og:description" content="Explorá avisos inmobiliarios en venta y alquiler en Argentina. Compará precios, ubicaciones y períodos de alquiler." />
   <meta property="og:url" content="__ORIGIN__/" />
   <meta property="og:image" content="__ORIGIN__/static/og.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
-  <meta property="og:image:alt" content="PropMap, mapa de casas en venta con score de ganga" />
+  <meta property="og:image:alt" content="PropMap, mapa de inmuebles en venta y alquiler" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Casas en venta en Argentina · Mapa con score | PropMap" />
-  <meta name="twitter:description" content="Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga." />
+  <meta name="twitter:title" content="Inmuebles en venta y alquiler en Argentina | PropMap" />
+  <meta name="twitter:description" content="Explorá avisos inmobiliarios en venta y alquiler en Argentina. Compará precios, ubicaciones y períodos de alquiler." />
   <meta name="twitter:image" content="__ORIGIN__/static/og.png" />
   <script type="application/ld+json">
   {
@@ -34,7 +34,7 @@
         "name": "PropMap",
         "url": "__ORIGIN__/",
         "inLanguage": "es-AR",
-        "description": "Mapa de casas, departamentos y terrenos en venta en Argentina. Compará el USD/m² de cada aviso con la zona y mirá el score de ganga.",
+        "description": "Explorá avisos inmobiliarios en venta y alquiler en Argentina. Compará precios, ubicaciones y períodos de alquiler.",
         "potentialAction": {
           "@type": "SearchAction",
           "target": {
@@ -62,9 +62,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://tile.openstreetmap.org" />
-  <link rel="preload" href="/static/styles.css?v=ui157" as="style" />
+  <link rel="preload" href="/static/styles.css?v=ui158" as="style" />
   <link rel="preload" href="/static/vendor/leaflet/leaflet.js" as="script" />
-  <link rel="preload" href="/static/app.js?v=ui157" as="script" />
+  <link rel="preload" href="/static/app.js?v=ui161" as="script" />
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" media="all" />
   <noscript>
     <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=IBM+Plex+Mono:wght@500&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet" />
@@ -73,7 +73,7 @@
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet.markercluster/MarkerCluster.Default.css" />
   <link rel="stylesheet" href="/static/css/tokens.css?v=ui157" />
-  <link rel="stylesheet" href="/static/styles.css?v=ui157" />
+  <link rel="stylesheet" href="/static/styles.css?v=ui158" />
 </head>
 <body class="tab-map">
   <a class="skip-link" href="#map">Ir al mapa</a>
@@ -82,6 +82,10 @@
       <span class="logo-mark" aria-hidden="true"></span>
       <span class="logo-word">PROPMAP</span>
     </h1>
+    <div class="operation-switch" role="group" aria-label="Operación">
+      <button type="button" data-listing-mode="buy" aria-pressed="true">Comprar</button>
+      <button type="button" data-listing-mode="rent" aria-pressed="false">Alquilar</button>
+    </div>
     <label class="search-strip-query">
       <span class="sr-only">Buscar avisos</span>
       <input id="freeTextSearch" type="search" placeholder="casa luminosa con patio en Palermo, 3 dormitorios, hasta 200 mil" autocomplete="off" spellcheck="false" />
@@ -105,6 +109,14 @@
         </label>
         <label class="span-2">Ciudades cargadas
           <select id="cityFilter"></select>
+        </label>
+        <label id="rentalPeriodControl" hidden>Período
+          <select id="rentalPeriod">
+            <option value="">Todos</option>
+            <option value="monthly">Mensual</option>
+            <option value="nightly">Por noche</option>
+            <option value="weekly">Por semana</option>
+          </select>
         </label>
         <label>Tipo
           <div class="multi" id="typeFilter" data-empty="Todos">
@@ -173,7 +185,7 @@
             </select>
           </label>
         </div>
-        <div class="trait-filters" role="group" aria-label="Del aviso">
+        <div class="trait-filters sale-only" role="group" aria-label="Del aviso">
           <label>
             <input type="checkbox" name="listingTrait" value="credit" />
             <span>Apto crédito</span>
@@ -229,25 +241,25 @@
         </div>
         <label>Ordenar
           <select id="sortBy">
-            <option value="deal">Ganga / score</option>
+            <option value="deal" data-sale-only>Ganga / score</option>
             <option value="price-asc">Precio menor</option>
             <option value="price-desc">Precio mayor</option>
             <option value="m2">Más m²</option>
-            <option value="m2price">USD/m² menor</option>
+            <option value="m2price" data-sale-only>USD/m² menor</option>
             <option value="type">Tipo</option>
             <option value="barrio">Barrio</option>
             <option value="contacted">Contactados primero</option>
-            <option value="yield-month">Renta con contrato</option>
-            <option value="yield-temp">Renta temporal</option>
+            <option value="yield-month" data-sale-only>Renta con contrato</option>
+            <option value="yield-temp" data-sale-only>Renta temporal</option>
           </select>
         </label>
-        <label class="check">
+        <label class="check sale-only">
           <input id="favOnly" type="checkbox" />
           Solo favoritos
         </label>
       </div>
 
-      <div class="deal-block">
+      <div class="deal-block sale-only">
         <div class="deal-head">
           <span>Ganga</span>
           <details class="deal-help">
@@ -270,7 +282,7 @@
 
       <div class="kpis" id="kpis"></div>
 
-      <section class="fold price-analysis" id="priceAnalysis" data-fold="prices" data-fold-default="closed">
+      <section class="fold price-analysis sale-only" id="priceAnalysis" data-fold="prices" data-fold-default="closed">
         <button type="button" class="fold-head" aria-expanded="false">Análisis de precios</button>
         <div class="fold-body" hidden>
           <p class="muted" id="priceAnalysisContext">Según la ciudad y el tipo que estás mirando.</p>
@@ -279,7 +291,7 @@
         </div>
       </section>
 
-      <section class="market-pulse" id="marketPulse">
+      <section class="market-pulse sale-only" id="marketPulse">
         <div class="block-head">
           <h2>Pulso del mercado</h2>
           <button type="button" id="togglePulse" class="ghost">ocultar</button>
@@ -488,7 +500,7 @@
         <li>El punto redondo es ubicación real (calle y altura o esquina). El cuadrado es la manzana aproximada del aviso. Si no hay ni eso, queda marcado como sin ubicación.</li>
         <li>Marcá favoritos con una cuenta validada; se guardan cifrados. En el celular usá las solapas de abajo.</li>
       </ul>
-      <p class="help-rent"><strong>Alquileres:</strong> el contrato (USD/mes) y el temporal (USD/noche) son <em>estimaciones</em> armadas con avisos de la zona, el tipo y el tamaño. Descuentan vacancia u ocupación típica. No son un alquiler cerrado ni un ingreso asegurado.</p>
+      <p class="help-rent"><strong>En modo Comprar:</strong> los valores de alquiler son estimaciones de renta. En modo Alquilar, los precios corresponden a avisos publicados y se separan entre mensual y por noche.</p>
       <p class="help-legal">Los avisos son de portales de terceros. <a href="/legal">Términos, privacidad y derechos reservados</a>.</p>
       <div class="dialog-actions">
         <button class="primary" value="close" type="submit">Listo</button>
@@ -594,6 +606,6 @@
   <script type="module" src="/static/parse-free-text.js?v=ui157"></script>
   <script type="module" src="/static/filter-presets.js?v=ui115"></script>
   <script type="module" src="/static/comparator.js?v=ui157"></script>
-  <script defer src="/static/app.js?v=ui157"></script>
+  <script defer src="/static/app.js?v=ui161"></script>
 </body>
 </html>
