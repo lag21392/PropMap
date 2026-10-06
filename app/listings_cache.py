@@ -494,27 +494,31 @@ def _snap_ver_ok_bytes(raw: bytes, *, head: bytes | None = None, tail: bytes | N
 
 
 def reset() -> None:
-    global _rev, _ready, _warming, _usd, _last_run, _disk_preloaded, _force_cache_dir, _catalog_keep_fp, _build_depth, _meta_at
-    with _lock:
-        _rev = 0
-        _by_id.clear()
-        _item_rev.clear()
-        _ready = False
-        _warming = False
-        _usd = USD_FALLBACK
-        _last_run = ""
-        _cities.clear()
-        _city_snaps.clear()
-        _persist_queued.clear()
-        _encode_queued.clear()
-        _loading.clear()
-        _warm_queued.clear()
-        _warmed.clear()
-        _encode_at.clear()
-        _disk_preloaded = False
-        _force_cache_dir = None
-        _db_loaded.clear()
-        _catalog_keep_fp = ""
+    global _rev, _ready, _warming, _usd, _last_run, _disk_preloaded, _force_cache_dir, _catalog_keep_fp, _build_depth, _meta_at, _card_cache_generation
+    with _page_lock:
+        with _lock:
+            _rev = 0
+            _by_id.clear()
+            _item_rev.clear()
+            _ready = False
+            _warming = False
+            _usd = USD_FALLBACK
+            _last_run = ""
+            _cities.clear()
+            _city_snaps.clear()
+            _persist_queued.clear()
+            _encode_queued.clear()
+            _loading.clear()
+            _warm_queued.clear()
+            _warmed.clear()
+            _encode_at.clear()
+            _disk_preloaded = False
+            _force_cache_dir = None
+            _db_loaded.clear()
+            _catalog_keep_fp = ""
+        _card_cache.clear()
+        _page_building.clear()
+        _card_cache_generation += 1
     with _build_gate:
         _build_depth = 0
     with _meta_gate:
@@ -1757,6 +1761,7 @@ def _card_row(row: dict[str, Any]) -> dict[str, Any]:
 _page_building: set[str] = set()
 _page_lock = threading.Lock()
 _card_cache: dict[str, tuple[int, list]] = {}
+_card_cache_generation = 0
 
 
 def _schedule_card_pages(city_id: str) -> None:
@@ -1766,15 +1771,19 @@ def _schedule_card_pages(city_id: str) -> None:
         if city_id in _page_building:
             return
         _page_building.add(city_id)
+        generation = _card_cache_generation
     threading.Thread(
         target=_build_card_pages,
-        args=(city_id,),
+        args=(city_id, generation),
         daemon=True,
         name=f"card-pages-{city_id}",
     ).start()
 
 
-def _build_card_pages(city_id: str) -> None:
+def _build_card_pages(city_id: str, generation: int | None = None) -> None:
+    if generation is None:
+        with _page_lock:
+            generation = _card_cache_generation
     try:
         raw, _encoding = listings_body(city_id, gzip=False)
         if not raw:
@@ -1788,13 +1797,16 @@ def _build_card_pages(city_id: str) -> None:
         rows = [_card_row(row) for row in data.get("listings") or [] if isinstance(row, dict)]
         rev = int(data.get("rev") or 0)
         del data
-        with _lock:
-            snap = _city_snaps.get(city_id)
-            if snap is not None and not snap.get("warming"):
-                snap["card_rows"] = rows
-                snap["card_rev"] = int(snap.get("rev") or rev)
-                rev = int(snap.get("card_rev") or rev)
-            _card_cache[city_id] = (rev, rows)
+        with _page_lock:
+            if generation != _card_cache_generation:
+                return
+            with _lock:
+                snap = _city_snaps.get(city_id)
+                if snap is not None and not snap.get("warming"):
+                    snap["card_rows"] = rows
+                    snap["card_rev"] = int(snap.get("rev") or rev)
+                    rev = int(snap.get("card_rev") or rev)
+                _card_cache[city_id] = (rev, rows)
     finally:
         with _page_lock:
             _page_building.discard(city_id)
@@ -2229,6 +2241,52 @@ def _evict_old_snaps_locked(keep: str | None = None, priority: set[str] | None =
                 _by_id.pop(lid, None)
 
 
+def _evict_ram_for_pressure(hold: set[str]) -> bool:
+    global _card_cache_generation
+    if not _page_lock.acquire(timeout=0.4):
+        return False
+    try:
+        if not _lock.acquire(timeout=0.4):
+            return False
+        try:
+            if _loading:
+                return False
+            keep = {cid: _city_snaps[cid] for cid in hold if cid in _city_snaps}
+            if "*" in _city_snaps:
+                keep["*"] = _city_snaps["*"]
+            _city_snaps.clear()
+            _city_snaps.update(keep)
+            _by_id.clear()
+            for city_id, snap in _city_snaps.items():
+                snap["listings"] = []
+                snap.pop("card_rows", None)
+                snap.pop("card_rev", None)
+                if snap.get("encoded_gzip"):
+                    snap.pop("encoded", None)
+                if snap.get("pins_gzip"):
+                    snap.pop("pins_encoded", None)
+                if city_id == "*" or not _disk_http_ready(city_id, allow_stale=True):
+                    continue
+                meta = _read_meta(city_id, allow_stale=True) or {}
+                try:
+                    disk_rev = int(meta.get("rev"))
+                    snap_rev = int(snap.get("rev"))
+                except (TypeError, ValueError):
+                    continue
+                if disk_rev == snap_rev:
+                    snap.pop("encoded", None)
+                    snap.pop("encoded_gzip", None)
+                    snap.pop("enc_rev", None)
+            _card_cache.clear()
+            _card_cache_generation += 1
+        finally:
+            _lock.release()
+    finally:
+        _page_lock.release()
+    gc.collect()
+    return True
+
+
 def _preload_disk() -> None:
     global _disk_preloaded
     with _lock:
@@ -2255,29 +2313,9 @@ def _watch_ram() -> None:
                 hold.update(_priority_city_ids()[:2])
             except Exception:
                 pass
-            got = _lock.acquire(timeout=0.4)
-            if not got:
+            if not _evict_ram_for_pressure(hold):
                 continue
-            try:
-                if _loading:
-                    continue
-                log.warning("RAM alta (%s MB), suelto dicts de avisos; el JSON queda en disco", rss // 1024)
-                hold.update(_loading)
-                keep = {cid: _city_snaps[cid] for cid in hold if cid in _city_snaps}
-                if "*" in _city_snaps:
-                    keep["*"] = _city_snaps["*"]
-                _city_snaps.clear()
-                _city_snaps.update(keep)
-                _by_id.clear()
-                for snap in _city_snaps.values():
-                    snap["listings"] = []
-                    if snap.get("encoded_gzip"):
-                        snap.pop("encoded", None)
-                    if snap.get("pins_gzip"):
-                        snap.pop("pins_encoded", None)
-            finally:
-                _lock.release()
-            gc.collect()
+            log.warning("RAM alta (%s MB), suelto dicts de avisos; el JSON queda en disco", rss // 1024)
         except Exception:
             log.exception("ram-watch")
 

@@ -779,11 +779,12 @@ def _scrape_one_city(
                         "Las fichas se siguen completando."
                     )
                     return name, False
-                catalog = [
-                    x
-                    for x in store.fetch_by_cities({city_id})
-                    if x.source == name
-                ]
+                if not country:
+                    del ready
+                    if items:
+                        del item
+                del items
+                catalog = store.fetch_by_cities({city_id}, source=name)
                 report(f"{city['label']}: listado listo. Reviso fichas pendientes…")
                 return name, _enrich_details(catalog, report, name, city["label"], should_stop=stop)
             except Exception as exc:

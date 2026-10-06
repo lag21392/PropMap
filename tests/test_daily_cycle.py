@@ -1,4 +1,63 @@
+import gc
+import weakref
+from contextlib import nullcontext
+
 from app import pipeline, schedule
+
+
+def test_scraped_rows_are_released_before_catalog_fetch(monkeypatch):
+    from app.models import Listing
+    from app import llm_enrich
+
+    row_ref = None
+
+    def scraper(_report, **_kwargs):
+        nonlocal row_ref
+        row = Listing(
+            source="fixture",
+            source_id="memory-release",
+            url="https://example.com/memory-release",
+            title="Casa en venta",
+            property_type="casa",
+            price=100,
+            currency="USD",
+            price_usd=100,
+            city="caba",
+        )
+        row_ref = weakref.ref(row)
+        return [row]
+
+    def fetch_catalog(_cities, *, source=None):
+        gc.collect()
+        assert row_ref is not None
+        assert row_ref() is None
+        assert source == "fixture"
+        return []
+
+    monkeypatch.setattr(pipeline, "usd_rate", lambda: 1.0)
+    monkeypatch.setattr(pipeline, "is_country_place", lambda _city: False)
+    monkeypatch.setattr(pipeline.crawl, "is_slow", lambda: False)
+    monkeypatch.setattr(pipeline.crawl, "job_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(pipeline.freshness, "reset_known", lambda _ids: None)
+    monkeypatch.setattr(pipeline.freshness, "is_known", lambda _listing_id: True)
+    monkeypatch.setattr(pipeline.freshness, "has_usable_listing_text", lambda _row: True)
+    monkeypatch.setattr(pipeline.store, "listing_ids", lambda: [])
+    monkeypatch.setattr(pipeline.store, "upsert_many", lambda _items: None)
+    monkeypatch.setattr(pipeline.store, "fetch_by_cities", fetch_catalog)
+    monkeypatch.setattr(pipeline, "pin_listing_city", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline, "to_usd", lambda price, _currency, _rate: price)
+    monkeypatch.setattr(pipeline, "apply_unit_price", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "apply_signals", lambda *_args: None)
+    monkeypatch.setattr(pipeline, "_retire_unseen", lambda *_args: 0)
+    monkeypatch.setattr(pipeline, "_enrich_details", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(llm_enrich, "enqueue", lambda *_args, **_kwargs: None)
+
+    pipeline._scrape_one_city(
+        "caba",
+        {"label": "CABA"},
+        [("fixture", scraper)],
+        lambda _message: None,
+    )
 
 
 def test_job_limits_leave_a_slot_for_an_interactive_search():

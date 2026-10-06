@@ -988,20 +988,25 @@ def fetch_poi_backlog(limit: int, prefer_city: str = "") -> list[Listing]:
     return [_listing_from_row(row, pins.get(row["id"])) for row in rows]
 
 
-def fetch_by_cities(cities: set[str] | list[str]) -> list[Listing]:
+def fetch_by_cities(cities: set[str] | list[str], source: str | None = None) -> list[Listing]:
     wanted = [cid for cid in cities if cid]
     if not wanted:
         return []
     marks = ",".join("?" * len(wanted))
-    where = f"city IN ({marks}) ORDER BY price_usd IS NULL, price_usd ASC"
+    where = f"city IN ({marks})"
+    params: tuple[Any, ...] = tuple(wanted)
+    if source is not None:
+        where += " AND source = ?"
+        params += (source,)
+    where += " ORDER BY price_usd IS NULL, price_usd ASC"
     with connect() as conn:
         try:
-            rows = conn.execute(_listing_sql(where, map_row=True), tuple(wanted)).fetchall()
+            rows = conn.execute(_listing_sql(where, map_row=True), params).fetchall()
             map_row = True
         except sqlite3.OperationalError:
             rows = conn.execute(
                 f"SELECT * FROM listings WHERE {where}",
-                tuple(wanted),
+                params,
             ).fetchall()
             map_row = False
         pins = _pins_map(conn)

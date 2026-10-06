@@ -63,6 +63,53 @@ def test_map_fetch_keeps_pentagon_scores(tmp_path, monkeypatch):
     assert "access" not in rows[0].extra
 
 
+def test_fetch_by_cities_filters_source_in_sql_and_preserves_order(tmp_path, monkeypatch):
+    from app import store
+    from app.models import Listing
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+
+    def item(source: str, source_id: str, price: int) -> Listing:
+        return Listing(
+            source=source,
+            source_id=source_id,
+            url=f"https://example.com/{source_id}",
+            title=source_id,
+            property_type="departamento",
+            price=price,
+            currency="USD",
+            price_usd=price,
+            city="caba",
+        )
+
+    store.upsert_many(
+        [
+            item("zonaprop", "z-expensive", 300),
+            item("properati", "p-cheap", 100),
+            item("zonaprop", "z-cheap", 200),
+        ]
+    )
+    statements: list[str] = []
+    with store.connect() as conn:
+        conn.set_trace_callback(statements.append)
+    selected = store.fetch_by_cities({"caba"}, source="zonaprop")
+    all_sources = store.fetch_by_cities({"caba"})
+
+    assert [row.source_id for row in selected] == ["z-cheap", "z-expensive"]
+    assert [row.source_id for row in all_sources] == [
+        "p-cheap",
+        "z-cheap",
+        "z-expensive",
+    ]
+    fetch_sql = next(
+        statement
+        for statement in statements
+        if "SELECT listings.*" in statement and "FROM listings" in statement
+    )
+    assert "city IN ('caba') AND source = 'zonaprop'" in fetch_sql
+
+
 def test_upsert_many_merges_existing_and_keeps_last_duplicate(tmp_path, monkeypatch):
     from app import store
     from app.models import Listing

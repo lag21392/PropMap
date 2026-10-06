@@ -154,6 +154,114 @@ def test_city_disk_cache_survives_memory_reset(tmp_path, monkeypatch):
     reset()
 
 
+def test_ram_pressure_evicts_card_rows_and_recovers_from_disk(tmp_path, monkeypatch):
+    from app import listings_cache
+
+    monkeypatch.setattr("app.listings_cache.start_warmup", lambda: None)
+    reset()
+    listings_cache._force_cache_dir = tmp_path
+    ingest([_item("pressure-1", "caba")])
+    listings_cache._ready = True
+    first = payload("caba")
+    snap = listings_cache._city_snaps["caba"]
+    assert listings_cache._disk_http_ready("caba", allow_stale=True)
+
+    card_rows = [listings_cache._card_row(first["listings"][0])]
+    snap["card_rows"] = card_rows
+    snap["card_rev"] = snap["rev"]
+    snap["pins_encoded"] = b"uncompressed-pins"
+    snap["pins_gzip"] = b"compressed-pins"
+    listings_cache._card_cache["caba"] = (snap["rev"], card_rows)
+
+    assert listings_cache._evict_ram_for_pressure({"caba"})
+    assert listings_cache._by_id == {}
+    assert snap["listings"] == []
+    assert "card_rows" not in snap
+    assert "card_rev" not in snap
+    assert "caba" not in listings_cache._card_cache
+    assert "pins_encoded" not in snap
+    assert snap["pins_gzip"] == b"compressed-pins"
+    assert "encoded" not in snap
+    assert "encoded_gzip" not in snap
+
+    recovered = payload("caba")
+    assert [row["id"] for row in recovered["listings"]] == ["zonaprop:pressure-1"]
+    listings_cache._build_card_pages("caba", listings_cache._card_cache_generation)
+    page = listings_cache.listings_card_page("caba", 0)
+    assert page is not None
+    assert [row["id"] for row in page["listings"]] == ["zonaprop:pressure-1"]
+    reset()
+
+
+def test_ram_pressure_discards_inflight_card_page_build(monkeypatch):
+    import json
+    from app import listings_cache
+
+    reset()
+    started = threading.Event()
+    finish = threading.Event()
+    raw = json.dumps(
+        {"rev": 1, "listings": [{"id": "zonaprop:inflight", "city": "caba"}]}
+    ).encode()
+
+    def blocked_body(_city, *, gzip=False):
+        started.set()
+        assert finish.wait(2)
+        return raw, None
+
+    monkeypatch.setattr(listings_cache, "listings_body", blocked_body)
+    listings_cache._city_snaps["caba"] = {
+        "rev": 1,
+        "listings": [{"id": "zonaprop:inflight"}],
+    }
+    generation = listings_cache._card_cache_generation
+    worker = threading.Thread(
+        target=listings_cache._build_card_pages,
+        args=("caba", generation),
+    )
+    worker.start()
+    assert started.wait(2)
+
+    assert listings_cache._evict_ram_for_pressure({"caba"})
+    finish.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert "card_rows" not in listings_cache._city_snaps["caba"]
+    assert "caba" not in listings_cache._card_cache
+    reset()
+
+
+def test_ram_pressure_keeps_gzip_when_disk_is_unavailable(monkeypatch):
+    from app import listings_cache
+
+    reset()
+    snap = {
+        "rev": 4,
+        "listings": [{"id": "zonaprop:gzip-only"}],
+        "stats": {},
+        "geo_ver": listings_cache.GEO_VERSION,
+        "snap_ver": listings_cache.SNAP_VER,
+        "score_ver": listings_cache.SCORE_VERSION,
+        "encoded": b'{"listings":[]}',
+        "encoded_gzip": b"\x1f\x8bcompressed",
+    }
+    listings_cache._city_snaps["caba"] = snap
+    monkeypatch.setattr(listings_cache, "_disk_http_ready", lambda *_a, **_k: False)
+    monkeypatch.setattr(listings_cache, "_read_disk_bytes", lambda *_a, **_k: None)
+    monkeypatch.setattr(listings_cache, "_read_disk_gzip", lambda *_a, **_k: None)
+
+    assert listings_cache._evict_ram_for_pressure({"caba"})
+    assert "encoded" not in snap
+    assert snap["encoded_gzip"] == b"\x1f\x8bcompressed"
+    assert listings_cache.listings_body("caba", gzip=True) == (
+        b"\x1f\x8bcompressed",
+        "gzip",
+    )
+    assert listings_cache.listings_body("caba", gzip=False) == (None, None)
+    reset()
+
+
 def test_priority_cities_start_with_default_city(monkeypatch):
     from app import listings_cache
 
