@@ -306,7 +306,7 @@ _access_inflight: set[str] = set()
 _access_at: dict[str, float] = {}
 _access_run = threading.Semaphore(1)
 ACCESS_COOLDOWN_SEC = 180.0
-ACCESS_TURN_SEC = 30.0
+ACCESS_TURN_SEC = 60.0
 
 
 def _publish_poi_axes(items: list[Listing]) -> None:
@@ -425,6 +425,12 @@ def kick_access_later(city_id: str | None, *, now: bool = False) -> None:
                 if turn:
                     _access_at[cid] = time.monotonic()
                 _access_inflight.discard(cid)
+    # Periodic malloc_trim to release memory back to OS
+    try:
+        import ctypes
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:
+        pass
 
     threading.Thread(target=_job, daemon=True, name=f"access-{cid}").start()
 

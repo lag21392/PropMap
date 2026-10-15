@@ -201,20 +201,42 @@ def _from_zonaprop_state(item: Listing, html: str) -> None:
         if credit is not None and extra.get("mortgage_credit") is None:
             extra["mortgage_credit"] = credit
         item.extra = extra
-        pictures = ((posting.get("visiblePictures") or {}).get("pictures") or [])
+
+        # Extraer fotos desde v2VisiblePictures.pictures (nueva estructura posible)
+        pictures = (
+            (posting.get("v2VisiblePictures") or {}).get("pictures")
+            or (posting.get("visiblePictures") or {}).get("pictures")
+            or (
+                # Fallback: buscar en posting directamente si v2VisiblePictures existe
+                (posting.get("v2VisiblePictures") or {}).get("images")
+                or (posting.get("visiblePictures") or {}).get("images")
+            )
+            or []
+        )
         photo_urls = []
+        photo_sources = []
         for pic in pictures:
             if not isinstance(pic, dict):
                 continue
             href = pic.get("url730x532") or pic.get("url360x266") or pic.get("url") or ""
-            if href:
+            if not href:
+                href = pic.get("imageUrl") or pic.get("imgUrl") or pic.get("src") or pic.get("value") or ""
+            if href and not any(h in href.lower() for h in _PHOTO_SKIP):
                 photo_urls.append(href)
-        if photo_urls and not item.image:
-            item.image = photo_urls[0]
+                if href not in photo_sources:
+                    photo_sources.append(href)
+        
+        # Si no hay fotos en v2VisiblePictures/visiblePictures, intentar extraer del HTML
+        if not photo_urls and "zonaprop" in url:
+            photo_urls = _extract_zonaprop_photos_from_html(html)
+        
         if photo_urls:
             from ..dedupe import add_photos
-
             add_photos(item, photo_urls)
+        
+        # Marcar primera foto como imagen principal
+        if photo_urls and not item.image:
+            item.image = photo_urls[0]
     _from_zonaprop_map(item, html)
 
 
@@ -650,3 +672,49 @@ def _num(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if abs(number) > 1 else None
+
+# Constantes para fotos - extraída de dedupe.py para compatibilidad
+_PHOTO_SKIP = ("unsplash.com", "placeholder", "data:image", "gravatar")
+
+
+
+def _extract_zonaprop_photos_from_html(html: str, max_photos: int = 12) -> list[str]:
+    """Extrae URLs de fotos del HTML de la ficha de ZonaProp como fallback."""
+    photo_urls: list[str] = []
+
+    # data-ratio con src (foto principal/generador de thumbs)
+    for m in re.finditer(r'data-ratio="[^"]*"[^>]*src=["\']([^"\']+)["\']', html or "", re.I):
+        url = m.group(1)
+        if url and url not in photo_urls:
+            photo_urls.append(url)
+
+    # img con data-src (lazy loading)
+    for m in re.finditer(r'<img[^>]+data-src=["\']([^"\']+)["\']', html or "", re.I):
+        url = m.group(1)
+        if url and url not in photo_urls:
+            photo_urls.append(url)
+
+    # srcset (primera url de cada tanda)
+    for m in re.finditer(r'srcset=["\']([^"\']+)["\']', html or "", re.I):
+        first = (m.group(1) or "").split(",")[0].strip().split(" ")[0]
+        if first and first not in photo_urls:
+            photo_urls.append(first)
+
+    # Cualquier URL de imagen (jpg/png/webp) en el HTML (limita por riesgo de ruido)
+    for m in re.finditer(r'(https?://[^"\'\s>]+\.(?:jpe?g|png|webp)[^"\'\s>]*)', html or "", re.I):
+        url = m.group(1).rstrip(".,;")
+        if url and url not in photo_urls:
+            photo_urls.append(url)
+
+    # Filtrar: solo URLs válidas, sin placeholders, y acotar cantidad
+    seen: set[str] = set()
+    valid: list[str] = []
+    for url in photo_urls:
+        low = url.lower()
+        if url in seen or not low.startswith("http") or any(skip in low for skip in _PHOTO_SKIP):
+            continue
+        seen.add(url)
+        valid.append(url)
+        if len(valid) >= max_photos:
+            break
+    return valid

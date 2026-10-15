@@ -4,10 +4,10 @@ import random
 import threading
 import time
 
-FAST_MIN, FAST_MAX = 0.05, 0.20
-SLOW_MIN, SLOW_MAX = 0.5, 1.2
-FAST_PAGES = 64
-SLOW_PAGES = 48
+FAST_MIN, FAST_MAX = 0.05, 0.15
+SLOW_MIN, SLOW_MAX = 0.3, 0.8
+FAST_PAGES = 96
+SLOW_PAGES = 72
 REST_MIN, REST_MAX = 15, 30
 SOON_MIN, SOON_MAX = 6, 12
 SLOW_HOSTS = ("properati.com",)

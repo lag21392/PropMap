@@ -83,8 +83,8 @@ _rest_gen: dict[str, int] = {}
 DAILY_SEC = 24 * 3600
 CHECK_EVERY_SEC = 8
 BETWEEN_CITIES_SEC = 1
-MAX_JOBS = 3
-MAX_BACKGROUND = 2
+MAX_JOBS = 5
+MAX_BACKGROUND = 3
 PORTAL_WORKERS = 8
 
 
@@ -629,6 +629,12 @@ def _run_city_job(city_id: str, progress: Progress | None = None, fast: bool = T
                 job["running"] = False
                 job["mode"] = ""
                 _status["running"] = any(j.get("running") for j in _jobs.values())
+            # WAL checkpoint and memory release after city job completes
+            try:
+                from .store import checkpoint
+                checkpoint("PASSIVE")
+            except Exception:
+                pass
             note_finished(city_id, fast=fast, paused=paused or jumping)
             if jumping:
                 refresh(city_id, fast=True)
@@ -687,6 +693,12 @@ def _scrape_one_city(
 
                         mark_await_llm(item)
             store.upsert_many(chunk)
+            # Periodic malloc_trim to release memory back to OS
+            try:
+                import ctypes
+                ctypes.CDLL(None).malloc_trim(0)
+            except Exception:
+                pass
             from .detail_fetch import enqueue as enqueue_details
             from .freshness import has_usable_listing_text
             from .llm_enrich import enqueue as enqueue_llm

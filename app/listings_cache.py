@@ -60,9 +60,9 @@ _meta_gate = threading.Lock()
 META_REFRESH_SEC = 20.0
 CITY_CACHE_TTL_SEC = 48 * 3600
 KEEP_CITY_GAP_SEC = 1.2
-MAX_RAM_SNAPS = 4
-HYDRATE_RAM = 3
-RAM_SOFT_KB = 3_800_000
+MAX_RAM_SNAPS = 2
+HYDRATE_RAM = 0
+RAM_SOFT_KB = 900_000
 SNAP_VER = "25"
 SNAP_READ_VERS = frozenset({"25"})
 MIN_TRUSTED_SNAP = 80
@@ -2029,6 +2029,33 @@ def _write_http_artifacts(
             gz_tmp = folder / f".{city_id}.json.gz.tmp"
             gz_tmp.write_bytes(encoded_gzip)
             gz_tmp.replace(_gz_path(folder, city_id))
+    except FileNotFoundError:
+        # Race condition: another process may have created the directory
+        # Retry once
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(encoded)
+            tmp.replace(path)
+            meta_tmp.write_text(
+                json.dumps(
+                    {"rev": rev, "n": n, "deals": deals, "snap_ver": SNAP_VER, "geo_ver": GEO_VERSION, "score_ver": SCORE_VERSION, "saved_at": time.time(), "db_loaded": bool(db_loaded), "warming": bool(warming), "db_n": 0 if warming else int(db_n or (meta or {}).get("db_n") or 0)},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            meta_tmp.replace(meta_path)
+            if encoded_gzip:
+                gz_tmp = folder / f".{city_id}.json.gz.tmp"
+                gz_tmp.write_bytes(encoded_gzip)
+                gz_tmp.replace(_gz_path(folder, city_id))
+        except OSError:
+            log.exception("no pude guardar cache http de %s (retry)", city_id)
+            for leftover in (tmp, meta_tmp):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
     except OSError:
         log.exception("no pude guardar cache http de %s", city_id)
         for leftover in (tmp, meta_tmp):
@@ -2315,6 +2342,13 @@ def _watch_ram() -> None:
                 pass
             if not _evict_ram_for_pressure(hold):
                 continue
+            # Intentar devolver memoria al SO liberando arenas de glibc
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except Exception:
+                pass
             log.warning("RAM alta (%s MB), suelto dicts de avisos; el JSON queda en disco", rss // 1024)
         except Exception:
             log.exception("ram-watch")

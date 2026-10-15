@@ -18,14 +18,25 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
 DB_PATH = DATA_DIR / "listings.sqlite"
 _write = Lock()
 _counts_lock = Lock()
-_tls = local()
+
+class _Local(local):
+    def __release_local__(self):
+        conn = getattr(self, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        super().__release_local__()
+
+_tls = _Local()
 _counts_memo: dict[str, int] = {}
 _counts_at = 0.0
 COUNTS_TTL_SEC = 25.0
 # Reduced from 4000 KB to 1024 KB per connection to reduce memory usage
-CACHE_KB = 1024
-WAL_JOURNAL_LIMIT = 128 * 1024 * 1024
-WAL_CHECKPOINT_SEC = 45.0
+CACHE_KB = 256
+WAL_JOURNAL_LIMIT = 32 * 1024 * 1024
+WAL_CHECKPOINT_SEC = 15.0
 _wal_stop = Event()
 _wal_thread: Thread | None = None
 log = logging.getLogger(__name__)
@@ -127,7 +138,7 @@ def _open_conn(timeout: float = 10) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute(f"PRAGMA cache_size=-{CACHE_KB}")
-    conn.execute("PRAGMA busy_timeout=8000")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA wal_autocheckpoint=1000")
     conn.execute(f"PRAGMA journal_size_limit={WAL_JOURNAL_LIMIT}")
     return conn
@@ -146,6 +157,12 @@ def checkpoint(mode: str = "PASSIVE") -> tuple[int, int, int]:
         return (int(row[0]), int(row[1]), int(row[2]))
     finally:
         conn.close()
+        # Release memory back to OS after checkpoint
+        try:
+            import ctypes
+            ctypes.CDLL(None).malloc_trim(0)
+        except Exception:
+            pass
 
 
 def start_wal_checkpointer() -> None:
@@ -162,8 +179,8 @@ def start_wal_checkpointer() -> None:
 def _wal_loop() -> None:
     while not _wal_stop.wait(WAL_CHECKPOINT_SEC):
         try:
-            busy, frames, ckpt = checkpoint("PASSIVE")
-            if frames > 8000:
+            busy, frames, ckpt = checkpoint("TRUNCATE")
+            if frames > 4000:
                 log.warning(
                     "WAL grande: %s frames, checkpointed %s, busy %s",
                     frames,

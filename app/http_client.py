@@ -51,7 +51,7 @@ _DETAIL_URL = re.compile(
     re.I,
 )
 _blocked_until: dict[str, float] = {}
-PAGE_CACHE_TTL = 12 * 3600
+PAGE_CACHE_TTL = 24 * 3600
 
 
 class PageGone(RuntimeError):
