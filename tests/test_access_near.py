@@ -69,7 +69,7 @@ def test_near_payload_reads_stored_without_live_compute(monkeypatch):
     assert out["city"] == "caba"
 
 
-def test_near_payload_does_not_invent_a_score(monkeypatch):
+def test_near_payload_searches_and_saves_when_the_city_map_is_ready(monkeypatch):
     reset()
     remember(
         "caba",
@@ -85,12 +85,32 @@ def test_near_payload_does_not_invent_a_score(monkeypatch):
     monkeypatch.setattr("app.store.get_listing", lambda _lid: item)
     saved = []
     monkeypatch.setattr("app.access._save_access", lambda listing, live: saved.append((listing.id, live)))
-    monkeypatch.setattr("app.access.kick_access_later", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("la lectura no dispara el cálculo")))
+    monkeypatch.setattr("app.access.kick_access_later", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("la lectura no recorre toda la ciudad")))
 
     out = near_payload(listing_id=item.id, city="caba", lat=item.lat, lon=item.lon)
+    assert out["pending"] is False
+    assert out["score"] is not None
+    assert out["nearby"]
+    assert saved and saved[0][0] == item.id
+    assert saved[0][1]["score"] == out["score"]
+    reset()
+
+
+def test_near_payload_waits_when_the_city_map_is_missing(monkeypatch):
+    reset()
+    item = _exact(city="sin-mapa", source_id="sin-mapa")
+    monkeypatch.setattr("app.store.init", lambda: None)
+    monkeypatch.setattr("app.store.get_listing", lambda _lid: item)
+    monkeypatch.setattr("app.access._save_access", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no guardar vacío")))
+    called = {}
+    monkeypatch.setattr("app.osm_poi.ensure_city_pois", lambda cid, blocking=False: called.setdefault("city", cid))
+    monkeypatch.setattr("app.access.enqueue_poi_score", lambda row: called.setdefault("queued", row.id))
+
+    out = near_payload(listing_id=item.id, city="sin-mapa", lat=item.lat, lon=item.lon)
     assert out["pending"] is True
     assert out["score"] is None
-    assert not saved
+    assert called["city"] == "sin-mapa"
+    assert called["queued"] == item.id
     reset()
 
 

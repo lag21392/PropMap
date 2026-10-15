@@ -385,10 +385,10 @@ def _run_predict(backend: tuple[str, Any, str], state: Any, questions: dict[str,
 
         if _serve_url():
             model_name = model if model and model != "systemone" else (os.getenv("LAYA_MODEL") or "multilingual")
-            timeout = float(os.getenv("LAYA_HTTP_TIMEOUT", "30"))
+            timeout = float(os.getenv("LAYA_HTTP_TIMEOUT", "60"))
         else:
             model_name = os.getenv("SYSTEMONE_MODEL") or "kev-latest"
-            timeout = 12.0
+            timeout = 30.0
         payload = {"state": state, "questions": questions, "model": model_name}
         resp = httpx.post(str(agent), json=payload, timeout=timeout)
         resp.raise_for_status()

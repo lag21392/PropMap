@@ -4,12 +4,12 @@ import random
 import threading
 import time
 
-FAST_MIN, FAST_MAX = 0.08, 0.28
-SLOW_MIN, SLOW_MAX = 0.7, 1.6
-FAST_PAGES = 24
-SLOW_PAGES = 48
-REST_MIN, REST_MAX = 20, 40
-SOON_MIN, SOON_MAX = 8, 16
+FAST_MIN, FAST_MAX = 0.05, 0.15
+SLOW_MIN, SLOW_MAX = 0.3, 0.8
+FAST_PAGES = 96
+SLOW_PAGES = 72
+REST_MIN, REST_MAX = 15, 30
+SOON_MIN, SOON_MAX = 6, 12
 SLOW_HOSTS = ("properati.com",)
 # 429/401/403 superan esto; el pacing normal no (máx. 6 s).
 COOL_SEC = 8.0

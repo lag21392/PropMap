@@ -62,6 +62,7 @@ services:
       SCRAPE_LOCAL_GAP_SEC: "${SCRAPE_LOCAL_GAP_SEC:-20}"
       SCRAPE_LOCAL_PARALLEL: "${SCRAPE_LOCAL_PARALLEL:-4}"
       SCRAPE_LOCAL_MAX_DAY: "${SCRAPE_LOCAL_MAX_DAY:-600}"
+      MALLOC_ARENA_MAX: "2"
       MATOMO_INTERNAL_URL: "${MATOMO_INTERNAL_URL}"
       MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL}"
       MATOMO_SITE_ID: "${MATOMO_SITE_ID:-1}"
@@ -91,7 +92,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
-      start_period: 35s
+      start_period: 180s
     logging:
       driver: json-file
       options:

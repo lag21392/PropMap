@@ -54,7 +54,7 @@ def test_home_and_legal_expose_indexable_metadata(monkeypatch):
     assert f'<link rel="canonical" href="{ORIGIN}/"' in home.text
     assert 'name="description"' in home.text
     assert "score de ganga" in home.text
-    assert "Casas, departamentos y terrenos en venta" in home.text
+    assert "casas, departamentos y terrenos en venta" in home.text
     assert 'rel="icon"' in home.text
     raw = re.search(r'<script type="application/ld\+json">\s*(.*?)\s*</script>', home.text, re.S).group(1)
     payload = json.loads(raw)
@@ -73,6 +73,12 @@ def test_home_and_legal_expose_indexable_metadata(monkeypatch):
     assert alias.status_code == 301
     assert alias.headers["location"].endswith("/legal")
     assert "noindex" in (api.headers.get("x-robots-tag") or "")
+
+
+def test_map_links_the_linkedin_post(monkeypatch):
+    with _client(monkeypatch) as client:
+        home = client.get("/")
+    assert 'href="https://www.linkedin.com/posts/lucas-agustin-gonzalez-9807a9170_recientemente-estuve-desarrollando-wwwpropmapcomar-share-7506342670085091328-H2HI/"' in home.text
 
 
 def test_private_html_stays_out_of_the_index(monkeypatch):

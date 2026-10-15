@@ -1,3 +1,17 @@
+def test_wal_checkpoint_and_journal_limit(tmp_path, monkeypatch):
+    from app import store
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "listings.sqlite")
+    store.init()
+    busy, frames, ckpt = store.checkpoint("PASSIVE")
+    assert busy == 0
+    assert frames >= 0
+    assert ckpt >= 0
+    with store.connect() as conn:
+        limit = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+    assert int(limit) == store.WAL_JOURNAL_LIMIT
+
+
 def test_connect_reuses_the_same_sqlite_connection(tmp_path, monkeypatch):
     from app import store
 

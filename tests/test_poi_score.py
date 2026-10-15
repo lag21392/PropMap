@@ -24,12 +24,34 @@ def test_apply_poi_overlay_fills_missing_score_only():
     from app.listings_cache import _poi_by_id, apply_poi_overlay, remember_poi_axes
 
     _poi_by_id.clear()
-    remember_poi_axes({"zonaprop:a": {"score": 80, "confidence": "high", "note": "a pie"}})
+    remember_poi_axes({
+        "zonaprop:a": {"score": 80, "confidence": "high", "note": "a pie"},
+        "zonaprop:c": {"score": 12, "confidence": "high", "note": "viejo"},
+    })
     pending = {"id": "zonaprop:a", "profile": {"axes": {"servicios": {"score": None, "note": "todavía"}}}}
     ready = {"id": "zonaprop:b", "profile": {"axes": {"servicios": {"score": 10, "note": "ya"}}}}
-    assert apply_poi_overlay([pending, ready]) == 1
+    kept = {"id": "zonaprop:c", "profile": {"axes": {"servicios": {"score": 76.5, "note": "guardado"}}}}
+    assert apply_poi_overlay([pending, ready, kept]) == 1
     assert pending["profile"]["axes"]["servicios"]["score"] == 80
     assert ready["profile"]["axes"]["servicios"]["score"] == 10
+    assert kept["profile"]["axes"]["servicios"]["score"] == 76.5
+    _poi_by_id.clear()
+
+
+def test_ficha_keeps_the_saved_poi_score_the_card_shows():
+    from app.listings_cache import _poi_by_id, remember_poi_axes
+
+    _poi_by_id.clear()
+    item = _exact("saved-poi")
+    remember_poi_axes({
+        item.id: {"score": 76.5, "confidence": "high", "note": "respecto de esta ciudad · 28 lugares a menos de 600 m"},
+    })
+    public = item.to_public_dict()
+    axis = public["profile"]["axes"]["servicios"]
+    assert axis["score"] == 76.5
+    assert "28 lugares" in axis["note"]
+    assert public["profile"]["total"] is not None
+    assert not any(row["key"] == "servicios" for row in public["profile"]["pending"])
     _poi_by_id.clear()
 
 

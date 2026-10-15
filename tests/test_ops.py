@@ -1,3 +1,5 @@
+import re
+
 from fastapi.testclient import TestClient
 
 from app import crawl, main, ops
@@ -31,6 +33,57 @@ def test_note_rolls_http_and_llm():
     assert 'propmap_http_total{lane="direct"}' in text
     assert 'propmap_http_group_total{group="local"}' in text
     assert "propmap_listings" in text
+
+
+def test_inline_detail_attempts_report_outcomes_only_when_fetched(monkeypatch):
+    from contextlib import nullcontext
+
+    from app import detail_fetch, llm_enrich, pipeline, store
+
+    notes = []
+    monkeypatch.setattr(ops, "note", lambda metric, **labels: notes.append((metric, labels)))
+    monkeypatch.setattr(pipeline, "_needs_details", lambda item: not item.details_scraped)
+    monkeypatch.setattr(detail_fetch, "detail_slot", nullcontext)
+    monkeypatch.setattr(store, "upsert_many", lambda _rows: None)
+    monkeypatch.setattr(llm_enrich, "enqueue", lambda _rows: None)
+    monkeypatch.setattr(pipeline, "analyze", lambda _item: None)
+    monkeypatch.setattr(crawl, "snapshot", lambda: {})
+    monkeypatch.setattr(crawl, "is_slow", lambda: False)
+
+    def fetch(item, **_kwargs):
+        if item.source_id == "failed-detail":
+            raise RuntimeError("detail fetch failed")
+        item.details_scraped = True
+
+    monkeypatch.setattr(pipeline, "enrich_details", fetch)
+    rows = [
+        Listing(
+            source="portal",
+            source_id=source_id,
+            url=f"https://example.com/{source_id}",
+            title="Aviso",
+            property_type="casa",
+            city="caba",
+        )
+        for source_id in ("successful-detail", "failed-detail")
+    ]
+    pipeline._enrich_details(rows, lambda _message: None, "portal", "city")
+    assert notes == [
+        ("details", {"outcome": "ok"}),
+        ("details", {"outcome": "fail"}),
+    ]
+
+    already_fetched = Listing(
+        source="portal",
+        source_id="already-fetched",
+        url="https://example.com/already-fetched",
+        title="Aviso",
+        property_type="casa",
+        city="caba",
+        details_scraped=True,
+    )
+    pipeline._enrich_details([already_fetched], lambda _message: None, "portal", "city")
+    assert len(notes) == 2
 
 
 def test_inventory_counts_llm_and_details(tmp_path, monkeypatch):
@@ -148,7 +201,8 @@ def test_tablero_and_ops_api_need_admin(monkeypatch):
         assert "details_pipe" in body
         assert "need" in body["llm_pipe"]
         assert b"laneChart" in page.content
-        assert b"tablero.js?v=19" in page.content
+        # El número sube en cada deploy; lo que importa es que el JS vaya versionado.
+        assert re.search(rb"tablero\.js\?v=\d+", page.content)
         prom = client.get("/api/ops/metrics")
         assert prom.status_code == 200
         assert "propmap_up 1" in prom.text
@@ -310,6 +364,72 @@ def _empty_inv(**over):
     }
     data.update(over)
     return data
+
+
+def test_intake_pipe_reports_distinct_scrape_windows(monkeypatch):
+    from app import egress, pipeline
+
+    current_min = int(ops.time.time() // 60)
+    series = [
+        {"t": (current_min - 1439 + i) * 60, "ingest": 0, "new": 0, "gone": 0}
+        for i in range(1440)
+    ]
+    series[-1]["ingest"] = 4
+    series[-60]["ingest"] = 3
+    series[-61]["ingest"] = 100
+    telemetry = {
+        "series": series,
+        "ingest": {"n": 500},
+        "new": {"n": 5},
+        "gone": {"n": 2},
+        "llm": {},
+        "details": {},
+    }
+    monkeypatch.setattr(ops, "snapshot", lambda: telemetry)
+    monkeypatch.setattr(ops, "inventory", lambda force=False: _empty_inv(details=13))
+    monkeypatch.setattr(ops, "_persist_on", lambda: True)
+    monkeypatch.setattr(
+        ops,
+        "_movement_totals",
+        lambda _tel, since_min=None: (5, 2, 100) if since_min is None else (1, 0, 200),
+    )
+    monkeypatch.setattr(ops, "_day_outcomes", lambda _prefix: (0, 0, 0))
+    monkeypatch.setattr(
+        pipeline,
+        "status",
+        lambda: {"running": True, "counts": {}, "details": {}, "llm": {}, "copy": {}},
+    )
+    monkeypatch.setattr(egress, "snapshot", lambda: {})
+    monkeypatch.setattr(crawl, "busy_rows", lambda: [])
+
+    dashboard = ops._build_dashboard()
+    intake = dashboard["intake_pipe"]
+    assert intake["this_min"] == 4
+    assert intake["last_hour"] == 7
+    assert intake["ok_d"] == 100
+    assert intake["ok_24"] == 200
+    assert intake["done"] == dashboard["movement"]["seen"]
+    assert dashboard["movement"]["new"] == 5
+    assert dashboard["details_pipe"]["done"] == 13
+
+
+def test_unpersisted_24h_window_requires_full_process_coverage(monkeypatch):
+    current_min = int(ops.time.time() // 60)
+    start_min = current_min - 1439
+    telemetry = {
+        "series": [
+            {"t": (start_min + offset) * 60, "new": 1, "gone": 2, "ingest": 3}
+            for offset in range(1440)
+        ]
+    }
+    monkeypatch.setattr(ops, "_persist_on", lambda: False)
+    monkeypatch.setattr(ops, "_started", (start_min + 1) * 60)
+    assert ops._window_scope(start_min) == "process"
+    assert ops._movement_totals(telemetry, since_min=start_min) == (0, 0, 0)
+
+    monkeypatch.setattr(ops, "_started", start_min * 60)
+    assert ops._window_scope(start_min) == "24h"
+    assert ops._movement_totals(telemetry, since_min=start_min) == (1440, 2880, 4320)
 
 
 def test_llm_and_details_survive_process_reset(tmp_path, monkeypatch):

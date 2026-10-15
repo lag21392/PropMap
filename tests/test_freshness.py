@@ -182,6 +182,44 @@ def test_page_workers_stay_serial_in_tests():
     assert page_workers() == 1
 
 
+def test_paginate_keeps_later_pages_in_flight(monkeypatch):
+    """Una página lenta no frena a las siguientes: salen juntas y se aplican en orden."""
+    import threading
+    import time
+
+    from app.scrapers import paginate
+
+    monkeypatch.setattr("app.scrapers.page_workers", lambda: 3)
+    reset_known(set())
+    started: list[int] = []
+    gate = threading.Event()
+
+    def fetch_page(page: int):
+        started.append(page)
+        if page == 1:
+            assert gate.wait(3), "la página 1 no debería trabar el arranque de las otras"
+        return [_item(f"p{page}-{i}") for i in range(8)]
+
+    holder: dict = {}
+
+    def run():
+        holder["items"] = paginate(fetch_page, max_pages=3)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    deadline = time.time() + 2
+    while time.time() < deadline and not ({1, 2, 3} <= set(started)):
+        time.sleep(0.01)
+    assert {1, 2, 3} <= set(started)
+    gate.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    ids = [item.source_id for item in holder["items"]]
+    assert ids[0].startswith("p1-")
+    assert "p2-0" in ids
+    assert "p3-0" in ids
+
+
 def test_list_card_snippet_is_usable_text():
     short = _item("short", description="corto")
     snippet = _item("snip", description="d" * LIST_TEXT_MIN)

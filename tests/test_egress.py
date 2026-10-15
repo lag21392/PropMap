@@ -8,6 +8,9 @@ class _Resp:
         self.text = text
         self.url = url
 
+    def read(self):
+        return (self.text or "").encode()
+
     def raise_for_status(self):
         import httpx
 
@@ -169,10 +172,10 @@ def test_grows_tor_circuits_when_all_blocked(monkeypatch):
     crawl.note_http(403, "www.zonaprop.com.ar", lane="tor-1")
     lane = egress.pick("www.zonaprop.com.ar")
     assert lane is not None
-    assert lane.id in {"tor-2", "tor-3"}
+    assert lane.id in {"tor-2", "tor-3", "tor-4", "tor-5"}
     snap = egress.snapshot()
-    assert snap["tor_circuits"] == 4
-    assert snap["tor_extra"] == 2
+    assert snap["tor_extra"] == egress.GROW_STEP
+    assert snap["tor_circuits"] == 2 + egress.GROW_STEP
     crawl.reset()
     egress.reset()
 

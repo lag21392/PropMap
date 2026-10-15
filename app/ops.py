@@ -327,7 +327,36 @@ def _build_dashboard() -> dict[str, Any]:
     details_pace["eta_h"] = round(details_need_n / details_rate, 1) if details_rate and details_need_n else None
     copy_pace["eta_h"] = round(copy_need_n / copy_rate, 1) if copy_rate and copy_need_n else None
     new_n, gone_n, seen_n = _movement_totals(tel)
-    new_24h, gone_24h, seen_24h = _movement_totals(tel, since_min=int(time.time() // 60) - KEEP_MIN + 1)
+    rolling_start = int(time.time() // 60) - KEEP_MIN + 1
+    new_24h, gone_24h, seen_24h = _movement_totals(tel, since_min=rolling_start)
+    ingest_today = (
+        seen_n
+        if _persist_on()
+        else _series_sum_since(tel, "ingest", _today_start_min())
+    )
+    ingest_window_scope = _window_scope(rolling_start)
+    ingest_today_scope = (
+        "today"
+        if _persist_on() or _started <= _today_start_min() * 60
+        else "process_today"
+    )
+    ingest_series = tel.get("series") or []
+    ingest_minute = int((ingest_series[-1] if ingest_series else {}).get("ingest") or 0)
+    ingest_hour = sum(int(row.get("ingest") or 0) for row in ingest_series[-60:])
+    intake_pipe = {
+        "done": ingest_today,
+        "need": 0,
+        "working": int(bool(live.get("running"))),
+        "this_min": ingest_minute,
+        "last_hour": ingest_hour,
+        "per_hour": float(ingest_hour),
+        "per_min": round(ingest_hour / 60.0, 2) if ingest_hour else 0.0,
+        "ok_d": ingest_today,
+        "ok_24": seen_24h if ingest_window_scope == "24h" else None,
+        "rate_scope": "hour" if ingest_hour else "none",
+        "day_scope": ingest_today_scope,
+        "window_scope": ingest_window_scope,
+    }
     pass_new = int((live.get("counts") or {}).get("avisos") or 0)
     visits: list[dict[str, Any]] = []
     try:
@@ -369,6 +398,7 @@ def _build_dashboard() -> dict[str, Any]:
             "gone_24h": gone_24h,
             "seen_24h": seen_24h,
             "scope": "today" if _persist_on() else "process",
+            "window_scope": ingest_window_scope,
         },
         "llm_pipe": {
             "done": int(inv.get("llm_done") or 0),
@@ -402,6 +432,7 @@ def _build_dashboard() -> dict[str, Any]:
             "pct": float(inv.get("details_pct") or 0),
             **details_pace,
         },
+        "intake_pipe": intake_pipe,
         "copy_pipe": {
             "done": int(inv.get("copy_done") or 0),
             "need": int(inv.get("copy_need") or 0),
@@ -497,6 +528,18 @@ def _disk_or_mem(saved: dict[str, int], mem_n: int, *keys: str) -> int:
     return disk_n or int(mem_n or 0)
 
 
+def _series_sum_since(tel: dict[str, Any], metric: str, start_min: int) -> int:
+    return sum(
+        int(row.get(metric) or 0)
+        for row in tel.get("series") or []
+        if int((row.get("t") or 0) // 60) >= start_min
+    )
+
+
+def _window_scope(start_min: int) -> str:
+    return "24h" if _persist_on() or _started <= start_min * 60 else "process"
+
+
 def _merge_outcome(saved: dict[str, int], mem: dict[str, int], prefix: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for outcome in ("ok", "partial", "fail", "retry"):
@@ -548,7 +591,11 @@ def _outcome_pace(series: list[dict[str, Any]], field: str, *, prefix: str = "")
     last_hour = ok_h + partial_h
     day_ok, day_partial, day_fail = _day_outcomes(prefix) if prefix else (0, 0, 0)
     if not (day_ok or day_partial) and not _persist_on():
-        day_ok, day_partial, day_fail = ok_h, partial_h, fail_h
+        today_start = _today_start_min()
+        today = [row for row in series if int((row.get("t") or 0) // 60) >= today_start]
+        day_ok = grab(today, "ok")
+        day_partial = grab(today, "partial")
+        day_fail = grab(today, "fail")
     day_done = day_ok + day_partial
     if last_hour > 0:
         per_hour = float(last_hour)
@@ -563,6 +610,7 @@ def _outcome_pace(series: list[dict[str, Any]], field: str, *, prefix: str = "")
         "this_min": this_min,
         "this_ok": this_ok,
         "this_fail": this_fail,
+        "last_hour": last_hour,
         "ok_h": ok_h,
         "partial_h": partial_h,
         "fail_h": fail_h,
@@ -576,6 +624,12 @@ def _outcome_pace(series: list[dict[str, Any]], field: str, *, prefix: str = "")
         "per_min": round(per_hour / 60.0, 2) if per_hour else 0.0,
         "per_day": round(float(day_done), 1),
         "rate_scope": rate_scope,
+        "day_scope": (
+            "today"
+            if _persist_on() or _started <= _today_start_min() * 60
+            else "process_today"
+        ),
+        "window_scope": _window_scope(int(time.time() // 60) - KEEP_MIN + 1),
     }
     if per_hour <= 0:
         held = _pace_hold.get(field)
@@ -721,6 +775,14 @@ def _movement_totals(tel: dict[str, Any], since_min: int | None = None) -> tuple
     process_gone = int((tel.get("gone") or {}).get("n") or 0)
     process_seen = int((tel.get("ingest") or {}).get("n") or 0)
     if not _persist_on():
+        if since_min is not None:
+            if _started > since_min * 60:
+                return 0, 0, 0
+            totals = {
+                metric: _series_sum_since(tel, metric, since_min)
+                for metric in ("new", "gone", "ingest")
+            }
+            return totals["new"], totals["gone"], totals["ingest"]
         return process_new, process_gone, process_seen
     try:
         from .store import ops_sum_since

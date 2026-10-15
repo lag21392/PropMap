@@ -30,6 +30,23 @@ docker compose up --build -d
 
 Parar: `docker compose down`.
 
+### Arranque automático de producción tras reiniciar Linux
+
+En el host de producción, desde la copia desplegada del repositorio, ejecutá una vez:
+
+```bash
+sudo ./scripts/install-production-startup.sh
+```
+
+El instalador habilita `docker.service` y registra `propmap-production.service` en systemd. En cada arranque, la unidad espera a Docker y al montaje que contiene el repositorio, y ejecuta `docker compose -f compose.prod.yaml up -d` desde su raíz resuelta, levantando el stack de producción completo. No abre un navegador.
+
+Para comprobar el estado y consultar el registro:
+
+```bash
+systemctl status propmap-production.service
+journalctl -u propmap-production.service
+```
+
 ### Linux, sin Docker
 
 ```bash

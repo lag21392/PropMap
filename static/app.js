@@ -145,6 +145,10 @@ let listingsRev = 0;
 let listingsRevByCity = {};
 let usdArs = 0;
 let loadRetries = 0;
+let emptyWarmingRetries = 0;
+let emptyWarmingCity = "";
+let emptyWarmingPausedCity = "";
+const MAX_EMPTY_WARMING_RETRIES = 8;
 let lastStatus = {};
 const isAdmin = location.pathname.replace(/\/+$/, "") === "/admin";
 document.body.classList.toggle("is-admin", isAdmin);
@@ -250,6 +254,33 @@ function clearLoadedListings() {
     pane.innerHTML = `<p class="muted">Elegí un aviso en la lista o en el mapa para ver la ficha.</p>`;
   }
   showListingsWait("city");
+}
+
+function showWarmingRecovery(waitKind) {
+  const retry = () => {
+    emptyWarmingRetries = 0;
+    emptyWarmingPausedCity = "";
+    loadRetries = 0;
+    load({ waitKind, live: false });
+  };
+  const appendRetry = (parent) => {
+    parent.replaceChildren(document.createTextNode("Los avisos siguen preparándose. "));
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost";
+    button.textContent = "Reintentar";
+    button.addEventListener("click", retry);
+    parent.append(button);
+  };
+  const line = $("statusLine");
+  if (line) appendRetry(line);
+  const list = $("list");
+  if (list) {
+    list.setAttribute("aria-busy", "false");
+    if (!allListings.length) appendRetry(list);
+  }
+  const overlay = $("mapLoading");
+  if (overlay) overlay.hidden = true;
 }
 
 const emptyPlaces = new Set();
@@ -569,7 +600,8 @@ async function loadCardPages(city, seq) {
       clearTimeout(kill);
     }
     if (seq !== viewSeq || currentCity() !== city) return;
-    if (data.warming || data.unchanged) {
+    if (data.warming) return { warming: true, data };
+    if (data.unchanged) {
       stalls += 1;
       if (stalls > 40 && allListings.length) return;
       await new Promise((r) => setTimeout(r, 400));
@@ -678,6 +710,16 @@ async function loadRentals() {
 
 async function load(opts = {}) {
   const city = currentCity();
+  if (emptyWarmingCity !== city) {
+    emptyWarmingCity = city;
+    emptyWarmingRetries = 0;
+    emptyWarmingPausedCity = "";
+  }
+  if (emptyWarmingPausedCity === city) {
+    if (opts.live) return;
+    emptyWarmingRetries = 0;
+    emptyWarmingPausedCity = "";
+  }
   if (loadInFlight && opts.live) return;
   if (!opts.live) {
     viewSeq += 1;
@@ -688,48 +730,43 @@ async function load(opts = {}) {
   const shouldWait = !listingsReady || opts.waitKind === "city";
   if (shouldWait && !allListings.length) showListingsWait(opts.waitKind || "init");
   if (!allListings.length && !opts.live) prefetchPins(city, seq, opts.waitKind);
-  if (!String(lastListingsFp).endsWith(":f")) {
-    try {
-      await loadCardPages(city, seq);
-    } catch {
-      if (seq !== viewSeq || currentCity() !== city) return;
-      if (allListings.length) {
-        hideListingsWait();
-        if ($("statusLine") && /Cargando/.test($("statusLine").textContent || "")) {
-          $("statusLine").textContent = publicStatusLine();
-        }
+  let data;
+  let cardPagesWarming = false;
+  try {
+    if (!String(lastListingsFp).endsWith(":f")) {
+      const result = await loadCardPages(city, seq);
+      if (result?.warming) {
+        data = result.data;
+        cardPagesWarming = true;
+      } else {
+        emptyWarmingRetries = 0;
         return;
       }
-      loadRetries += 1;
-      showListingsWait(opts.waitKind || "init");
-      const delay = Math.min(3000, 350 * loadRetries);
-      setTimeout(() => load({ ...opts, live: false }), delay);
-    } finally {
-      loadInFlight = false;
     }
-    return;
-  }
-  let data;
-  try {
-    const q = new URLSearchParams();
-    if (opts.live) q.set("live", "1");
-    q.set("city", city);
-    const knownRev = listingsRevByCity[city];
-    const havePins = String(lastListingsFp).endsWith(":p");
-    if (allListings.length && knownRev && !havePins) {
-      q.set("since", String(knownRev));
+    if (!data) {
+      const q = new URLSearchParams();
+      if (opts.live) q.set("live", "1");
+      q.set("city", city);
+      const knownRev = listingsRevByCity[city];
+      const havePins = String(lastListingsFp).endsWith(":p");
+      if (allListings.length && knownRev && !havePins) {
+        q.set("since", String(knownRev));
+      }
+      const ac = new AbortController();
+      const kill = setTimeout(() => ac.abort(), havePins ? 120000 : 90000);
+      try {
+        const res = await timedFetch("/api/listings?" + q.toString(), "listings", { signal: ac.signal });
+        clearTimeout(kill);
+        if (!res.ok) throw new Error(String(res.status));
+        data = await res.json();
+      } finally {
+        clearTimeout(kill);
+      }
     }
-    const ac = new AbortController();
-    const kill = setTimeout(() => ac.abort(), havePins ? 120000 : 90000);
-    try {
-      const res = await timedFetch("/api/listings?" + q.toString(), "listings", { signal: ac.signal });
-      clearTimeout(kill);
-      if (!res.ok) throw new Error(String(res.status));
-      data = await res.json();
-    } finally {
-      clearTimeout(kill);
+    if (!(data.warming && !(data.listings || []).length && !allListings.length)) {
+      loadRetries = 0;
+      if (!data.warming) emptyWarmingRetries = 0;
     }
-    if (!(data.warming && !(data.listings || []).length && !allListings.length)) loadRetries = 0;
   } catch {
     if (seq !== viewSeq || currentCity() !== city) return;
     if (allListings.length) {
@@ -761,10 +798,19 @@ async function load(opts = {}) {
         $("statusLine").textContent = `Mostrando ${allListings.length} avisos. Sigue cargando…`;
       }
     } else if (!allListings.length) {
-      loadRetries += 1;
       showListingsWait(opts.waitKind || "init");
+      emptyWarmingRetries += 1;
+    } else if (cardPagesWarming) {
+      emptyWarmingRetries += 1;
     }
-    const delay = allListings.length ? 500 : Math.min(2000, 300 + loadRetries * 40);
+    if ((cardPagesWarming || !allListings.length) && emptyWarmingRetries >= MAX_EMPTY_WARMING_RETRIES) {
+      emptyWarmingPausedCity = city;
+      showWarmingRecovery(opts.waitKind || "init");
+      return;
+    }
+    const delay = allListings.length
+      ? 500
+      : Math.min(8000, 400 * (2 ** (emptyWarmingRetries - 1)));
     setTimeout(() => load({ waitKind: opts.waitKind || "init", live: true }), delay);
     return;
   }
@@ -1626,6 +1672,19 @@ function bindNearby(item, rows) {
   });
 }
 
+function paintSavedPoiScore(item, data) {
+  if (!item || !data || data.score == null || data.pending) return;
+  if (!item.profile || typeof item.profile !== "object") item.profile = { axes: {} };
+  if (!item.profile.axes) item.profile.axes = {};
+  const prev = item.profile.axes.servicios || {};
+  const note = data.reason || prev.note || "";
+  if (prev.score === data.score && (prev.note || "") === note) return;
+  item.profile.axes.servicios = { score: data.score, confidence: "high", note };
+  const card = document.querySelector(".ficha-bundle .radar-card");
+  if (!card || selectedId !== item.id) return;
+  card.outerHTML = pentagonChart(item.profile, { kind: item.property_type });
+}
+
 async function fillNearby(item) {
   const box = $("nearBox");
   if (!box || !item) return;
@@ -1651,6 +1710,7 @@ async function fillNearby(item) {
       box.innerHTML = nearbyHtml(item, rows, data.pending);
       bindNearby(item, rows);
       showNearbyOnMap(rows);
+      item.nearby = rows;
     } else {
       const meters = walkMeters(item, data);
       const msg = data.pending
@@ -1659,6 +1719,7 @@ async function fillNearby(item) {
       box.innerHTML = `<div class="near-list"><p class="muted">${escapeHtml(msg)}</p></div>`;
       poiLayer.clearLayers();
     }
+    paintSavedPoiScore(item, data);
     if (data.pending) {
       setTimeout(() => {
         if (selectedId === item.id) fillNearby(item);
@@ -3845,6 +3906,13 @@ async function pollStatus(force) {
   if (listingsReady && scrapeWas !== scrapeRunning) render();
   if ($("refreshBtn")) $("refreshBtn").disabled = fastJobs.includes(city);
   if ($("pauseBtn")) $("pauseBtn").disabled = !fastJobs.length;
+  if (emptyWarmingPausedCity === city) {
+    cityWasRunning[city] = viewingThis;
+    wasRunning = viewingThis;
+    pollBusy = false;
+    armPoll();
+    return;
+  }
   updateSearchingBanner();
   updatePipelineLine(s);
   const now = Date.now();

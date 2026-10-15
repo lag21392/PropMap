@@ -16,9 +16,9 @@ from urllib.parse import urlparse
 from . import crawl
 
 FAIL_COOLDOWN_SEC = 45.0
-MAX_TOR_CIRCUITS = 16
-GROW_STEP = 2
-GROW_EVERY_SEC = 20.0
+MAX_TOR_CIRCUITS = 48
+GROW_STEP = 8
+GROW_EVERY_SEC = 6.0
 
 
 @dataclass(frozen=True)
@@ -80,22 +80,22 @@ def use_local() -> bool:
 def local_limits() -> tuple[float, int]:
     """Segundos que ocupa una ficha por IP de casa, y tope diario."""
     try:
-        gap = float(os.environ.get("SCRAPE_LOCAL_GAP_SEC") or 20.0)
+        gap = float(os.environ.get("SCRAPE_LOCAL_GAP_SEC") or 10.0)
     except ValueError:
-        gap = 20.0
+        gap = 10.0
     try:
-        cap = int(os.environ.get("SCRAPE_LOCAL_MAX_DAY") or 600)
+        cap = int(os.environ.get("SCRAPE_LOCAL_MAX_DAY") or 1200)
     except ValueError:
-        cap = 600
+        cap = 1200
     return max(0.0, gap), max(0, cap)
 
 
 def local_parallel() -> int:
     try:
-        n = int(os.environ.get("SCRAPE_LOCAL_PARALLEL") or 4)
+        n = int(os.environ.get("SCRAPE_LOCAL_PARALLEL") or 8)
     except ValueError:
-        n = 4
-    return max(1, min(8, n))
+        n = 8
+    return max(1, min(16, n))
 
 
 def local_has_room() -> bool:

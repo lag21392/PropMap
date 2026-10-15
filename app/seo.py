@@ -110,8 +110,7 @@ def sitemap_xml(request) -> str:
     origin = origin_for(request)
     pages = (
         ("/", STATIC / "index.html", "weekly", "1.0"),
-        ("/legal", STATIC / "legal.html", "monthly", "0.3"),
-    )
+        ("/legal", STATIC / "legal.html", "monthly", "0.3"),    )
     chunks = []
     for path, file, freq, priority in pages:
         stamp = datetime.fromtimestamp(file.stat().st_mtime, timezone.utc).date().isoformat()

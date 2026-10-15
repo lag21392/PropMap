@@ -106,10 +106,11 @@ function paint(data) {
   const move = data.movement || {};
   const llm = data.llm_pipe || {};
   const fichas = data.details_pipe || {};
+  const intake = data.intake_pipe || {};
   const copy = data.copy_pipe || {};
   const running = Boolean(live.running);
 
-  paintSummary({ live, inv, tel, move, llm, fichas, copy, egress, running });
+  paintSummary({ live, inv, tel, move, llm, fichas, intake, copy, egress, running });
   paintLanes(egress.tracks || [], tel, data.busy || [], egress);
   paintMove(move, tel.series || []);
   paintLlm(llm, tel.series || [], live.copy || {});
@@ -230,7 +231,10 @@ function paintMove(move, series) {
   const seen24 = Number(move.seen_24h || 0);
   const passNew = Number(move.pass_new || 0);
   const today = move.scope === "today";
-  const use24 = !(neuToday || goneToday || seenToday) && (neu24 || gone24 || seen24);
+  const use24 =
+    move.window_scope === "24h" &&
+    !(neuToday || goneToday || seenToday) &&
+    (neu24 || gone24 || seen24);
   const neu = use24 ? neu24 : neuToday;
   const gone = use24 ? gone24 : goneToday;
   const seen = use24 ? seen24 : seenToday;
@@ -306,6 +310,7 @@ function etaCopy(hours, need, live) {
 function queueNow(kind, pipe) {
   const working = Number(pipe.working || 0);
   const queue = Number(pipe.queue || 0);
+  if (kind === "intake") return working ? "paginando" : "sin paginar";
   const copyOnGpu = Number(pipe.copy_working || 0) > 0;
   if (kind === "llm" && pipe.gpu && !copyOnGpu) return "en la GPU";
   if (kind === "llm" && copyOnGpu) return "cede el turno";
@@ -327,42 +332,69 @@ function queueEta(pipe) {
 }
 
 function queueRow(label, pipe, kind) {
+  const lastHour =
+    pipe.last_hour ?? Number(pipe.ok_h || 0) + Number(pipe.partial_h || 0);
+  const todayLabel = pipe.day_scope === "process_today" ? "hoy · proceso" : "hoy";
+  const windowLabel = pipe.window_scope === "process" ? "proceso" : "24 h";
+  const recent = pipe.ok_24 == null ? "—" : fmt(pipe.ok_24);
+  const periodNote =
+    pipe.day_scope === "process_today" || pipe.window_scope === "process"
+      ? `<small>${esc(todayLabel)} / ${esc(windowLabel)}</small>`
+      : "";
   return `<tr>
     <td>${esc(label)}</td>
     <td class="num">${fmt(pipe.done || 0)}</td>
     <td class="num is-need">${fmt(pipe.need || 0)}</td>
     <td>${esc(queueNow(kind, pipe))}</td>
     <td class="num">${fmt(pipe.this_min || 0)}</td>
-    <td class="num">${paceLabel(Number(pipe.per_hour || 0), pipe)}</td>
-    <td class="num">${fmt(pipe.ok_d || 0)}</td>
-    <td class="num">${esc(queueEta(pipe))}</td>
+    <td class="num">${fmt(lastHour)}</td>
+    <td class="num">${kind === "intake" ? paceLabel(Number(pipe.per_hour || 0), pipe) + " list/h" : paceLabel(Number(pipe.per_hour || 0), pipe)}</td>
+    <td class="num">${fmt(pipe.ok_d || 0)} / ${recent}${periodNote}</td>
+    <td class="num">${kind === "intake" ? "—" : esc(queueEta(pipe))}</td>
   </tr>`;
 }
 
-function paintQueues(llm, fichas, copy) {
+function paintQueues(llm, fichas, intake, copy) {
   const table = document.getElementById("queueTable");
   if (!table) return;
   table.innerHTML = `<caption>Proceso</caption>
     <thead><tr>
       <th>Etapa</th><th class="num">Hechos</th><th class="num">Faltan</th><th>Ahora</th>
-      <th class="num">Este minuto</th><th class="num">Por hora</th><th class="num">Hoy</th><th class="num">Termina</th>
+      <th class="num">Este minuto</th><th class="num">Última hora</th><th class="num">Ritmo / h</th>
+      <th class="num">Hoy / 24 h</th><th class="num">Termina</th>
     </tr></thead>
     <tbody>
+      ${queueRow("Ingreso de listados · paginado del portal (no fichas)", intake, "intake")}
       ${queueRow("Fichas · bajada, no es LLM", fichas, "fichas")}
       ${queueRow("Limpieza · LLM", llm, "llm")}
       ${queueRow("Descripciones · LLM", copy, "copy")}
-    </tbody>`;
+    </tbody></table>
+    <p class="queue-note">"Ingreso de listados" es el paginado del portal (aviso nuevo + existentes), no la bajada de fichas. Anda por ráfagas por-ciudad: los descansos entre ciudades hacen que el ritmo suba y baje dentro de la misma hora. La bajada de fichas está en su propia fila.</p>`;
 }
 
 function paintSummary(ctx) {
-  const { live, inv, tel, move, llm, fichas, copy, egress, running } = ctx;
-  paintQueues(llm, fichas, copy || {});
+  const { live, inv, tel, move, llm, fichas, intake, copy, egress, running } = ctx;
+  paintQueues(llm, fichas, intake || {}, copy || {});
   document.getElementById("sumBlock").hidden = false;
   const cities = (live.running_cities || []).join(", ");
   const base = fmt(inv.listings || 0);
-  const newToday = Number(move.new || 0) || Number(move.new_24h || 0);
-  const goneToday = Number(move.gone || 0) || Number(move.gone_24h || 0);
-  const flow = newToday || goneToday ? ` · +${fmt(newToday)} / −${fmt(goneToday)} hoy` : "";
+  const hasTodayMovement =
+    Number(move.new || 0) || Number(move.gone || 0) || Number(move.seen || 0);
+  const use24 =
+    move.window_scope === "24h" &&
+    !hasTodayMovement &&
+    (Number(move.new_24h || 0) || Number(move.gone_24h || 0) || Number(move.seen_24h || 0));
+  const newMovement = use24 ? Number(move.new_24h || 0) : Number(move.new || 0);
+  const goneMovement = use24 ? Number(move.gone_24h || 0) : Number(move.gone || 0);
+  const movementWindow = use24
+    ? "últimas 24 h"
+    : move.scope === "today"
+      ? "hoy"
+      : "desde el proceso";
+  const flow =
+    newMovement || goneMovement
+      ? ` · +${fmt(newMovement)} / −${fmt(goneMovement)} ${movementWindow}`
+      : "";
   const scrape = running
     ? `Scrape en curso · ${cities || "sin lugar"} · ${live.mode || "pasada"}`
     : live.message && live.message !== "Todavía no se buscó nada."
