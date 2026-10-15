@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -42,7 +41,6 @@ _DETAIL_URL = re.compile(
     re.I,
 )
 _blocked_until: dict[str, float] = {}
-_tls = threading.local()
 PAGE_CACHE_TTL = 12 * 3600
 
 
@@ -90,23 +88,13 @@ def _httpx_get(
     proxy: str | None = None,
 ) -> httpx.Response:
     hdrs = headers or HEADERS
-    wait_s = max(timeout, 55.0 if proxy else 35.0)
-    if os.environ.get("PROPMAP_TEST") == "1":
-        with httpx.Client(**_client_kwargs(timeout, hdrs, proxy)) as client:
-            return client.get(url)
-    clients = getattr(_tls, "clients", None)
-    if not isinstance(clients, dict):
-        clients = {}
-        _tls.clients = clients
-    key = f"{id(hdrs) if hdrs is HEADERS else 'custom'}|{proxy or ''}"
-    client = clients.get(key)
-    if client is None:
-        client = httpx.Client(
-            **_client_kwargs(wait_s, hdrs, proxy),
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-        )
-        clients[key] = client
-    return client.get(url)
+    wait_s = timeout if os.environ.get("PROPMAP_TEST") == "1" else max(timeout, 55.0 if proxy else 35.0)
+    # Un cliente por hilo dejaba el socket en CLOSE-WAIT cuando Tor cerraba.
+    # Cada pedido abre y cierra el suyo.
+    with httpx.Client(**_client_kwargs(wait_s, hdrs, proxy)) as client:
+        response = client.get(url)
+        response.read()
+        return response
 
 
 def portal_way(url: str = "", listing_id: str = "") -> str:

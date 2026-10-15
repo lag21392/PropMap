@@ -218,6 +218,7 @@ def apply_filters(listings: list, filters: dict, *, city_scoped: bool = False) -
     if isinstance(traits, str):
         traits = [traits]
     fav_only = bool(filters.get("favOnly"))
+    period = _filter_value(filters, "rentalPeriod", "period")
 
     result = []
     for item in listings:
@@ -229,6 +230,10 @@ def apply_filters(listings: list, filters: dict, *, city_scoped: bool = False) -
             continue
         if zona and getattr(item, "zona", "") != zona:
             continue
+        if period:
+            item_period = getattr(item, "period", "") or ""
+            if item_period != period:
+                continue
         price = getattr(item, "price_usd", None)
         if max_price and (price is None or float(price) > max_price):
             continue

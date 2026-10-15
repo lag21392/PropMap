@@ -23,17 +23,18 @@ services:
       - "8010:8000"
     volumes:
       - ./data-dev:/app/data
-      - ./data/listings.sqlite:/app/data/listings.sqlite
-      - ./data/listings.sqlite-wal:/app/data/listings.sqlite-wal
-      - ./data/listings.sqlite-shm:/app/data/listings.sqlite-shm
+      # La DB de producción se copia a data-dev antes de levantar (ver scripts/backup_db_for_dev.sh).
+      # No montar directamente los archivos de producción para evitar corrupción cruzada.
       - ./static:/app/static:ro
       - ./app:/app/app:ro
     environment:
       HOST: "0.0.0.0"
       PORT: "8000"
       DATA_DIR: /app/data
+      # La DB de dev está aislada en data-dev/ (se copia desde prod antes de levantar).
+      # Por eso aquí SÍ scrapeamos y escribimos Matomo sobre la copia, no sobre prod.
       SEARCH_PASSWORD: "${SEARCH_PASSWORD}"
-      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8010}"
       AUTH_SECRET: "${AUTH_SECRET:-}"
       AUTH_DEV_SHOW_LINK: "${AUTH_DEV_SHOW_LINK:-0}"
       SMTP_HOST: "${SMTP_HOST:-propmap-mail}"
@@ -46,6 +47,8 @@ services:
       MAIL_UI_URL: "${MAIL_UI_URL:-http://127.0.0.1:7512}"
       LLM_URL: "${LLM_URL:-http://propmap-llm:8080}"
       SYSTEMONE_URL: "${SYSTEMONE_URL:-}"
+      LAYA_SERVE_URL: "${LAYA_SERVE_URL:-http://laya-gpu:8000}"
+      LAYA_MODEL: "${LAYA_MODEL:-multilingual}"
       LLM_PROVIDER: "${LLM_PROVIDER:-local}"
       LLM_MODEL: "${LLM_MODEL:-gemma4-e4b-q4}"
       LLM_WORKERS: "${LLM_WORKERS:-1}"
@@ -185,7 +188,7 @@ services:
       MATOMO_DATABASE_PASSWORD: "${MATOMO_DB_PASSWORD}"
       MATOMO_DATABASE_DBNAME: "${MATOMO_DB_NAME}"
       MATOMO_DATABASE_TABLES_PREFIX: matomo_
-      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8000}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL:-http://127.0.0.1:8010}"
       MATOMO_PUBLIC_URL: "${MATOMO_PUBLIC_URL:-}"
     depends_on:
       matomo-db:

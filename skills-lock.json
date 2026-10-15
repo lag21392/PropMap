@@ -31,6 +31,12 @@
       "skillPath": ".claude/skills/geospatial-data-pipeline/SKILL.md",
       "computedHash": "09bb65c311cfd020680b6a162786db70bf3aaa27e991b44e0f39e095f4a6d5a8"
     },
+    "impeccable": {
+      "source": "pbakaus/impeccable",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/impeccable/SKILL.md",
+      "computedHash": "f7c4e03bef91154273d2dc3b62aff829cf4ab1b1f16e6b98c8c6a31be4405318"
+    },
     "just-scrape": {
       "source": "makerjackie/jackie-skills-starter",
       "sourceType": "github",

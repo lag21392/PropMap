@@ -117,11 +117,11 @@ def note_http(status: int, host: str = "", lane: str = "direct") -> None:
     if status in {429, 503}:
         backoff(random.uniform(18, 35), host, lane=lane)
     elif status == 403:
-        # Tor: 12-20 min. IP de casa: una página ~20 s, las otras siguen.
+        # Ese carril descansa un momento y el pedido pasa a otro. No se frena la cola.
         if (lane or "direct") == "direct":
             backoff(random.uniform(18, 22), host, lane=lane)
         else:
-            backoff(random.uniform(12 * 60, 20 * 60), host, lane=lane)
+            backoff(random.uniform(20, 40), host, lane=lane)
     elif status == 401:
         if (lane or "direct") == "direct":
             backoff(random.uniform(18, 22), host, lane=lane)

@@ -47,4 +47,4 @@
 
 ## Commit
 
-- `17ea7a6` feat: soportar período semanal, agrupar ciudades por provincia y buscar por provincia (7 files, +378/-44)
+- `200cc13` feat: soportar período semanal, agrupar ciudades por provincia y buscar por provincia (7 files, +382/-44)

@@ -217,6 +217,38 @@ def test_city_slug_redirects_to_the_id(tmp_path, monkeypatch):
     assert kind.headers["location"].endswith("/ciudad/trelew/casa")
 
 
+def test_footer_does_not_wait_for_the_city_scan(monkeypatch):
+    import threading
+    import time
+
+    from app import seo
+
+    monkeypatch.delenv("PROPMAP_TEST", raising=False)
+    seo._rows_memo = None
+    seo._rows_at = 0.0
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow():
+        started.set()
+        release.wait(2)
+        return [{"id": "quilmes", "label": "Quilmes"}]
+
+    monkeypatch.setattr(seo, "_load_cities", slow)
+    try:
+        t0 = time.monotonic()
+        html = seo.footer_nav()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.3
+        assert "Ciudades con avisos" in html
+        assert "/ciudad/quilmes" not in html
+        assert started.wait(1)
+    finally:
+        release.set()
+        seo._rows_memo = None
+        seo._rows_at = 0.0
+
+
 def test_brotli_when_the_library_is_present(monkeypatch):
     from app import compress
 

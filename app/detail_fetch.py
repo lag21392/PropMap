@@ -17,8 +17,8 @@ _skip_until: dict[str, float] = {}
 _lock = threading.Lock()
 _workers = 0
 MAX_WORKERS = 3
-SKIP_FAIL_SEC = 300.0
-SKIP_MAX_SEC = 6 * 3600.0
+SKIP_FAIL_SEC = 20.0
+SKIP_MAX_SEC = 90.0
 COLD_TRIES = 4
 
 
@@ -270,22 +270,8 @@ def _drain() -> None:
 
 
 def _fetch_bounded(listing_id: str) -> None:
-    """Una ficha que no vuelve no puede quedarse con el cupo para siempre."""
-    done = threading.Event()
-
-    def run() -> None:
-        try:
-            _fetch_id(listing_id)
-        finally:
-            done.set()
-
-    threading.Thread(target=run, daemon=True, name="detail-one").start()
-    if done.wait(75):
-        return
-    _ops_note("details", outcome="fail")
-    with _lock:
-        _seen.discard(listing_id)
-        _cool_locked(listing_id, 1)
+    """La ficha corre en este hilo. Un hilo aparte seguía vivo después del tope y se llevaba la RAM."""
+    _fetch_id(listing_id)
 
 
 def _fetch_id(listing_id: str) -> None:
@@ -330,24 +316,29 @@ def _fetch_id(listing_id: str) -> None:
             with _lock:
                 _cool_locked(listing_id, tries)
         item.extra = extra
-        store.upsert_many([item])
-        item = store.get_listing(listing_id) or item
+        try:
+            store.upsert_many([item])
+            item = store.get_listing(listing_id) or item
+        except Exception:
+            pass
     try:
-        from .access import enqueue_poi_score
+        try:
+            from .access import enqueue_poi_score
 
-        enqueue_poi_score(item)
-    except Exception:
-        pass
-    if needs_llm(item):
-        extra = item.extra or {}
-        enqueue_llm(
-            [item],
-            urgent=location_incomplete(item) or bool(extra.get("await_llm")),
-        )
-    else:
-        from .llm_copy import enqueue as enqueue_copy
+            enqueue_poi_score(item)
+        except Exception:
+            pass
+        if needs_llm(item):
+            extra = item.extra or {}
+            enqueue_llm(
+                [item],
+                urgent=location_incomplete(item) or bool(extra.get("await_llm")),
+            )
+        else:
+            from .llm_copy import enqueue as enqueue_copy
 
-        enqueue_copy([item])
-    with _lock:
-        if listing_id not in _urgent and listing_id not in _queue:
-            _seen.discard(listing_id)
+            enqueue_copy([item])
+    finally:
+        with _lock:
+            if listing_id not in _urgent and listing_id not in _queue:
+                _seen.discard(listing_id)

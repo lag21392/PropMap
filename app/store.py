@@ -725,18 +725,25 @@ def upsert_listings(listings: list[Listing], delete_source: str | None = None, *
     for item in listings:
         unique[item.id] = item
     batch = list(unique.values())
-    with _write:
-        with connect() as conn:
-            if delete_source:
-                conn.execute("DELETE FROM listings WHERE source = ?", (delete_source,))
-            if batch:
-                existing = {} if delete_source else _rows_by_ids(conn, [item.id for item in batch])
-                for item in batch:
-                    row = existing.get(item.id)
-                    if row:
-                        _merge_existing(item, row)
-                conn.executemany(_UPSERT_SQL, [_upsert_params(item, now) for item in batch])
-            conn.commit()
+    for attempt in range(4):
+        try:
+            with _write:
+                with connect() as conn:
+                    if delete_source:
+                        conn.execute("DELETE FROM listings WHERE source = ?", (delete_source,))
+                    if batch:
+                        existing = {} if delete_source else _rows_by_ids(conn, [item.id for item in batch])
+                        for item in batch:
+                            row = existing.get(item.id)
+                            if row:
+                                _merge_existing(item, row)
+                        conn.executemany(_UPSERT_SQL, [_upsert_params(item, now) for item in batch])
+                    conn.commit()
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 3:
+                raise
+            time.sleep(0.4 * (attempt + 1))
     from .market import sync_listing_prices
 
     sync_listing_prices(batch)

@@ -1,1 +1,1 @@
-[{"user_id": "u1", "filters": {"city": "caba"}, "ts": 1790354838.4099813}]
+[{"user_id": "u1", "filters": {"city": "caba"}, "ts": 1790354838.4099813, "id": "4ca75262-91c7-45c4-9fa8-e4b028596b59", "tier": "free", "active": true, "created": 1790527283.9719474, "last_sent": null}, {"id": "a5eac9fc-2ada-4955-bc9a-6470ca019b9c", "user_id": "1748e60a52d52244831457e63dbf2743", "filters": {"city": "Buenos Aires", "price_max": 100000}, "tier": "free", "active": true, "created": 1790526928.556838, "last_sent": "2026-10-06T18:27:16.616794+00:00", "seen_ids": []}]

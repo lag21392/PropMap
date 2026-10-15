@@ -55,6 +55,36 @@ body {
   font-size: 15px;
   letter-spacing: 0.08em;
 }
+.operation-switch {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+}
+.operation-switch button {
+  padding: 8px 12px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+}
+.operation-switch button[aria-pressed="true"] {
+  background: var(--teal);
+  color: var(--paper);
+}
+.rent-mode .sale-only,
+.rent-mode .deal-block,
+.rent-mode .price-analysis,
+.rent-mode .market-pulse {
+  display: none;
+}
+.rent-period {
+  color: var(--muted);
+  font-size: 0.78em;
+  font-weight: 400;
+}
 .search-logo .logo-mark {
   width: 36px;
   height: 36px;

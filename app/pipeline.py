@@ -730,10 +730,18 @@ def _scrape_one_city(
             "mercadolibre": "inmuebles.mercadolibre.com.ar",
         }.get(name, "")
         if host and not can_fetch(host):
-            report(f"{city['label']}: {name} en pausa por bloqueo, sigo con otros portales.")
-            with count_lock:
-                counts.setdefault(f"{name}:{city_id}", 0)
-            return name, False
+            # Un 403 deja un carril unos segundos. Se espera ese hueco y se sigue.
+            report(f"{city['label']}: {name} cambia de carril y sigue.")
+            deadline = time.time() + 50
+            while not can_fetch(host) and time.time() < deadline and not stop():
+                time.sleep(1)
+            if stop():
+                return name, True
+            if not can_fetch(host):
+                report(f"{city['label']}: {name} sin carril libre, lo retomo en el próximo turno.")
+                with count_lock:
+                    counts.setdefault(f"{name}:{city_id}", 0)
+                return name, False
         with crawl.job_context(slow=slow_flag, should_stop=stop):
             try:
                 items = scraper(
@@ -1258,8 +1266,10 @@ def maybe_daily_refresh() -> None:
     running = _running_ids()
     # El mantenimiento (POIs, geo) no puede ir antes: un scan largo de la base
     # deja el hilo diario ahí y la ciudad que toca no arranca.
-    if crawl.aborted() and not running:
-        return
+    if not running:
+        # La pausa vale para la búsqueda que estaba en curso, no para el motor.
+        crawl.clear_abort()
+        _stop.clear()
     from .schedule import home_scrape_id, next_jobs
 
     try:
