@@ -60,9 +60,9 @@ _meta_gate = threading.Lock()
 META_REFRESH_SEC = 20.0
 CITY_CACHE_TTL_SEC = 48 * 3600
 KEEP_CITY_GAP_SEC = 1.2
-MAX_RAM_SNAPS = 4
-HYDRATE_RAM = 3
-RAM_SOFT_KB = 3_800_000
+MAX_RAM_SNAPS = 2
+HYDRATE_RAM = 0
+RAM_SOFT_KB = 900_000
 SNAP_VER = "25"
 SNAP_READ_VERS = frozenset({"25"})
 MIN_TRUSTED_SNAP = 80
@@ -218,6 +218,8 @@ def apply_poi_overlay(rows: list[dict[str, Any]] | None) -> int:
             axes = {}
             profile["axes"] = axes
         serv = axes.get("servicios") if isinstance(axes.get("servicios"), dict) else {}
+        if serv.get("score") is not None:
+            continue
         if serv.get("score") == incoming.get("score") and (serv.get("note") or "") == (incoming.get("note") or ""):
             continue
         axes["servicios"] = dict(incoming)
@@ -492,27 +494,31 @@ def _snap_ver_ok_bytes(raw: bytes, *, head: bytes | None = None, tail: bytes | N
 
 
 def reset() -> None:
-    global _rev, _ready, _warming, _usd, _last_run, _disk_preloaded, _force_cache_dir, _catalog_keep_fp, _build_depth, _meta_at
-    with _lock:
-        _rev = 0
-        _by_id.clear()
-        _item_rev.clear()
-        _ready = False
-        _warming = False
-        _usd = USD_FALLBACK
-        _last_run = ""
-        _cities.clear()
-        _city_snaps.clear()
-        _persist_queued.clear()
-        _encode_queued.clear()
-        _loading.clear()
-        _warm_queued.clear()
-        _warmed.clear()
-        _encode_at.clear()
-        _disk_preloaded = False
-        _force_cache_dir = None
-        _db_loaded.clear()
-        _catalog_keep_fp = ""
+    global _rev, _ready, _warming, _usd, _last_run, _disk_preloaded, _force_cache_dir, _catalog_keep_fp, _build_depth, _meta_at, _card_cache_generation
+    with _page_lock:
+        with _lock:
+            _rev = 0
+            _by_id.clear()
+            _item_rev.clear()
+            _ready = False
+            _warming = False
+            _usd = USD_FALLBACK
+            _last_run = ""
+            _cities.clear()
+            _city_snaps.clear()
+            _persist_queued.clear()
+            _encode_queued.clear()
+            _loading.clear()
+            _warm_queued.clear()
+            _warmed.clear()
+            _encode_at.clear()
+            _disk_preloaded = False
+            _force_cache_dir = None
+            _db_loaded.clear()
+            _catalog_keep_fp = ""
+        _card_cache.clear()
+        _page_building.clear()
+        _card_cache_generation += 1
     with _build_gate:
         _build_depth = 0
     with _meta_gate:
@@ -1210,7 +1216,9 @@ def request_city_bytes(city: str | None, *, refresh: bool = False) -> None:
                     return
                 if n and snap.get("encoded") and not snap.get("warming"):
                     return
-                if n and not snap.get("warming"):
+                # Una ciudad sin avisos ya leída tampoco se vuelve a cargar: alcanza
+                # con encolar el encode, si no se relee la base en cada pedido.
+                if not snap.get("warming"):
                     _schedule_encode(view_city)
                     return
             if snap.get("encoded") and not snap.get("warming") and not incomplete:
@@ -1753,6 +1761,7 @@ def _card_row(row: dict[str, Any]) -> dict[str, Any]:
 _page_building: set[str] = set()
 _page_lock = threading.Lock()
 _card_cache: dict[str, tuple[int, list]] = {}
+_card_cache_generation = 0
 
 
 def _schedule_card_pages(city_id: str) -> None:
@@ -1762,15 +1771,19 @@ def _schedule_card_pages(city_id: str) -> None:
         if city_id in _page_building:
             return
         _page_building.add(city_id)
+        generation = _card_cache_generation
     threading.Thread(
         target=_build_card_pages,
-        args=(city_id,),
+        args=(city_id, generation),
         daemon=True,
         name=f"card-pages-{city_id}",
     ).start()
 
 
-def _build_card_pages(city_id: str) -> None:
+def _build_card_pages(city_id: str, generation: int | None = None) -> None:
+    if generation is None:
+        with _page_lock:
+            generation = _card_cache_generation
     try:
         raw, _encoding = listings_body(city_id, gzip=False)
         if not raw:
@@ -1784,13 +1797,16 @@ def _build_card_pages(city_id: str) -> None:
         rows = [_card_row(row) for row in data.get("listings") or [] if isinstance(row, dict)]
         rev = int(data.get("rev") or 0)
         del data
-        with _lock:
-            snap = _city_snaps.get(city_id)
-            if snap is not None and not snap.get("warming"):
-                snap["card_rows"] = rows
-                snap["card_rev"] = int(snap.get("rev") or rev)
-                rev = int(snap.get("card_rev") or rev)
-            _card_cache[city_id] = (rev, rows)
+        with _page_lock:
+            if generation != _card_cache_generation:
+                return
+            with _lock:
+                snap = _city_snaps.get(city_id)
+                if snap is not None and not snap.get("warming"):
+                    snap["card_rows"] = rows
+                    snap["card_rev"] = int(snap.get("rev") or rev)
+                    rev = int(snap.get("card_rev") or rev)
+                _card_cache[city_id] = (rev, rows)
     finally:
         with _page_lock:
             _page_building.discard(city_id)
@@ -2013,6 +2029,33 @@ def _write_http_artifacts(
             gz_tmp = folder / f".{city_id}.json.gz.tmp"
             gz_tmp.write_bytes(encoded_gzip)
             gz_tmp.replace(_gz_path(folder, city_id))
+    except FileNotFoundError:
+        # Race condition: another process may have created the directory
+        # Retry once
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(encoded)
+            tmp.replace(path)
+            meta_tmp.write_text(
+                json.dumps(
+                    {"rev": rev, "n": n, "deals": deals, "snap_ver": SNAP_VER, "geo_ver": GEO_VERSION, "score_ver": SCORE_VERSION, "saved_at": time.time(), "db_loaded": bool(db_loaded), "warming": bool(warming), "db_n": 0 if warming else int(db_n or (meta or {}).get("db_n") or 0)},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            meta_tmp.replace(meta_path)
+            if encoded_gzip:
+                gz_tmp = folder / f".{city_id}.json.gz.tmp"
+                gz_tmp.write_bytes(encoded_gzip)
+                gz_tmp.replace(_gz_path(folder, city_id))
+        except OSError:
+            log.exception("no pude guardar cache http de %s (retry)", city_id)
+            for leftover in (tmp, meta_tmp):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
     except OSError:
         log.exception("no pude guardar cache http de %s", city_id)
         for leftover in (tmp, meta_tmp):
@@ -2225,6 +2268,52 @@ def _evict_old_snaps_locked(keep: str | None = None, priority: set[str] | None =
                 _by_id.pop(lid, None)
 
 
+def _evict_ram_for_pressure(hold: set[str]) -> bool:
+    global _card_cache_generation
+    if not _page_lock.acquire(timeout=0.4):
+        return False
+    try:
+        if not _lock.acquire(timeout=0.4):
+            return False
+        try:
+            if _loading:
+                return False
+            keep = {cid: _city_snaps[cid] for cid in hold if cid in _city_snaps}
+            if "*" in _city_snaps:
+                keep["*"] = _city_snaps["*"]
+            _city_snaps.clear()
+            _city_snaps.update(keep)
+            _by_id.clear()
+            for city_id, snap in _city_snaps.items():
+                snap["listings"] = []
+                snap.pop("card_rows", None)
+                snap.pop("card_rev", None)
+                if snap.get("encoded_gzip"):
+                    snap.pop("encoded", None)
+                if snap.get("pins_gzip"):
+                    snap.pop("pins_encoded", None)
+                if city_id == "*" or not _disk_http_ready(city_id, allow_stale=True):
+                    continue
+                meta = _read_meta(city_id, allow_stale=True) or {}
+                try:
+                    disk_rev = int(meta.get("rev"))
+                    snap_rev = int(snap.get("rev"))
+                except (TypeError, ValueError):
+                    continue
+                if disk_rev == snap_rev:
+                    snap.pop("encoded", None)
+                    snap.pop("encoded_gzip", None)
+                    snap.pop("enc_rev", None)
+            _card_cache.clear()
+            _card_cache_generation += 1
+        finally:
+            _lock.release()
+    finally:
+        _page_lock.release()
+    gc.collect()
+    return True
+
+
 def _preload_disk() -> None:
     global _disk_preloaded
     with _lock:
@@ -2251,29 +2340,16 @@ def _watch_ram() -> None:
                 hold.update(_priority_city_ids()[:2])
             except Exception:
                 pass
-            got = _lock.acquire(timeout=0.4)
-            if not got:
+            if not _evict_ram_for_pressure(hold):
                 continue
+            # Intentar devolver memoria al SO liberando arenas de glibc
             try:
-                if _loading:
-                    continue
-                log.warning("RAM alta (%s MB), suelto dicts de avisos; el JSON queda en disco", rss // 1024)
-                hold.update(_loading)
-                keep = {cid: _city_snaps[cid] for cid in hold if cid in _city_snaps}
-                if "*" in _city_snaps:
-                    keep["*"] = _city_snaps["*"]
-                _city_snaps.clear()
-                _city_snaps.update(keep)
-                _by_id.clear()
-                for snap in _city_snaps.values():
-                    snap["listings"] = []
-                    if snap.get("encoded_gzip"):
-                        snap.pop("encoded", None)
-                    if snap.get("pins_gzip"):
-                        snap.pop("pins_encoded", None)
-            finally:
-                _lock.release()
-            gc.collect()
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except Exception:
+                pass
+            log.warning("RAM alta (%s MB), suelto dicts de avisos; el JSON queda en disco", rss // 1024)
         except Exception:
             log.exception("ram-watch")
 

@@ -4,12 +4,12 @@ import random
 import threading
 import time
 
-FAST_MIN, FAST_MAX = 0.08, 0.28
-SLOW_MIN, SLOW_MAX = 0.7, 1.6
-FAST_PAGES = 24
-SLOW_PAGES = 48
-REST_MIN, REST_MAX = 20, 40
-SOON_MIN, SOON_MAX = 8, 16
+FAST_MIN, FAST_MAX = 0.05, 0.15
+SLOW_MIN, SLOW_MAX = 0.3, 0.8
+FAST_PAGES = 96
+SLOW_PAGES = 72
+REST_MIN, REST_MAX = 15, 30
+SOON_MIN, SOON_MAX = 6, 12
 SLOW_HOSTS = ("properati.com",)
 # 429/401/403 superan esto; el pacing normal no (máx. 6 s).
 COOL_SEC = 8.0
@@ -117,11 +117,11 @@ def note_http(status: int, host: str = "", lane: str = "direct") -> None:
     if status in {429, 503}:
         backoff(random.uniform(18, 35), host, lane=lane)
     elif status == 403:
-        # Tor: 12-20 min. IP de casa: una página ~20 s, las otras siguen.
+        # Ese carril descansa un momento y el pedido pasa a otro. No se frena la cola.
         if (lane or "direct") == "direct":
             backoff(random.uniform(18, 22), host, lane=lane)
         else:
-            backoff(random.uniform(12 * 60, 20 * 60), host, lane=lane)
+            backoff(random.uniform(20, 40), host, lane=lane)
     elif status == 401:
         if (lane or "direct") == "direct":
             backoff(random.uniform(18, 22), host, lane=lane)

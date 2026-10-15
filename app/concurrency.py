@@ -19,7 +19,7 @@ def get_cpu_executor() -> ThreadPoolExecutor:
     """Get or create the global CPU-bound ThreadPoolExecutor."""
     global _cpu_executor
     if _cpu_executor is None:
-        cpu_count = os.cpu_count() or 4
+        cpu_count = max(2, (os.cpu_count() or 4) // 2)
         _cpu_executor = ThreadPoolExecutor(max_workers=cpu_count, thread_name_prefix="cpu-pool")
     return _cpu_executor
 
@@ -28,7 +28,7 @@ def get_io_executor() -> ThreadPoolExecutor:
     """Get or create the global I/O-bound ThreadPoolExecutor."""
     global _io_executor
     if _io_executor is None:
-        _io_executor = ThreadPoolExecutor(max_workers=30, thread_name_prefix="io-pool")
+        _io_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="io-pool")
     return _io_executor
 
 

@@ -74,6 +74,21 @@ def test_watchdog_http_ok_and_fail(monkeypatch):
     assert watchdog._thread is None or not watchdog._thread.is_alive()
 
 
+def test_watchdog_keeps_heartbeat_before_serving(monkeypatch):
+    from app import watchdog
+
+    monkeypatch.setattr(watchdog, "_http_ok", lambda: False)
+    watchdog._started = 0.0
+    watchdog._serving.clear()
+    try:
+        assert watchdog._healthy() is True
+        watchdog.mark_serving()
+        assert watchdog._healthy() is False
+        assert watchdog._stuck_reason() == "/api/alive no contestó a tiempo"
+    finally:
+        watchdog._serving.set()
+
+
 def test_watchdog_stays_ok_while_cache_builds(monkeypatch):
     from app import listings_cache, watchdog
 

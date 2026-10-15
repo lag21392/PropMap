@@ -23,3 +23,5 @@ scripts/_probe*.py
 .pytest_cache/
 .DS_Store
 .cursor/
+# Local Pi runtime state
+.atl/

@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from typing import Any
 
 from .freshness import needs_detail_fetch
@@ -15,10 +16,14 @@ _queue: deque[str] = deque()
 _seen: set[str] = set()
 _skip_until: dict[str, float] = {}
 _lock = threading.Lock()
+_refill_lock = threading.Lock()
+_detail_condition = threading.Condition(_lock)
 _workers = 0
-MAX_WORKERS = 3
-SKIP_FAIL_SEC = 300.0
-SKIP_MAX_SEC = 6 * 3600.0
+_detail_active = 0
+MAX_WORKERS = 6
+MAX_PENDING = 300
+SKIP_FAIL_SEC = 5.0
+SKIP_MAX_SEC = 30.0
 COLD_TRIES = 4
 
 
@@ -41,13 +46,14 @@ def workers() -> int:
     raw = os.environ.get("DETAIL_WORKERS")
     if raw:
         try:
-            return max(1, min(16, int(raw)))
+            return max(1, min(48, int(raw)))
         except ValueError:
             pass
     n = lane_count()
-    target = n * 3 if n > 1 else MAX_WORKERS
+    # More aggressive scaling: 6 workers per lane, max 24
+    target = n * 6 if n > 1 else MAX_WORKERS
     # Tor extra no multiplica workers: si el portal bloquea, saturaban la IP local.
-    return max(1, min(6, max(MAX_WORKERS, target)))
+    return max(1, min(24, max(MAX_WORKERS, target)))
 
 
 def queue_stats() -> dict[str, Any]:
@@ -64,10 +70,29 @@ def queue_stats() -> dict[str, Any]:
         }
 
 
+@contextmanager
+def detail_slot():
+    """Share one detail-fetch budget across queue workers and concurrent scrape jobs."""
+    global _detail_active
+    with _detail_condition:
+        while _detail_active >= workers():
+            _detail_condition.wait()
+        _detail_active += 1
+    try:
+        yield
+    finally:
+        with _detail_condition:
+            _detail_active -= 1
+            _detail_condition.notify_all()
+
+
 def _wait_sec(tries: int) -> float:
     """Si el portal contesta 403, insistir al toque solo quema CPU y SQLite."""
     step = max(1, min(tries, 6))
-    return min(SKIP_MAX_SEC, SKIP_FAIL_SEC * (2 ** (step - 1)))
+    # Even more aggressive backoff: start at 3s, cap at 20s (was 5s-30s)
+    base = 3.0
+    max_sec = 20.0
+    return min(max_sec, base * (2 ** (step - 1)))
 
 
 def _cool_locked(listing_id: str, tries: int) -> None:
@@ -93,28 +118,14 @@ def needs_llm(item: Listing) -> bool:
     return needs_improve(item)
 
 
-_priority_city = ""
-_priority_read = 0.0
-
-
 def _priority_city_now() -> str:
-    global _priority_city, _priority_read
-    now = time.time()
-    if _priority_read and now - _priority_read < 20:
-        return _priority_city
-    from . import store
+    """La ciudad del día: sus fichas se vuelven a bajar primero."""
+    from .schedule import priority_city
 
     try:
-        with store.connect() as conn:
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = ?",
-                ("detail_priority_city",),
-            ).fetchone()
+        return priority_city()
     except Exception:
-        return _priority_city
-    _priority_city = (row["value"] if row else "").strip()
-    _priority_read = now
-    return _priority_city
+        return ""
 
 
 def _refresh_due(item: Listing, city: str) -> bool:
@@ -159,6 +170,8 @@ def enqueue(
                         _queue.remove(item.id)
                         _urgent.appendleft(item.id)
                     continue
+                if len(_seen) >= MAX_PENDING:
+                    continue
                 _seen.add(item.id)
                 if photo_first or loc_first:
                     _urgent.appendleft(item.id)
@@ -173,35 +186,42 @@ def enqueue(
 
 def refill(prefer_city: str = "") -> int:
     """Baja fichas de toda la base, no solo de la ciudad en scrape."""
+    return _refill(prefer_city, retry_cooling=True)
+
+
+def _refill(prefer_city: str, *, retry_cooling: bool) -> int:
     if not enabled():
         return 0
-    now = time.time()
-    with _lock:
-        pending = len(_urgent) + len(_queue)
-        room = max(0, 30 - pending)
-        skip = set(_seen)
-        # El backfill es un reintento deliberado: no filtrar por cooling (_skip_until)
-        # para que los items con detail_tries agotados puedan reintentarse.
-    if room <= 0:
-        return 0
-    from . import store
-
-    refresh = _priority_city_now()
-    prefer = refresh or (prefer_city or "").strip()
-    items = store.fetch_detail_backlog(
-        room,
-        prefer_city=prefer,
-        skip_ids=skip,
-        refresh_city=refresh,
-    )
-    take = [item for item in items if item.id not in skip][:room]
-    if take:
-        # Limpiar cooling para estos items ya que el backfill los está reintentando
+    with _refill_lock:
         with _lock:
-            for item in take:
-                _skip_until.pop(item.id, None)
-        enqueue(take, ignore_cooling=True, refresh_city=refresh)
-    return len(take)
+            room = min(30, max(0, MAX_PENDING - len(_seen)))
+            skip = set(_seen)
+            if not retry_cooling:
+                now = time.time()
+                skip.update(lid for lid, until in _skip_until.items() if until > now)
+        if room <= 0:
+            return 0
+        from . import store
+
+        refresh = _priority_city_now()
+        prefer = refresh or (prefer_city or "").strip()
+        items = store.fetch_detail_backlog(
+            room,
+            prefer_city=prefer,
+            skip_ids=skip,
+            refresh_city=refresh,
+        )
+        take = [item for item in items if item.id not in skip][:room]
+        if take:
+            if retry_cooling:
+                # Explicit backfill is a deliberate retry, even during cooldown.
+                with _lock:
+                    for item in take:
+                        _skip_until.pop(item.id, None)
+            enqueue(take, ignore_cooling=retry_cooling, refresh_city=refresh)
+            with _lock:
+                return sum(item.id in _seen for item in take)
+        return 0
 
 
 def _has_work() -> bool:
@@ -262,6 +282,12 @@ def _drain() -> None:
             if stalled:
                 time.sleep(1.0)
                 continue
+            try:
+                refilled = _refill("", retry_cooling=False)
+            except Exception:
+                refilled = 0
+            if refilled:
+                continue
             return
     finally:
         with _lock:
@@ -270,25 +296,20 @@ def _drain() -> None:
 
 
 def _fetch_bounded(listing_id: str) -> None:
-    """Una ficha que no vuelve no puede quedarse con el cupo para siempre."""
-    done = threading.Event()
-
-    def run() -> None:
-        try:
-            _fetch_id(listing_id)
-        finally:
-            done.set()
-
-    threading.Thread(target=run, daemon=True, name="detail-one").start()
-    if done.wait(75):
-        return
-    _ops_note("details", outcome="fail")
-    with _lock:
-        _seen.discard(listing_id)
-        _cool_locked(listing_id, 1)
+    """La ficha corre en este hilo. Un hilo aparte seguía vivo después del tope y se llevaba la RAM."""
+    _fetch_id(listing_id)
 
 
 def _fetch_id(listing_id: str) -> None:
+    try:
+        _fetch_id_inner(listing_id)
+    finally:
+        with _lock:
+            if listing_id not in _urgent and listing_id not in _queue:
+                _seen.discard(listing_id)
+
+
+def _fetch_id_inner(listing_id: str) -> None:
     from . import store
     from .features import analyze
     from .llm_enrich import enqueue as enqueue_llm
@@ -301,7 +322,8 @@ def _fetch_id(listing_id: str) -> None:
     if item.url and (needs_detail_fetch(item) or force):
         stamp = str((item.extra or {}).get("details_at") or "")
         try:
-            enrich_details(item, force=force)
+            with detail_slot():
+                enrich_details(item, force=force)
             ok = bool(item.details_scraped)
             if force:
                 ok = ok and str((item.extra or {}).get("details_at") or "") != stamp
@@ -330,24 +352,29 @@ def _fetch_id(listing_id: str) -> None:
             with _lock:
                 _cool_locked(listing_id, tries)
         item.extra = extra
-        store.upsert_many([item])
-        item = store.get_listing(listing_id) or item
+        try:
+            store.upsert_many([item])
+            item = store.get_listing(listing_id) or item
+        except Exception:
+            pass
     try:
-        from .access import enqueue_poi_score
+        try:
+            from .access import enqueue_poi_score
 
-        enqueue_poi_score(item)
-    except Exception:
-        pass
-    if needs_llm(item):
-        extra = item.extra or {}
-        enqueue_llm(
-            [item],
-            urgent=location_incomplete(item) or bool(extra.get("await_llm")),
-        )
-    else:
-        from .llm_copy import enqueue as enqueue_copy
+            enqueue_poi_score(item)
+        except Exception:
+            pass
+        if needs_llm(item):
+            extra = item.extra or {}
+            enqueue_llm(
+                [item],
+                urgent=location_incomplete(item) or bool(extra.get("await_llm")),
+            )
+        else:
+            from .llm_copy import enqueue as enqueue_copy
 
-        enqueue_copy([item])
-    with _lock:
-        if listing_id not in _urgent and listing_id not in _queue:
-            _seen.discard(listing_id)
+            enqueue_copy([item])
+    finally:
+        with _lock:
+            if listing_id not in _urgent and listing_id not in _queue:
+                _seen.discard(listing_id)

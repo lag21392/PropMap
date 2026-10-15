@@ -66,6 +66,52 @@ def test_empty_searched_place_jumps_the_queue(monkeypatch):
     assert jobs[0][0] == "rio-gallegos"
 
 
+def test_priority_city_only_lasts_while_its_window_is_open(monkeypatch):
+    """La ciudad del día manda hasta que vence; después todas pesan igual."""
+    from app import schedule
+
+    reset()
+    meta: dict[str, str] = {}
+    monkeypatch.setattr("app.store.set_meta", lambda key, value: meta.__setitem__(key, value))
+    monkeypatch.setattr("app.store.get_meta", lambda key, default="", **kw: meta.get(key, default))
+
+    assert schedule.set_priority_city("puerto-madryn") == "puerto-madryn"
+    assert schedule.home_scrape_id() == "puerto-madryn"
+
+    monkeypatch.setattr(schedule, "_today", lambda: "2099-12-31")
+    schedule._priority_at = 0.0
+    assert schedule.priority_city() == ""
+    assert schedule.home_scrape_id() == ""
+
+
+def test_priority_city_can_be_cleared(monkeypatch):
+    from app import schedule
+
+    reset()
+    meta: dict[str, str] = {}
+    monkeypatch.setattr("app.store.set_meta", lambda key, value: meta.__setitem__(key, value))
+    monkeypatch.setattr("app.store.get_meta", lambda key, default="", **kw: meta.get(key, default))
+
+    schedule.set_priority_city("puerto-madryn")
+    assert schedule.set_priority_city("") == ""
+    schedule._priority_at = 0.0
+    assert schedule.priority_city() == ""
+
+
+def test_priority_places_stay_in_the_pool_without_priority(monkeypatch):
+    """Sin prioridad, Madryn igual sigue en la rotación."""
+    from app import schedule
+
+    reset()
+    monkeypatch.setattr(schedule, "priority_city", lambda: "")
+    monkeypatch.setattr("app.places.listed_place_ids", lambda: ["trelew"])
+    monkeypatch.setattr("app.places.priority_place_ids", lambda: ["puerto-madryn", "caba"])
+    monkeypatch.setattr("app.places.load_custom_places", lambda: None)
+    monkeypatch.setattr("app.places.scrape_place_ok", lambda _cid: True)
+    monkeypatch.setattr("app.places.is_cache_artifact_id", lambda _cid: False)
+    assert "puerto-madryn" in schedule.pool_ids()
+
+
 def test_home_place_jumps_queue_even_if_another_is_starved(monkeypatch):
     reset()
     monkeypatch.setattr("app.schedule.pool_ids", lambda: ["puerto-madryn", "trelew", "caba"])
