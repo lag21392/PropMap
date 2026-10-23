@@ -17,19 +17,17 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 INTERVAL_SEC = 2.0
-LOCK_WAIT_SEC = 1.2
-HTTP_WAIT_SEC = 1.5
-STALE_SEC = 12.0
-SUICIDE_FAILS = 8
-DUMP_AT_FAILS = 3
-BOOT_GRACE_SEC = 40.0
+LOCK_WAIT_SEC = 5.0
+HTTP_WAIT_SEC = 5.0
+STALE_SEC = 30.0
+SUICIDE_FAILS = 20
+DUMP_AT_FAILS = 5
+BOOT_GRACE_SEC = 120.0
 
 _started = 0.0
 _fails = 0
 _ok_once = False
 _stop = threading.Event()
-_serving = threading.Event()
-_serving.set()
 _thread: threading.Thread | None = None
 
 
@@ -62,15 +60,9 @@ def start() -> None:
         return
     _started = time.time()
     _stop.clear()
-    _serving.clear()
     _write(ok=True)
     _thread = threading.Thread(target=_loop, daemon=True, name="watchdog")
     _thread.start()
-
-
-def mark_serving() -> None:
-    """El healthcheck de Docker puede latir durante el open de SQLite; /api/alive recién después."""
-    _serving.set()
 
 
 def stop() -> None:
@@ -117,8 +109,6 @@ def _dump_threads() -> None:
 
 def _stuck_reason() -> str:
     """Vacío si todo responde; si no, qué chequeo se trabó (para no adivinar en los logs)."""
-    if not _serving.is_set():
-        return ""
     from . import listings_cache, pipeline
 
     # cities_loading() no debe esperar el candado: si está tomado, ping_lock decide.

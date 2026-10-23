@@ -14,23 +14,20 @@ _cpu_executor: ThreadPoolExecutor | None = None
 # Workers = 20-30 for I/O-bound tasks (network, disk)
 _io_executor: ThreadPoolExecutor | None = None
 
-
 def get_cpu_executor() -> ThreadPoolExecutor:
     """Get or create the global CPU-bound ThreadPoolExecutor."""
     global _cpu_executor
     if _cpu_executor is None:
-        cpu_count = max(2, (os.cpu_count() or 4) // 2)
+        cpu_count = min(os.cpu_count() or 4, 4)  # Limit CPU workers to 4
         _cpu_executor = ThreadPoolExecutor(max_workers=cpu_count, thread_name_prefix="cpu-pool")
     return _cpu_executor
-
 
 def get_io_executor() -> ThreadPoolExecutor:
     """Get or create the global I/O-bound ThreadPoolExecutor."""
     global _io_executor
     if _io_executor is None:
-        _io_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="io-pool")
+        _io_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="io-pool")  # Reduced from 30 to 8
     return _io_executor
-
 
 def shutdown_executors() -> None:
     """Shutdown both global executors."""
@@ -42,13 +39,11 @@ def shutdown_executors() -> None:
         _io_executor.shutdown(wait=True)
         _io_executor = None
 
-
 def run_in_cpu_pool(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run a CPU-bound function in the global CPU pool."""
     executor = get_cpu_executor()
     future = executor.submit(func, *args, **kwargs)
     return future.result()
-
 
 def run_in_io_pool(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Run an I/O-bound function in the global I/O pool."""
@@ -56,12 +51,10 @@ def run_in_io_pool(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     future = executor.submit(func, *args, **kwargs)
     return future.result()
 
-
 def submit_to_cpu_pool(func: Callable[..., T], *args: Any, **kwargs: Any):
     """Submit a CPU-bound function to the global CPU pool (returns Future)."""
     executor = get_cpu_executor()
     return executor.submit(func, *args, **kwargs)
-
 
 def submit_to_io_pool(func: Callable[..., T], *args: Any, **kwargs: Any):
     """Submit an I/O-bound function to the global I/O pool (returns Future)."""
